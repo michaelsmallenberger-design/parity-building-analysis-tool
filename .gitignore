@@ -1,0 +1,10 @@
+# Ignore Python virtual environments
+venv/
+venv-linux/
+
+# Ignore secret keys
+config.py
+
+# Ignore Python cache files
+__pycache__/
+*.pyc

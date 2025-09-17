@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Processing Results</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 2em;
+            background-color: #f4f7f6;
+            color: #333;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        #status-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .results-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+        .result-group {
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            padding: 1.5rem;
+        }
+        .result-group h2 {
+            margin-top: 0;
+            color: #2c3e50;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 0.5rem;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #ddd;
+        }
+        th:first-child, td:first-child {
+            width: 40px;
+            text-align: center;
+        }
+        th {
+            background-color: #f9f9f9;
+        }
+        .download-button {
+            display: inline-block;
+            margin-top: 1rem;
+            background-color: #27ae60;
+            color: white;
+            padding: 12px 25px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            transition: background-color 0.3s ease;
+        }
+        .download-button:hover {
+            background-color: #229954;
+        }
+        .cancel-button {
+            display: inline-block;
+            margin-left: 1rem;
+            background-color: #e74c3c;
+            color: white;
+            padding: 8px 15px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            transition: background-color 0.3s ease;
+            cursor: pointer;
+            border: none;
+        }
+        .cancel-button:hover {
+            background-color: #c0392b;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Processing Addresses</h1>
+        <div id="status-container">
+            <div id="loader" class="loader"></div>
+            <span id="status">Waiting for job to start...</span>
+            </div>
+        <p><a href="{{ url_for('index') }}">Process Another List</a></p>
+    </div>
+    <hr>
+    
+    <div class="results-grid">
+        <div class="result-group">
+            <h2 id="detected-heading">✅ Good Fits</h2>
+            <table id="detected-table">
+                <thead><tr><th>#</th><th>Address</th><th>Confidence Score</th><th>Images</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+        <div class="result-group">
+            <h2 id="not-detected-heading">❌ Bad Fits</h2>
+            <table id="not-detected-table">
+                <thead><tr><th>#</th><th>Address</th><th>Status</th><th>Image</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const jobId = "{{ job_id }}";
+        const initialTotal = {{ total_count | default(0) }};
+        const statusContainer = document.getElementById('status-container');
+        const statusElement = document.getElementById('status');
+        const loaderElement = document.getElementById('loader');
+        const headerElement = document.querySelector('.header');
+        const detectedTableBody = document.querySelector('#detected-table tbody');
+        const notDetectedTableBody = document.querySelector('#not-detected-table tbody');
+        const detectedHeading = document.getElementById('detected-heading');
+        const notDetectedHeading = document.getElementById('not-detected-heading');
+
+        let detectedCount = 0;
+        let notDetectedCount = 0;
+        let pollingInterval;
+
+        if (initialTotal > 0) {
+            statusElement.textContent = `Processing... (0 of ${initialTotal} complete)`;
+        }
+
+        const cancelButton = document.createElement('button');
+        cancelButton.textContent = 'Cancel Job';
+        cancelButton.className = 'cancel-button';
+        cancelButton.onclick = function() {
+            fetch(`/cancel/${jobId}`, { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'cancelled') {
+                        statusElement.textContent = 'Job Cancelled by User.';
+                        loaderElement.style.display = 'none';
+                        cancelButton.style.display = 'none';
+                        clearInterval(pollingInterval);
+                    } else {
+                        alert('Could not cancel job.');
+                    }
+                });
+        };
+        statusContainer.appendChild(cancelButton);
+
+        function checkJobStatus() {
+            fetch(`/status/${jobId}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'processing') {
+                        const progress = data.progress || 0;
+                        const total = data.total || initialTotal;
+                        statusElement.textContent = `Processing... (${progress} of ${total} complete)`;
+                    } else if (data.status === 'finished') {
+                        clearInterval(pollingInterval);
+                        statusElement.textContent = 'Analysis Complete!';
+                        loaderElement.style.display = 'none';
+                        cancelButton.style.display = 'none';
+                        
+                        const finalResult = data.result;
+
+                        if (finalResult && finalResult.csv_path) {
+                            if (!headerElement.querySelector('.download-button')) {
+                                const downloadButton = document.createElement('a');
+                                downloadButton.href = `{{ url_for('static', filename='') }}${finalResult.csv_path}`;
+                                downloadButton.textContent = 'Download Results CSV';
+                                downloadButton.className = 'download-button';
+                                headerElement.appendChild(downloadButton);
+                            }
+                        }
+
+                        if (finalResult && finalResult.web_results && finalResult.web_results.length > 0) {
+                             finalResult.web_results.forEach(item => {
+                                const row = document.createElement('tr');
+                                const originalImgUrl = `{{ url_for('static', filename='') }}${item.original_image_url}`;
+                                
+                                if (item.confidence_score) {
+                                    detectedCount++;
+                                    const percentage = (item.confidence_score * 100).toFixed(1);
+                                    const resultImgUrl = `{{ url_for('static', filename='') }}${item.result_image_url}`;
+                                    row.innerHTML = `<td>${detectedCount}</td><td>${item.address}</td><td>${percentage}%</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                                    detectedTableBody.appendChild(row);
+                                } else {
+                                    notDetectedCount++;
+                                    row.innerHTML = `<td>${notDetectedCount}</td><td>${item.address}</td><td>No system detected</td><td><a href="${originalImgUrl}" target="_blank">View</a></td>`;
+                                    notDetectedTableBody.appendChild(row);
+                                }
+                            });
+                            detectedHeading.textContent = `✅ ${detectedCount} Good Fits Found`;
+                            notDetectedHeading.textContent = `❌ ${notDetectedCount} Bad Fits Found`;
+                        }
+                    } else if (data.status === 'failed') {
+                        clearInterval(pollingInterval);
+                        statusElement.textContent = 'Job Failed. Check the worker terminal for errors.';
+                        loaderElement.style.display = 'none';
+                        cancelButton.style.display = 'none';
+                    }
+                })
+                .catch(err => {
+                    console.error('Error fetching status:', err);
+                    statusElement.textContent = 'Error fetching status.';
+                    loaderElement.style.display = 'none';
+                    clearInterval(pollingInterval);
+                });
+        }
+
+        pollingInterval = setInterval(checkJobStatus, 3000);
+        checkJobStatus();
+    </script>
+</body>
+</html>
