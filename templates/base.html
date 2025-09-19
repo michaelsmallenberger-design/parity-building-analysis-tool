@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
+    
+    <title>{% block title %}Building Analysis Tool{% endblock %}</title>
+    
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 2em;
+            background-color: #f4f7f6;
+            color: #333;
+        }
+        /* Add other common styles here */
+    </style>
+    
+    {% block styles %}{% endblock %}
+</head>
+<body>
+
+    {% block content %}{% endblock %}
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>

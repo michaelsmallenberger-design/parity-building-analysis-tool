@@ -9,7 +9,8 @@ from tasks import process_address_list
 
 # Initialize the Flask application and Redis Queue
 app = Flask(__name__)
-redis_conn = Redis()
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+redis_conn = Redis.from_url(redis_url)
 q = Queue(connection=redis_conn)
 
 # Define folder paths
