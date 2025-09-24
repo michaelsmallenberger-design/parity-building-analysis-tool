@@ -1,2 +1,0 @@
-[build.args]
-BP_APT_PACKAGES = "libgl1"
