@@ -1,0 +1,5 @@
+[build]
+builder = "paketobuildpacks/builder:base"
+
+[build.args]
+BP_APT_PACKAGES = "libgl1"
