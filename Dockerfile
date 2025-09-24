@@ -5,7 +5,8 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install the missing system library required by OpenCV
-RUN apt-get update && apt-get install -y libgl1-mesa-glx
+# Use the correct package name 'libgl1'
+RUN apt-get update && apt-get install -y libgl1
 
 # Copy the requirements file first to leverage Docker's layer caching
 COPY requirements.txt requirements.txt
