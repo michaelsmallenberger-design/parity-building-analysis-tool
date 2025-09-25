@@ -1,0 +1,10 @@
+venv/
+venv-linux/
+.venv/
+__pycache__/
+*.pyc
+.git/
+node_modules/
+.DS_Store
+static/uploads/*
+static/results/*
