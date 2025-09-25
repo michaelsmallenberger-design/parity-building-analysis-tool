@@ -1,20 +1,26 @@
-# Use an official Python base image
-FROM python:3.12-slim
+# Reference Dockerfile for Cloud Run
+FROM python:3.11-slim
 
-# Set the working directory inside the container
+# System deps (libgomp may be required by some ML libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Install the missing system library required by OpenCV
-# Use the correct package name 'libgl1'
-RUN apt-get update && apt-get install -y libgl1
-
-# Copy the requirements file first to leverage Docker's layer caching
-COPY requirements.txt requirements.txt
-
-# Install Python dependencies
+# Copy requirements first for layered caching
+COPY requirements.txt /app/requirements.txt
+# If you don't have ultralytics in requirements, ensure it's there; and these:
+# google-cloud-storage, google-cloud-tasks, gunicorn
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your application code into the container
-COPY . .
+# Copy app code
+COPY . /app
 
-# The CMD to run will be taken from your Procfile by Railway
+# Cloud Run expects to listen on $PORT
+ENV PORT=8080
+
+# Gunicorn entrypoint
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 8 --timeout 0 app:app
