@@ -10,9 +10,10 @@ import requests
 from PIL import Image
 from functools import lru_cache
 
-from config import MAPBOX_API_KEY, GOOGLE_API_KEY  # config.py should read env vars
+MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# --- Paths / constants ---
+# --- Paths / constants --- 
 STATIC_DIR = os.path.join("static")
 RESULTS_DIR = os.path.join(STATIC_DIR, "results")
 UPLOADS_DIR = os.path.join(STATIC_DIR, "uploads")
