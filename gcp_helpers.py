@@ -30,6 +30,16 @@ def read_status(bucket, job_id: str):
         return {"status":"processing","progress":0,"total":1,"cancel_requested":False}
     return json.loads(b.download_as_text())
 
-def make_signed_url(bucket, blob_path: str, minutes=60*24*7) -> str:
+def make_signed_url(bucket, blob_path: str, minutes=60*24*7, method="GET") -> str:
+    """
+    Generate a V4 signed URL using IAM (no local private key needed).
+    Works on Cloud Run if the service account has roles/iam.serviceAccountTokenCreator.
+    """
+    client = storage.Client()
     blob = bucket.blob(blob_path)
-    return blob.generate_signed_url(expiration=datetime.timedelta(minutes=minutes))
+    return blob.generate_signed_url(
+        expiration=datetime.timedelta(minutes=minutes),
+        method=method,
+        version="v4",                 # <- force V4
+        credentials=client._credentials  # <- use attached credentials (IAM signing)
+    )
