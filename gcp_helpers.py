@@ -30,16 +30,22 @@ def read_status(bucket, job_id: str):
         return {"status":"processing","progress":0,"total":1,"cancel_requested":False}
     return json.loads(b.download_as_text())
 
-def make_signed_url(bucket, blob_path: str, minutes=60*24*7, method="GET") -> str:
+def make_signed_url(bucket, blob_path: str, minutes=60*24*7) -> str:
     """
-    Generate a V4 signed URL using IAM (no local private key needed).
-    Works on Cloud Run if the service account has roles/iam.serviceAccountTokenCreator.
+    Uses IAM-based V4 signing on Cloud Run. Requires:
+      - SIGNING_SERVICE_ACCOUNT env var set to the email of your Cloud Run service account
+      - roles/iam.serviceAccountTokenCreator on that service account (to itself)
+      - iamcredentials.googleapis.com API enabled
     """
-    client = storage.Client()
     blob = bucket.blob(blob_path)
+    sa_email = os.getenv("SIGNING_SERVICE_ACCOUNT")
+    if not sa_email:
+        # Fail loud with a helpful message if not configured
+        raise RuntimeError("SIGNING_SERVICE_ACCOUNT env var not set. Set it to your Cloud Run service account email.")
+
     return blob.generate_signed_url(
         expiration=datetime.timedelta(minutes=minutes),
-        method=method,
-        version="v4",                 # <- force V4
-        credentials=client._credentials  # <- use attached credentials (IAM signing)
+        method="GET",
+        version="v4",
+        service_account_email=sa_email,  # <- key part for IAM signing
     )
