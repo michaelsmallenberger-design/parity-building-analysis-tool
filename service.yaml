@@ -1,0 +1,63 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: parity-building-analysis-tool
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      # Your runtime service account (used for OIDC & keyless signed URLs)
+      serviceAccountName: 903474499840-compute@developer.gserviceaccount.com
+
+      containers:
+      - image: us-east4-docker.pkg.dev/building-analysis-tool/cloud-run-source-deploy/parity-building-analysis-tool/parity-building-analysis-tool@sha256:74564492b667f90e44c6dce92c7d94c11b3979922262edaf7509aae3da8ca51b
+        env:
+        - name: GCP_PROJECT
+          value: building-analysis-tool
+        - name: RESULTS_BUCKET
+          value: parity-build-tool-results
+        - name: TASKS_QUEUE
+          value: default
+        - name: TASKS_LOCATION
+          value: us-east4
+
+        # Your public service URL (no trailing slash) + /tasks for the handler
+        - name: TASK_HANDLER_URL
+          value: https://parity-building-analysis-tool-903474499840.us-east4.run.app/tasks
+        - name: TASK_AUTH_AUDIENCE
+          value: https://parity-building-analysis-tool-903474499840.us-east4.run.app
+
+        # Random long string you already had
+        - name: TASK_SHARED_SECRET
+          value: "5319866f01da495d80f9b2b0fe590138727f748f20a340509c02ed42aedb1e59"
+
+        - name: TASKS_SA_EMAIL
+          value: 903474499840-compute@developer.gserviceaccount.com
+
+        # File uploads live in /tmp on Cloud Run
+        - name: UPLOAD_FOLDER
+          value: /tmp/uploads
+
+        # API keys you had before
+        - name: MAPBOX_API_KEY
+          value: "pk.eyJ1IjoibWFoa3Voc2UiLCJhIjoiY21mNXc0ZzNoMDZxbTJsbzlnajQwcHF1bCJ9.1eZeiWJuUZdPtJhAZ92h3Q"
+        - name: GOOGLE_API_KEY
+          value: "AIzaSyA7sdJ7sbFk1NtkH4SNiTG7i0SY-GxaHYs"
+
+        # Keyless signing for GCS signed URLs (both names for compatibility)
+        - name: STORAGE_SIGNING_SERVICE_ACCOUNT
+          value: 903474499840-compute@developer.gserviceaccount.com
+        - name: SIGNING_SERVICE_ACCOUNT
+          value: 903474499840-compute@developer.gserviceaccount.com
+
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+      timeoutSeconds: 900
