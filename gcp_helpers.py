@@ -1,6 +1,8 @@
 import os, json, datetime
 from google.cloud import storage
 
+SIGNER_EMAIL = os.getenv("SIGNING_SERVICE_ACCOUNT")
+
 def get_bucket(bucket_name: str):
     if not bucket_name:
         raise RuntimeError("RESULTS_BUCKET env var not set")
@@ -30,22 +32,15 @@ def read_status(bucket, job_id: str):
         return {"status":"processing","progress":0,"total":1,"cancel_requested":False}
     return json.loads(b.download_as_text())
 
-def make_signed_url(bucket, blob_path: str, minutes=60*24*7) -> str:
-    """
-    Uses IAM-based V4 signing on Cloud Run. Requires:
-      - SIGNING_SERVICE_ACCOUNT env var set to the email of your Cloud Run service account
-      - roles/iam.serviceAccountTokenCreator on that service account (to itself)
-      - iamcredentials.googleapis.com API enabled
-    """
-    blob = bucket.blob(blob_path)
-    sa_email = os.getenv("SIGNING_SERVICE_ACCOUNT")
-    if not sa_email:
-        # Fail loud with a helpful message if not configured
-        raise RuntimeError("SIGNING_SERVICE_ACCOUNT env var not set. Set it to your Cloud Run service account email.")
+def make_signed_url(bucket_name, blob_name, minutes=15, method="GET"):
+    creds, project_id = google.auth.default()  # Compute Engine creds in Cloud Run
+    client = storage.Client(project=project_id, credentials=creds)
+    blob = client.bucket(bucket_name).blob(blob_name)
 
     return blob.generate_signed_url(
-        expiration=datetime.timedelta(minutes=minutes),
-        method="GET",
         version="v4",
-        service_account_email=sa_email,  # <- key part for IAM signing
+        expiration=datetime.timedelta(minutes=minutes),
+        method=method,
+        credentials=creds,                 # use runtime creds
+        service_account_email=SIGNER_EMAIL # IAM will sign for this SA
     )
