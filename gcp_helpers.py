@@ -37,12 +37,32 @@ def read_status(bucket, job_id: str):
         return {"status":"processing","progress":0,"total":1,"cancel_requested":False}
     return json.loads(b.download_as_text())
 
-def make_signed_url(bucket_name: str, blob_name: str, minutes: int = 15, method: str = "GET") -> str:
+def make_signed_url(bucket_or_name, blob_name: str, minutes: int = 15, method: str = "GET") -> str:
+    """
+    Generate a V4 signed URL for a GCS object.
+
+    Accepts either a bucket name (str) or a google.cloud.storage.bucket.Bucket
+    instance in the first parameter to be flexible with callers.
+    """
     # Default ADC from Cloud Run
     credentials, _ = google.auth.default()
 
-    # Service account that will sign (you already set this env var in Cloud Run)
-    sa_email = os.environ.get("SIGNING_SERVICE_ACCOUNT")  # e.g. 9034744...-compute@developer.gserviceaccount.com
+    # Determine bucket name
+    try:
+        from google.cloud.storage.bucket import Bucket as _GCSBucket  # type: ignore
+    except Exception:
+        _GCSBucket = None  # fallback if import shape changes
+
+    if _GCSBucket is not None and isinstance(bucket_or_name, _GCSBucket):
+        bucket_name = bucket_or_name.name
+    elif hasattr(bucket_or_name, "name") and not isinstance(bucket_or_name, (str, bytes)):
+        # Duck-typing for objects with .name
+        bucket_name = getattr(bucket_or_name, "name")
+    else:
+        bucket_name = str(bucket_or_name)
+
+    # Service account used for signing (via IAMCredentials API)
+    sa_email = os.environ.get("SIGNING_SERVICE_ACCOUNT")
 
     # Create an IAM Signer which uses the iamcredentials API (no private key needed)
     signer = Signer(Request(), credentials, sa_email)
