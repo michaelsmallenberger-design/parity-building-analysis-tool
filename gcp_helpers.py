@@ -44,7 +44,32 @@ def make_signed_url(bucket_or_name, blob_name: str, minutes: int = 15, method: s
     Accepts either a bucket name (str) or a google.cloud.storage.bucket.Bucket
     instance in the first parameter to be flexible with callers.
     """
-    # Default ADC from Cloud Run
+    # Fast path: if signing is disabled, return a proxy URL or public URL
+    if os.getenv("DISABLE_URL_SIGNING", "").lower() in ("1", "true", "yes"):
+        base_url = (
+            os.getenv("PUBLIC_BASE_URL")
+            or os.getenv("TASK_AUTH_AUDIENCE")
+            or (os.getenv("TASK_HANDLER_URL") or "").replace("/tasks", "")
+        )
+        if base_url:
+            return f"{base_url.rstrip('/')}/files/{blob_name}"
+        bucket_name_str = bucket_or_name.name if hasattr(bucket_or_name, "name") else str(bucket_or_name)
+        return f"https://storage.googleapis.com/{bucket_name_str}/{blob_name}"
+    base_url = (
+        os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("TASK_AUTH_AUDIENCE")
+        or (os.getenv("TASK_HANDLER_URL") or "").replace("/tasks", "")
+    )
+    if base_url:
+        return f"{base_url.rstrip('/')}/files/{blob_name}"
+    # As a last resort, construct the public GCS URL (requires bucket public-read)
+    try:
+        bucket_name_str = bucket_or_name.name if hasattr(bucket_or_name, "name") else str(bucket_or_name)
+        return f"https://storage.googleapis.com/{bucket_name_str}/{blob_name}"
+    except Exception:
+        pass
+
+    # Default ADC from Cloud Run for signing path
     credentials, _ = google.auth.default()
 
     # Determine bucket name
@@ -71,12 +96,23 @@ def make_signed_url(bucket_or_name, blob_name: str, minutes: int = 15, method: s
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
 
-    # V4 signed URL
-    return blob.generate_signed_url(
-        expiration=datetime.timedelta(minutes=minutes),
-        method=method,
-        version="v4",
-        # The following two lines let the library use IAM-based signing:
-        service_account_email=sa_email,
-        signer=signer,
-    )
+    # V4 signed URL (try IAM-based signing). Some older storage libs don't support 'signer'.
+    try:
+        return blob.generate_signed_url(
+            expiration=datetime.timedelta(minutes=minutes),
+            method=method,
+            version="v4",
+            service_account_email=sa_email,
+            signer=signer,
+        )
+    except TypeError:
+        # Library doesn't support 'signer'; fall back to proxy or public URL
+        base_url = (
+            os.getenv("PUBLIC_BASE_URL")
+            or os.getenv("TASK_AUTH_AUDIENCE")
+            or (os.getenv("TASK_HANDLER_URL") or "").replace("/tasks", "")
+        )
+        if base_url:
+            return f"{base_url.rstrip('/')}/files/{blob_name}"
+        # Last resort: public URL (requires bucket to allow public reads)
+        return f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
