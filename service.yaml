@@ -50,6 +50,8 @@ spec:
               value: 903474499840-compute@developer.gserviceaccount.com
             - name: TASKS_SA_EMAIL
               value: 903474499840-compute@developer.gserviceaccount.com
+            - name: DISABLE_URL_SIGNING
+              value: "true"
 
             # --- secrets from Secret Manager (no plaintext here) ---
             - name: MAPBOX_API_KEY

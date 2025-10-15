@@ -4,7 +4,7 @@ import uuid
 import tempfile
 import logging
 import pandas as pd
-from flask import Flask, request, render_template, redirect, url_for, jsonify, abort
+from flask import Flask, request, render_template, redirect, url_for, jsonify, abort, Response
 
 # GCP clients
 from google.cloud import tasks_v2
@@ -253,6 +253,36 @@ def task_process():
         except Exception as inner:
             app.logger.error("write_status failed: %s", inner)
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 200
+
+# -----------------------------------------------------------------------------
+# File proxy (workaround to avoid GCS signed URLs)
+# -----------------------------------------------------------------------------
+@app.route('/files/<path:blob_name>')
+def proxy_file(blob_name):
+    if not bucket:
+        abort(404)
+    try:
+        b = bucket.blob(blob_name)
+        if not b.exists():
+            abort(404)
+        data = b.download_as_bytes()
+        lower = blob_name.lower()
+        if lower.endswith('.jpg') or lower.endswith('.jpeg'):
+            mimetype = 'image/jpeg'
+        elif lower.endswith('.png'):
+            mimetype = 'image/png'
+        elif lower.endswith('.csv'):
+            mimetype = 'text/csv'
+        else:
+            mimetype = 'application/octet-stream'
+        resp = Response(data, mimetype=mimetype)
+        resp.headers['Cache-Control'] = 'public, max-age=604800'
+        if lower.endswith('.csv'):
+            resp.headers['Content-Disposition'] = f"attachment; filename={os.path.basename(blob_name)}"
+        return resp
+    except Exception as e:
+        app.logger.error("Proxy download failed for %s: %s", blob_name, e)
+        abort(404)
 
 # -----------------------------------------------------------------------------
 # Dev entrypoint
