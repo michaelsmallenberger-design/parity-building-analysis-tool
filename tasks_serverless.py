@@ -75,9 +75,8 @@ def process_address_list(
         if result_url and os.path.exists(result_url):
             result_local = result_url
         elif isinstance(result_url, str) and result_url.startswith('results/'):
-            # If utils.run_prediction saved to static/results/<file>, map to local path if exists
-            # In Cloud Run container, ensure path is absolute if needed
-            maybe_local = os.path.join(os.getcwd(), 'static', os.path.basename(result_url))
+            # utils.run_prediction returns web path 'results/<file>'; actual file is at 'static/results/<file>'
+            maybe_local = os.path.join(os.getcwd(), 'static', result_url.replace('\\', '/'))
             if os.path.exists(maybe_local):
                 result_local = maybe_local
 
