@@ -109,10 +109,12 @@
                     
                     const finalResult = data.result;
 
-                    if (finalResult && finalResult.csv_path) {
+                    const staticBase = `{{ url_for('static', filename='') }}`;
+                    if (finalResult && (finalResult.csv_url || finalResult.csv_path)) {
                         if (!headerElement.querySelector('.download-button')) {
                             const downloadButton = document.createElement('a');
-                            downloadButton.href = `{{ url_for('static', filename='') }}${finalResult.csv_path}`;
+                            const csvUrl = finalResult.csv_url ? finalResult.csv_url : staticBase + finalResult.csv_path;
+                            downloadButton.href = csvUrl;
                             downloadButton.textContent = 'Download Results CSV';
                             downloadButton.className = 'download-button';
                             headerElement.appendChild(downloadButton);
@@ -120,14 +122,15 @@
                     }
 
                     if (finalResult && finalResult.web_results && finalResult.web_results.length > 0) {
+                         const isAbs = (u) => typeof u === 'string' && (/^https?:\/\//.test(u) || u.startsWith('/'));
                          finalResult.web_results.forEach(item => {
                             const row = document.createElement('tr');
-                            const originalImgUrl = `{{ url_for('static', filename='') }}${item.original_image_url}`;
+                            const originalImgUrl = isAbs(item.original_image_url) ? item.original_image_url : staticBase + item.original_image_url;
                             
                             if (item.confidence_score) {
                                 detectedCount++;
                                 const percentage = (item.confidence_score * 100).toFixed(1);
-                                const resultImgUrl = `{{ url_for('static', filename='') }}${item.result_image_url}`;
+                                const resultImgUrl = isAbs(item.result_image_url) ? item.result_image_url : staticBase + item.result_image_url;
                                 row.innerHTML = `<td>${detectedCount}</td><td>${item.address}</td><td>${percentage}%</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
                                 detectedTableBody.appendChild(row);
                             } else {

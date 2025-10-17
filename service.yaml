@@ -32,6 +32,8 @@ spec:
             # --- plain (non-secret) config ---
             - name: RESULTS_BUCKET
               value: parity-build-tool-results
+            - name: DISABLE_URL_SIGNING
+              value: "true"
             - name: GCP_PROJECT
               value: building-analysis-tool
             - name: TASKS_QUEUE
