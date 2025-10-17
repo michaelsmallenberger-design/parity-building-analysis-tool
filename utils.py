@@ -28,6 +28,8 @@ MAPBOX_STYLE = "mapbox/satellite-v9"  # satellite basemap
 MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "19"))  # 18–20 are usually good for roofs
 MAPBOX_SIZE = os.getenv("MAPBOX_SIZE", "768x768")   # WxH; <= 1280x1280
 MAPBOX_HIGH_DPI = os.getenv("MAPBOX_DPI", "false").lower() == "true"  # @2x images
+# Optional bottom crop in pixels to remove API watermarks/logos; set via env
+MAPBOX_CROP_BOTTOM_PX = int(os.getenv("MAPBOX_CROP_BOTTOM_PX", "0"))
 
 # Simple retry config for external calls
 HTTP_TIMEOUT = 12
@@ -122,7 +124,12 @@ def get_satellite_image_mapbox(lat: float, lon: float, out_path: str) -> bool:
             f"{coords}/{size}{dpi_suffix}"
         )
 
-        params = {"access_token": MAPBOX_API_KEY}
+        params = {
+            "access_token": MAPBOX_API_KEY,
+            # Remove Mapbox logo and attribution overlays; provide attribution elsewhere in UI
+            "logo": "false",
+            "attribution": "false",
+        }
         # Stream to avoid loading large images into memory
         with requests.get(url, params=params, timeout=HTTP_TIMEOUT, stream=True) as r:
             if r.status_code != 200:
@@ -133,6 +140,13 @@ def get_satellite_image_mapbox(lat: float, lon: float, out_path: str) -> bool:
             # Some responses are PNG; normalize to JPG to keep YOLO happy
             img_bytes = io.BytesIO(r.content)
             img = Image.open(img_bytes).convert("RGB")
+            # Optionally crop bottom strip to remove any residual marks
+            crop_px = MAPBOX_CROP_BOTTOM_PX
+            if crop_px and crop_px > 0:
+                # If high-DPI requested, scale crop accordingly unless explicitly sized
+                eff_crop = crop_px * (2 if MAPBOX_HIGH_DPI else 1)
+                if eff_crop < img.height:
+                    img = img.crop((0, 0, img.width, img.height - eff_crop))
             img.save(out_path, format="JPEG", quality=92)
         return True
     except Exception as e:
