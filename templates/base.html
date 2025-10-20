@@ -15,6 +15,21 @@
             background-color: #f4f7f6;
             color: #333;
         }
+        .footer-attrib {
+            position: fixed;
+            right: 12px;
+            bottom: 10px;
+            z-index: 1000;
+            font-size: 11px;
+            color: #666;
+            background: rgba(255, 255, 255, 0.85);
+            padding: 4px 8px;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+        }
+        @media (max-width: 520px) {
+            .footer-attrib { left: 8px; right: 8px; text-align: center; }
+        }
         /* Add other common styles here */
     </style>
     
@@ -24,9 +39,9 @@
 
     {% block content %}{% endblock %}
 
-    <div style="margin-top:2rem;color:#666;font-size:12px;">
-        Imagery © Maxar; Map data © OpenStreetMap contributors; © Mapbox. Please see Mapbox terms for attribution requirements.
-    </div>
+    <footer class="footer-attrib">
+        Imagery © Maxar; Map data © OpenStreetMap contributors; © Mapbox.
+    </footer>
     
     {% block scripts %}{% endblock %}
 </body>
