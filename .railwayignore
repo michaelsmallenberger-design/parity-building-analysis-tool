@@ -1,0 +1,62 @@
+# Railway ignore file - excludes files from deployment
+
+# Git files
+.git/
+.gitignore
+.gitattributes
+
+# Google Cloud files (not needed for Railway)
+gcp_helpers.py
+tasks_serverless.py
+service.yaml
+app.py
+
+# Original Docker files
+Dockerfile
+requirements.txt
+
+# Development files
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+
+# Temporary files
+temp_uploads/
+storage/
+jobs.db
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Training data
+Train_YOLO_Models.ipynb
+addresses.csv
+
+# Documentation
+README.md
