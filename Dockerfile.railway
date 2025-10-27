@@ -1,0 +1,45 @@
+# Optimized Dockerfile for Railway deployment
+# Reduces build time from 16 minutes to ~6-8 minutes
+
+FROM python:3.11-slim
+
+# Install system dependencies (minimal set)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements first for better layer caching
+COPY requirements_railway.txt requirements.txt
+
+# Install PyTorch CPU-only version (much smaller and faster)
+# This is the key optimization - CPU-only wheels are ~200MB vs ~800MB for CUDA
+RUN pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app_railway.py app.py
+COPY job_queue.py .
+COPY storage_helpers.py .
+COPY worker.py .
+COPY tasks_local.py .
+COPY utils.py .
+COPY models/ models/
+COPY static/ static/
+COPY templates/ templates/
+
+# Create storage directory
+RUN mkdir -p storage
+
+# Expose port
+ENV PORT=8080
+EXPOSE 8080
+
+# Run with gunicorn
+CMD gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
