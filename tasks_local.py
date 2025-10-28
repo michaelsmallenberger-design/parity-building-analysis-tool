@@ -16,6 +16,7 @@ def process_address_list(
     should_cancel: Callable[[], bool],
     upload_file: Callable[[str, str], str],       # (local_path, dest_blob) -> blob_path
     make_signed_url: Callable[[str], str],        # (blob_path) -> url
+    write_partial_result: Callable[[Dict[str, Any]], None] = None,  # Optional callback for streaming results
 ) -> Dict[str, Any]:
     """
     Process a CSV of addresses with YOLO model predictions.
@@ -31,8 +32,32 @@ def process_address_list(
     except Exception as e:
         return {"error": f"Error reading CSV: {e}"}
 
-    if 'Address' not in df.columns:
-        return {"error": "CSV must contain an 'Address' column."}
+    # Auto-detect address column (support common variations)
+    address_col = None
+    address_variants = [
+        'Address', 'address', 'ADDRESS',
+        'Property Address', 'property address', 'PROPERTY ADDRESS',
+        'PropertyAddress', 'propertyaddress', 'PROPERTYADDRESS',
+        'Street Address', 'street address', 'STREET ADDRESS',
+        'StreetAddress', 'streetaddress', 'STREETADDRESS',
+        'Building Address', 'building address', 'BUILDING ADDRESS',
+        'BuildingAddress', 'buildingaddress', 'BUILDINGADDRESS',
+        'Property_Address', 'property_address', 'PROPERTY_ADDRESS',
+        'Street_Address', 'street_address', 'STREET_ADDRESS',
+        'Building_Address', 'building_address', 'BUILDING_ADDRESS'
+    ]
+
+    for variant in address_variants:
+        if variant in df.columns:
+            address_col = variant
+            break
+
+    if not address_col:
+        return {"error": f"CSV must contain an address column. Supported column names: 'Address', 'Property Address', 'Street Address', 'Building Address' (case-insensitive)."}
+
+    # Rename to standard 'Address' for consistent processing
+    if address_col != 'Address':
+        df = df.rename(columns={address_col: 'Address'})
 
     done = 0
     for i, row in df.iterrows():
@@ -60,6 +85,16 @@ def process_address_list(
                 'Cooling Tower Detected': 'No',
                 'Confidence Score': 'Geocoding Failed'
             })
+            web_results.append({
+                "address": full_address,
+                "confidence_score": None,
+                "result_image_url": None,
+                "original_image_url": None,
+                "error": "Geocoding Failed"
+            })
+            # Write partial result for failed address
+            if write_partial_result:
+                write_partial_result({"web_results": web_results})
             continue
 
         lat, lon = coords
@@ -75,6 +110,16 @@ def process_address_list(
                 'Cooling Tower Detected': 'No',
                 'Confidence Score': 'Image Download Failed'
             })
+            web_results.append({
+                "address": full_address,
+                "confidence_score": None,
+                "result_image_url": None,
+                "original_image_url": None,
+                "error": "Image Download Failed"
+            })
+            # Write partial result for failed address
+            if write_partial_result:
+                write_partial_result({"web_results": web_results})
             continue
 
         # Run prediction (creates result image in static/results/)
@@ -123,6 +168,10 @@ def process_address_list(
                 'Cooling Tower Detected': 'No',
                 'Confidence Score': 'N/A'
             })
+
+        # Write partial results so frontend can display progress
+        if write_partial_result:
+            write_partial_result({"web_results": web_results})
 
     # Build results CSV
     results_df = pd.DataFrame(csv_rows)

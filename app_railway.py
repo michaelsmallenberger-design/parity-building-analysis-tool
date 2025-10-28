@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, request, render_template, redirect, url_for, jsonify, abort, Response
 
 # Local modules
-from job_queue import init_db, enqueue_job, get_job_status, cancel_job
+from job_queue import init_db, enqueue_job, get_job_status, cancel_job, check_usage_limit
 from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists, read_file
 from worker import start_worker
 
@@ -65,6 +65,16 @@ def upload():
         log.warning(f"Could not count CSV rows: {e}")
         total = 0
 
+    # Check monthly usage limit
+    can_process, current_usage, error_msg = check_usage_limit(total)
+    if not can_process:
+        log.warning(f"Usage limit check failed: {error_msg}")
+        local_path.unlink(missing_ok=True)  # Clean up uploaded file
+        return render_template('error.html',
+                             error_title="Monthly Limit Reached",
+                             error_message=error_msg,
+                             current_usage=current_usage), 403
+
     # Create job ID
     job_id = str(uuid.uuid4())
 
@@ -114,8 +124,9 @@ def job_status_route(job_id):
     if status.get('message'):
         response['message'] = status['message']
 
-    # If finished, include result data
-    if status['status'] == 'finished':
+    # Include result data (both partial and final)
+    # This allows frontend to display results as they come in
+    if status['status'] in ['processing', 'finished']:
         result = read_result(job_id)
         if result:
             response['result'] = result
