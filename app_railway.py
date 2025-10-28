@@ -163,13 +163,18 @@ def serve_file(blob_name):
             mimetype = 'image/png'
         elif lower.endswith('.csv'):
             mimetype = 'text/csv'
+        elif lower.endswith('.html') or lower.endswith('.htm'):
+            mimetype = 'text/html'
+        elif lower.endswith('.zip'):
+            mimetype = 'application/zip'
         else:
             mimetype = 'application/octet-stream'
 
         resp = Response(data, mimetype=mimetype)
         resp.headers['Cache-Control'] = 'public, max-age=604800'
 
-        if lower.endswith('.csv'):
+        # Force download for CSV and ZIP files
+        if lower.endswith('.csv') or lower.endswith('.zip'):
             filename = os.path.basename(blob_name)
             resp.headers['Content-Disposition'] = f"attachment; filename={filename}"
 

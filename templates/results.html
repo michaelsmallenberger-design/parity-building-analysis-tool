@@ -164,8 +164,13 @@
     th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
     th:first-child, td:first-child { width: 40px; text-align: center; }
     th { background-color: #f9f9f9; }
-    .download-button { display: inline-block; margin-top: 1rem; background-color: #27ae60; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold; transition: background-color 0.3s ease; }
-    .download-button:hover { background-color: #229954; }
+    .download-buttons { display: flex; gap: 1rem; margin-top: 1.5rem; flex-wrap: wrap; justify-content: center; }
+    .download-button { display: inline-block; background-color: #27ae60; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold; transition: all 0.3s ease; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .download-button:hover { background-color: #229954; transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+    .download-button.primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    .download-button.primary:hover { background: linear-gradient(135deg, #5568d3 0%, #6a4191 100%); }
+    .download-button.secondary { background-color: #3498db; }
+    .download-button.secondary:hover { background-color: #2980b9; }
     .cancel-button { display: inline-block; margin-left: 1rem; background-color: #e74c3c; color: white; padding: 8px 15px; text-decoration: none; border-radius: 5px; font-size: 0.9rem; font-weight: bold; transition: background-color 0.3s ease; cursor: pointer; border: none; }
     .cancel-button:hover { background-color: #c0392b; }
 </style>
@@ -416,8 +421,9 @@
                     loaderElement.style.display = 'none';
                     cancelButton.style.display = 'none';
                     clearInterval(pollingInterval);
-                    detectedTableBody.innerHTML = '';
-                    notDetectedTableBody.innerHTML = '';
+                    highConfidenceTableBody.innerHTML = '';
+                    needsReviewTableBody.innerHTML = '';
+                    lowConfidenceTableBody.innerHTML = '';
                 } else {
                     alert('Could not cancel job.');
                 }
@@ -460,17 +466,45 @@
                         displayNewResults(finalResult.web_results);
                     }
 
-                    // Add download button for CSV
+                    // Add download buttons
                     const staticBase = `{{ url_for('static', filename='') }}`;
-                    if (finalResult && (finalResult.csv_url || finalResult.csv_path)) {
-                        if (!headerElement.querySelector('.download-button')) {
-                            const downloadButton = document.createElement('a');
-                            const csvUrl = finalResult.csv_url ? finalResult.csv_url : staticBase + finalResult.csv_path;
-                            downloadButton.href = csvUrl;
-                            downloadButton.textContent = 'Download Results CSV';
-                            downloadButton.className = 'download-button';
-                            headerElement.appendChild(downloadButton);
+                    if (finalResult && !headerElement.querySelector('.download-buttons')) {
+                        const downloadContainer = document.createElement('div');
+                        downloadContainer.className = 'download-buttons';
+
+                        // Add ZIP bundle button (primary - most useful)
+                        if (finalResult.zip_url) {
+                            const zipButton = document.createElement('a');
+                            zipButton.href = finalResult.zip_url;
+                            zipButton.textContent = '📦 Download Complete Bundle (ZIP)';
+                            zipButton.className = 'download-button primary';
+                            zipButton.title = 'Includes HTML report, CSV, and all images';
+                            downloadContainer.appendChild(zipButton);
                         }
+
+                        // Add HTML report button
+                        if (finalResult.html_url) {
+                            const htmlButton = document.createElement('a');
+                            htmlButton.href = finalResult.html_url;
+                            htmlButton.textContent = '📄 View HTML Report';
+                            htmlButton.className = 'download-button secondary';
+                            htmlButton.title = 'Self-contained report with embedded images';
+                            htmlButton.target = '_blank';
+                            downloadContainer.appendChild(htmlButton);
+                        }
+
+                        // Add CSV button
+                        if (finalResult.csv_url || finalResult.csv_path) {
+                            const csvButton = document.createElement('a');
+                            const csvUrl = finalResult.csv_url ? finalResult.csv_url : staticBase + finalResult.csv_path;
+                            csvButton.href = csvUrl;
+                            csvButton.textContent = '📊 Download CSV Only';
+                            csvButton.className = 'download-button';
+                            csvButton.title = 'Spreadsheet data without images';
+                            downloadContainer.appendChild(csvButton);
+                        }
+
+                        headerElement.appendChild(downloadContainer);
                     }
 
                     // Update dashboard with final counts

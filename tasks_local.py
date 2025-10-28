@@ -8,6 +8,8 @@ import tempfile
 import pandas as pd
 from typing import Callable, Dict, Any, Optional
 from utils import geocode_address_mapbox, get_satellite_image_mapbox, run_prediction
+from html_report import generate_html_report
+from zip_bundler import create_results_bundle, extract_image_paths_from_results
 
 def process_address_list(
     uploaded_filepath: str,
@@ -182,4 +184,61 @@ def process_address_list(
     upload_file(csv_local, csv_blob)
     csv_url = make_signed_url(csv_blob)
 
-    return {"web_results": web_results, "csv_url": csv_url}
+    # Generate HTML report with embedded images
+    html_local = os.path.join(tempfile.gettempdir(), f"Report_{job_id}.html")
+
+    # We need a function to get local paths from blob paths for image encoding
+    # This lambda will be passed to the HTML generator
+    def blob_to_local(blob_path):
+        # For local storage, blob paths are relative to storage base
+        # The make_signed_url returns /files/<blob_path>
+        # We need to reconstruct the actual local path
+        from storage_helpers import get_file_path
+        return get_file_path(blob_path)
+
+    try:
+        generate_html_report(
+            web_results=web_results,
+            job_id=job_id,
+            output_path=html_local,
+            get_local_path_func=blob_to_local
+        )
+
+        # Upload HTML report
+        html_blob = f"results/{job_id}/Report_{job_id}.html"
+        upload_file(html_local, html_blob)
+        html_url = make_signed_url(html_blob)
+    except Exception as e:
+        print(f"Warning: Failed to generate HTML report: {e}")
+        html_url = None
+
+    # Create ZIP bundle with everything
+    zip_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.zip")
+
+    try:
+        # Extract all image paths
+        image_paths = extract_image_paths_from_results(web_results, blob_to_local)
+
+        # Create the bundle
+        create_results_bundle(
+            html_path=html_local,
+            csv_path=csv_local,
+            image_paths=image_paths,
+            output_zip_path=zip_local,
+            job_id=job_id
+        )
+
+        # Upload ZIP bundle
+        zip_blob = f"results/{job_id}/results_{job_id}.zip"
+        upload_file(zip_local, zip_blob)
+        zip_url = make_signed_url(zip_blob)
+    except Exception as e:
+        print(f"Warning: Failed to create ZIP bundle: {e}")
+        zip_url = None
+
+    return {
+        "web_results": web_results,
+        "csv_url": csv_url,
+        "html_url": html_url,
+        "zip_url": zip_url
+    }
