@@ -11,7 +11,7 @@ from pathlib import Path
 
 from job_queue import (
     init_db, get_pending_jobs, update_job_status,
-    should_cancel_job, get_job_payload
+    should_cancel_job, get_job_payload, increment_usage
 )
 from storage_helpers import init_storage, get_file_path, upload_file, make_url, write_result
 from tasks_local import process_address_list
@@ -106,6 +106,10 @@ class BackgroundWorker:
             def make_url_fn(dest_blob, minutes=None):
                 return make_url(dest_blob)
 
+            # Partial result writer for real-time updates
+            def write_partial_fn(partial_data):
+                write_result(job_id, partial_data)
+
             # Process the address list
             log.info(f"Starting address processing for job {job_id}, CSV: {csv_path}")
             result = process_address_list(
@@ -115,10 +119,14 @@ class BackgroundWorker:
                 should_cancel=should_cancel,
                 upload_file=upload_fn,
                 make_signed_url=make_url_fn,
+                write_partial_result=write_partial_fn,
             )
 
             # Save result
             write_result(job_id, result)
+
+            # Increment usage counter for monthly tracking
+            increment_usage(max(int(total), 1))
 
             # Mark as finished
             update_job_status(job_id, status="finished",

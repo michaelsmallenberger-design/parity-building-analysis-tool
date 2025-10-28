@@ -12,7 +12,7 @@ DB_PATH = Path("jobs.db")
 _lock = threading.Lock()
 
 def init_db():
-    """Initialize the SQLite database with jobs table."""
+    """Initialize the SQLite database with jobs table and usage tracking."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
@@ -25,6 +25,16 @@ def init_db():
                 payload TEXT,
                 created_at TEXT,
                 updated_at TEXT
+            )
+        """)
+        # Usage tracking table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                year_month TEXT NOT NULL,
+                addresses_processed INTEGER DEFAULT 0,
+                last_updated TEXT,
+                UNIQUE(year_month)
             )
         """)
         conn.commit()
@@ -121,3 +131,65 @@ def get_job_payload(job_id: str):
     if status and status.get('payload'):
         return json.loads(status['payload'])
     return None
+
+# -----------------------------------------------------------------------------
+# USAGE TRACKING (for monthly API limit enforcement)
+# -----------------------------------------------------------------------------
+
+MONTHLY_ADDRESS_LIMIT = 2500  # Conservative limit to stay under $5/month
+
+def get_current_month() -> str:
+    """Get current month in YYYY-MM format."""
+    return datetime.utcnow().strftime("%Y-%m")
+
+def get_monthly_usage() -> int:
+    """Get total addresses processed this month."""
+    current_month = get_current_month()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            SELECT addresses_processed FROM monthly_usage WHERE year_month = ?
+        """, (current_month,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+def check_usage_limit(requested_addresses: int) -> tuple[bool, int, str]:
+    """
+    Check if processing this batch would exceed monthly limit.
+
+    Returns:
+        (can_process, current_usage, error_message)
+    """
+    current_usage = get_monthly_usage()
+    remaining = MONTHLY_ADDRESS_LIMIT - current_usage
+
+    if current_usage >= MONTHLY_ADDRESS_LIMIT:
+        return False, current_usage, f"Monthly limit of {MONTHLY_ADDRESS_LIMIT} addresses reached. Resets on 1st of next month."
+
+    if requested_addresses > remaining:
+        return False, current_usage, f"Batch size ({requested_addresses}) exceeds remaining monthly quota ({remaining}). Try a smaller batch."
+
+    return True, current_usage, ""
+
+def increment_usage(addresses_processed: int):
+    """Increment the monthly usage counter."""
+    current_month = get_current_month()
+    now = datetime.utcnow().isoformat()
+
+    with _lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            # Try to update existing record
+            cursor = conn.execute("""
+                UPDATE monthly_usage
+                SET addresses_processed = addresses_processed + ?,
+                    last_updated = ?
+                WHERE year_month = ?
+            """, (addresses_processed, now, current_month))
+
+            # If no record exists, insert new one
+            if cursor.rowcount == 0:
+                conn.execute("""
+                    INSERT INTO monthly_usage (year_month, addresses_processed, last_updated)
+                    VALUES (?, ?, ?)
+                """, (current_month, addresses_processed, now))
+
+            conn.commit()

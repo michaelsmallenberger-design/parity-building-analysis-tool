@@ -5,12 +5,161 @@
 {% block styles %}
 <style>
     .header { text-align: center; margin-bottom: 2rem; }
-    #status-container { display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: bold; }
+    #status-container { display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: bold; margin-bottom: 1.5rem; }
     .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .results-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-top: 2rem; }
-    .result-group { background-color: white; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); padding: 1.5rem; }
-    .result-group h2 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 0.5rem; }
+
+    /* Dashboard Progress Tracker */
+    .progress-dashboard {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-radius: 12px;
+        padding: 2rem;
+        margin: 2rem auto;
+        max-width: 600px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+    }
+    .progress-dashboard.complete {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+    }
+    .progress-title {
+        font-size: 1.1rem;
+        margin-bottom: 1rem;
+        text-align: center;
+        font-weight: 600;
+    }
+    .progress-bar-container {
+        background-color: rgba(255, 255, 255, 0.3);
+        border-radius: 10px;
+        height: 30px;
+        margin: 1rem 0;
+        overflow: hidden;
+        position: relative;
+    }
+    .progress-bar-fill {
+        background: linear-gradient(90deg, #fff 0%, #f0f0f0 100%);
+        height: 100%;
+        transition: width 0.5s ease;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        color: #667eea;
+        font-size: 0.85rem;
+    }
+    .progress-stats {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-top: 1.5rem;
+    }
+    .stat-item {
+        background-color: rgba(255, 255, 255, 0.15);
+        padding: 0.75rem;
+        border-radius: 8px;
+        text-align: center;
+    }
+    .stat-label {
+        font-size: 0.85rem;
+        opacity: 0.9;
+        margin-bottom: 0.25rem;
+    }
+    .stat-value {
+        font-size: 1.4rem;
+        font-weight: bold;
+    }
+    .progress-main-stat {
+        text-align: center;
+        font-size: 1.1rem;
+        margin-top: 1rem;
+        opacity: 0.95;
+    }
+
+    /* Filter Controls */
+    .filter-controls {
+        display: flex;
+        justify-content: center;
+        gap: 1rem;
+        margin: 2rem 0;
+        flex-wrap: wrap;
+    }
+    .filter-btn {
+        padding: 10px 20px;
+        border: 2px solid #ddd;
+        background: white;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+    .filter-btn:hover {
+        background: #f8f9fa;
+        transform: translateY(-2px);
+    }
+    .filter-btn.active {
+        background: #667eea;
+        color: white;
+        border-color: #667eea;
+    }
+
+    /* Results Grid - Now 3 columns */
+    .results-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+        gap: 2rem;
+        margin-top: 2rem;
+    }
+    .result-group {
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        padding: 1.5rem;
+    }
+    .result-group.hidden {
+        display: none;
+    }
+    .result-group h2 {
+        margin-top: 0;
+        color: #2c3e50;
+        padding-bottom: 0.5rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .result-group.high-confidence h2 {
+        border-bottom: 3px solid #27ae60;
+        color: #27ae60;
+    }
+    .result-group.needs-review h2 {
+        border-bottom: 3px solid #f39c12;
+        color: #e67e22;
+    }
+    .result-group.low-confidence h2 {
+        border-bottom: 3px solid #95a5a6;
+        color: #7f8c8d;
+    }
+
+    /* Confidence Badges */
+    .confidence-badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 0.85rem;
+        font-weight: bold;
+    }
+    .confidence-high {
+        background: #d4edda;
+        color: #155724;
+    }
+    .confidence-medium {
+        background: #fff3cd;
+        color: #856404;
+    }
+    .confidence-low {
+        background: #f8d7da;
+        color: #721c24;
+    }
+
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
     th:first-child, td:first-child { width: 40px; text-align: center; }
@@ -28,22 +177,75 @@
     <div id="status-container">
         <div id="loader" class="loader"></div>
         <span id="status">Waiting for job to start...</span>
-        </div>
+    </div>
     <p><a href="{{ url_for('index') }}">Process Another List</a></p>
 </div>
+
+<div id="progress-dashboard" class="progress-dashboard">
+    <div class="progress-title">Progress</div>
+    <div class="progress-bar-container">
+        <div id="progress-bar-fill" class="progress-bar-fill" style="width: 0%">0%</div>
+    </div>
+    <div class="progress-main-stat" id="progress-main-stat">0 / 0 addresses processed</div>
+
+    <div class="progress-stats">
+        <div class="stat-item">
+            <div class="stat-label">✅ Towers Found</div>
+            <div class="stat-value" id="stat-towers-found">0 (0%)</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">❌ No Towers</div>
+            <div class="stat-value" id="stat-no-towers">0 (0%)</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">⏱️ Avg Speed</div>
+            <div class="stat-value" id="stat-speed">-- addr/min</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">🕒 Time Remaining</div>
+            <div class="stat-value" id="stat-eta">Calculating...</div>
+        </div>
+    </div>
+</div>
+
 <hr>
 
+<div class="filter-controls">
+    <button class="filter-btn active" data-filter="all">Show All</button>
+    <button class="filter-btn" data-filter="high">High Confidence Only</button>
+    <button class="filter-btn" data-filter="review">Needs Review</button>
+    <button class="filter-btn" data-filter="low">Low/No Detection</button>
+</div>
+
 <div class="results-grid">
-    <div class="result-group">
-        <h2 id="detected-heading">✅ Good Fits</h2>
-        <table id="detected-table">
-            <thead><tr><th>#</th><th>Address</th><th>Confidence Score</th><th>Images</th></tr></thead>
+    <div class="result-group high-confidence" data-category="high">
+        <h2 id="high-confidence-heading">
+            <span>✅ High Confidence</span>
+            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(70%+)</span>
+        </h2>
+        <table id="high-confidence-table">
+            <thead><tr><th>#</th><th>Address</th><th>Confidence</th><th>Images</th></tr></thead>
             <tbody></tbody>
         </table>
     </div>
-    <div class="result-group">
-        <h2 id="not-detected-heading">❌ Bad Fits</h2>
-        <table id="not-detected-table">
+
+    <div class="result-group needs-review" data-category="review">
+        <h2 id="needs-review-heading">
+            <span>⚠️ Needs Review</span>
+            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(40-69%)</span>
+        </h2>
+        <table id="needs-review-table">
+            <thead><tr><th>#</th><th>Address</th><th>Confidence</th><th>Images</th></tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div class="result-group low-confidence" data-category="low">
+        <h2 id="low-confidence-heading">
+            <span>❌ Low/No Detection</span>
+            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(&lt;40%)</span>
+        </h2>
+        <table id="low-confidence-table">
             <thead><tr><th>#</th><th>Address</th><th>Status</th><th>Image</th></tr></thead>
             <tbody></tbody>
         </table>
@@ -59,17 +261,147 @@
     const statusElement = document.getElementById('status');
     const loaderElement = document.getElementById('loader');
     const headerElement = document.querySelector('.header');
-    const detectedTableBody = document.querySelector('#detected-table tbody');
-    const notDetectedTableBody = document.querySelector('#not-detected-table tbody');
-    const detectedHeading = document.getElementById('detected-heading');
-    const notDetectedHeading = document.getElementById('not-detected-heading');
+    const highConfidenceTableBody = document.querySelector('#high-confidence-table tbody');
+    const needsReviewTableBody = document.querySelector('#needs-review-table tbody');
+    const lowConfidenceTableBody = document.querySelector('#low-confidence-table tbody');
+    const highConfidenceHeading = document.getElementById('high-confidence-heading');
+    const needsReviewHeading = document.getElementById('needs-review-heading');
+    const lowConfidenceHeading = document.getElementById('low-confidence-heading');
 
-    let detectedCount = 0;
-    let notDetectedCount = 0;
+    // Dashboard elements
+    const progressDashboard = document.getElementById('progress-dashboard');
+    const progressBarFill = document.getElementById('progress-bar-fill');
+    const progressMainStat = document.getElementById('progress-main-stat');
+    const statTowersFound = document.getElementById('stat-towers-found');
+    const statNoTowers = document.getElementById('stat-no-towers');
+    const statSpeed = document.getElementById('stat-speed');
+    const statEta = document.getElementById('stat-eta');
+
+    let highConfidenceCount = 0;
+    let needsReviewCount = 0;
+    let lowConfidenceCount = 0;
     let pollingInterval;
+    let startTime = Date.now();
+    let lastProgress = 0;
+    let displayedResultsCount = 0;  // Track how many results we've already displayed
 
     if (initialTotal > 0) {
         statusElement.textContent = `Processing... (0 of ${initialTotal} complete)`;
+        progressMainStat.textContent = `0 / ${initialTotal} addresses processed`;
+    }
+
+    function updateDashboard(progress, total) {
+        const percentage = total > 0 ? Math.round((progress / total) * 100) : 0;
+
+        // Update progress bar
+        progressBarFill.style.width = `${percentage}%`;
+        progressBarFill.textContent = `${percentage}%`;
+
+        // Update main stat
+        progressMainStat.textContent = `${progress} / ${total} addresses processed`;
+
+        // Calculate statistics using displayedResultsCount for real-time accuracy
+        const processedCount = displayedResultsCount;
+        const detectedTotal = highConfidenceCount + needsReviewCount;
+        const towersFoundPct = processedCount > 0 ? Math.round((detectedTotal / processedCount) * 100) : 0;
+        const noTowersPct = processedCount > 0 ? Math.round((lowConfidenceCount / processedCount) * 100) : 0;
+
+        statTowersFound.textContent = `${detectedTotal} (${towersFoundPct}%)`;
+        statNoTowers.textContent = `${lowConfidenceCount} (${noTowersPct}%)`;
+
+        // Calculate speed (addresses per minute)
+        const elapsedMs = Date.now() - startTime;
+        const elapsedMin = elapsedMs / 60000;
+        const speed = elapsedMin > 0 ? (progress / elapsedMin) : 0;
+
+        if (progress > 0 && speed > 0) {
+            statSpeed.textContent = `${speed.toFixed(1)} addr/min`;
+
+            // Calculate ETA
+            const remaining = total - progress;
+            const etaMin = remaining / speed;
+
+            if (etaMin < 1) {
+                statEta.textContent = `< 1 min`;
+            } else if (etaMin < 60) {
+                statEta.textContent = `~${Math.round(etaMin)} min`;
+            } else {
+                const hours = Math.floor(etaMin / 60);
+                const mins = Math.round(etaMin % 60);
+                statEta.textContent = `~${hours}h ${mins}m`;
+            }
+        } else {
+            statSpeed.textContent = `--`;
+            statEta.textContent = `Calculating...`;
+        }
+    }
+
+    function displayNewResults(web_results) {
+        // Only display results we haven't shown yet
+        if (!web_results || web_results.length <= displayedResultsCount) {
+            return;
+        }
+
+        const staticBase = `{{ url_for('static', filename='') }}`;
+        const isAbs = (u) => typeof u === 'string' && (/^https?:\/\//.test(u) || u.startsWith('/'));
+
+        // Process only new results
+        for (let i = displayedResultsCount; i < web_results.length; i++) {
+            const item = web_results[i];
+            const row = document.createElement('tr');
+
+            // Handle errors (geocoding/image download failures)
+            if (item.error) {
+                lowConfidenceCount++;
+                row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>${item.error}</td><td>N/A</td>`;
+                lowConfidenceTableBody.appendChild(row);
+            } else {
+                const originalImgUrl = item.original_image_url && isAbs(item.original_image_url)
+                    ? item.original_image_url
+                    : staticBase + (item.original_image_url || '');
+
+                if (item.confidence_score) {
+                    const percentage = (item.confidence_score * 100).toFixed(1);
+                    const confidenceValue = item.confidence_score * 100;
+                    const resultImgUrl = item.result_image_url && isAbs(item.result_image_url)
+                        ? item.result_image_url
+                        : staticBase + (item.result_image_url || '');
+
+                    // Categorize by confidence level
+                    if (confidenceValue >= 70) {
+                        // High Confidence (70%+)
+                        highConfidenceCount++;
+                        const badge = `<span class="confidence-badge confidence-high">${percentage}%</span>`;
+                        row.innerHTML = `<td>${highConfidenceCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        highConfidenceTableBody.appendChild(row);
+                    } else if (confidenceValue >= 40) {
+                        // Needs Review (40-69%)
+                        needsReviewCount++;
+                        const badge = `<span class="confidence-badge confidence-medium">${percentage}%</span>`;
+                        row.innerHTML = `<td>${needsReviewCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        needsReviewTableBody.appendChild(row);
+                    } else {
+                        // Low Confidence (<40%)
+                        lowConfidenceCount++;
+                        const badge = `<span class="confidence-badge confidence-low">${percentage}%</span>`;
+                        row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        lowConfidenceTableBody.appendChild(row);
+                    }
+                } else {
+                    // No detection
+                    lowConfidenceCount++;
+                    row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>No system detected</td><td><a href="${originalImgUrl}" target="_blank">View</a></td>`;
+                    lowConfidenceTableBody.appendChild(row);
+                }
+            }
+        }
+
+        displayedResultsCount = web_results.length;
+
+        // Update table headings with counts
+        highConfidenceHeading.querySelector('span:first-child').textContent = `✅ High Confidence (${highConfidenceCount})`;
+        needsReviewHeading.querySelector('span:first-child').textContent = `⚠️ Needs Review (${needsReviewCount})`;
+        lowConfidenceHeading.querySelector('span:first-child').textContent = `❌ Low/No Detection (${lowConfidenceCount})`;
     }
 
     const cancelButton = document.createElement('button');
@@ -101,14 +433,34 @@
                     const progress = data.progress || 0;
                     const total = data.total || initialTotal;
                     statusElement.textContent = `Processing... (${progress} of ${total} complete)`;
+
+                    // Display new results as they come in
+                    if (data.result && data.result.web_results) {
+                        displayNewResults(data.result.web_results);
+                    }
+
+                    // Update dashboard
+                    updateDashboard(progress, total);
                 } else if (data.status === 'finished') {
                     clearInterval(pollingInterval);
                     statusElement.textContent = 'Analysis Complete!';
                     loaderElement.style.display = 'none';
                     cancelButton.style.display = 'none';
-                    
+
+                    // Mark dashboard as complete
+                    progressDashboard.classList.add('complete');
+                    progressBarFill.style.width = '100%';
+                    progressBarFill.textContent = '100%';
+                    statEta.textContent = 'Complete!';
+
                     const finalResult = data.result;
 
+                    // Display any remaining results
+                    if (finalResult && finalResult.web_results) {
+                        displayNewResults(finalResult.web_results);
+                    }
+
+                    // Add download button for CSV
                     const staticBase = `{{ url_for('static', filename='') }}`;
                     if (finalResult && (finalResult.csv_url || finalResult.csv_path)) {
                         if (!headerElement.querySelector('.download-button')) {
@@ -121,27 +473,9 @@
                         }
                     }
 
-                    if (finalResult && finalResult.web_results && finalResult.web_results.length > 0) {
-                         const isAbs = (u) => typeof u === 'string' && (/^https?:\/\//.test(u) || u.startsWith('/'));
-                         finalResult.web_results.forEach(item => {
-                            const row = document.createElement('tr');
-                            const originalImgUrl = isAbs(item.original_image_url) ? item.original_image_url : staticBase + item.original_image_url;
-                            
-                            if (item.confidence_score) {
-                                detectedCount++;
-                                const percentage = (item.confidence_score * 100).toFixed(1);
-                                const resultImgUrl = isAbs(item.result_image_url) ? item.result_image_url : staticBase + item.result_image_url;
-                                row.innerHTML = `<td>${detectedCount}</td><td>${item.address}</td><td>${percentage}%</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
-                                detectedTableBody.appendChild(row);
-                            } else {
-                                notDetectedCount++;
-                                row.innerHTML = `<td>${notDetectedCount}</td><td>${item.address}</td><td>No system detected</td><td><a href="${originalImgUrl}" target="_blank">View</a></td>`;
-                                notDetectedTableBody.appendChild(row);
-                            }
-                        });
-                        detectedHeading.textContent = `✅ ${detectedCount} Good Fits Found`;
-                        notDetectedHeading.textContent = `❌ ${notDetectedCount} Bad Fits Found`;
-                    }
+                    // Update dashboard with final counts
+                    const finalTotal = data.total || initialTotal;
+                    updateDashboard(finalTotal, finalTotal);
                 } else if (data.status === 'failed') {
                     clearInterval(pollingInterval);
                     statusElement.textContent = 'Job Failed. Check the worker terminal for errors.';
@@ -156,6 +490,32 @@
                 clearInterval(pollingInterval);
             });
     }
+
+    // Filter button functionality
+    const filterButtons = document.querySelectorAll('.filter-btn');
+    const resultGroups = document.querySelectorAll('.result-group');
+
+    filterButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            // Update active button
+            filterButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+
+            const filter = btn.dataset.filter;
+
+            // Show/hide result groups based on filter
+            resultGroups.forEach(group => {
+                const category = group.dataset.category;
+                if (filter === 'all') {
+                    group.classList.remove('hidden');
+                } else if (filter === category) {
+                    group.classList.remove('hidden');
+                } else {
+                    group.classList.add('hidden');
+                }
+            });
+        });
+    });
 
     pollingInterval = setInterval(checkJobStatus, 3000);
     checkJobStatus();
