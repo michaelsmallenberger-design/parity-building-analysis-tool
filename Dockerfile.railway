@@ -42,4 +42,5 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Run with gunicorn
-CMD gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
+# Use shell form to properly expand $PORT
+CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 8 --timeout 0 app:app
