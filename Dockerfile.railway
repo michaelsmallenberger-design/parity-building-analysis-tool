@@ -30,8 +30,6 @@ COPY storage_helpers.py .
 COPY worker.py .
 COPY tasks_local.py .
 COPY utils.py .
-COPY html_report.py .
-COPY zip_bundler.py .
 COPY models/ models/
 COPY static/ static/
 COPY templates/ templates/
