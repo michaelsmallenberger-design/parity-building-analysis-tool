@@ -139,8 +139,11 @@ def process_address_list(
             log.warning(f"Row {i}: Empty address, skipping")
             csv_rows.append({
                 'Address': '(Empty)',
-                'Cooling Tower Detected': 'No',
-                'Confidence Score': 'Empty Address'
+                'Detected': 'No',
+                'Confidence': 'N/A',
+                'Original_Image': '',
+                'Detection_Result': '',
+                'Notes': 'Empty address in CSV'
             })
             web_results.append({
                 "address": "(Empty)",
@@ -168,8 +171,11 @@ def process_address_list(
             log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
             csv_rows.append({
                 'Address': full_address,
-                'Cooling Tower Detected': 'No',
-                'Confidence Score': 'Geocoding Failed'
+                'Detected': 'No',
+                'Confidence': 'Geocoding Failed',
+                'Original_Image': '',
+                'Detection_Result': '',
+                'Notes': 'Address could not be geocoded'
             })
             web_results.append({
                 "address": full_address,
@@ -196,8 +202,11 @@ def process_address_list(
             log.warning(f"Row {i+1}/{total}: Image download failed")
             csv_rows.append({
                 'Address': full_address,
-                'Cooling Tower Detected': 'No',
-                'Confidence Score': 'Image Download Failed'
+                'Detected': 'No',
+                'Confidence': 'Image Download Failed',
+                'Original_Image': '',
+                'Detection_Result': '',
+                'Notes': 'Satellite image could not be downloaded'
             })
             web_results.append({
                 "address": full_address,
@@ -247,18 +256,44 @@ def process_address_list(
             "original_image_url": original_url
         })
 
+        # Build CSV row with image URLs
         if confidence:
-            csv_rows.append({
-                'Address': full_address,
-                'Cooling Tower Detected': 'Yes',
-                'Confidence Score': f"{(confidence * 100):.1f}%"
-            })
+            detected = 'Yes'
+            conf_display = f"{(confidence * 100):.1f}%"
+            if confidence >= 0.70:
+                notes = 'High confidence detection'
+            elif confidence >= 0.40:
+                notes = 'Review recommended - medium confidence'
+            else:
+                notes = 'Low confidence detection'
         else:
-            csv_rows.append({
-                'Address': full_address,
-                'Cooling Tower Detected': 'No',
-                'Confidence Score': 'N/A'
-            })
+            detected = 'No'
+            conf_display = 'N/A'
+            notes = 'No cooling tower detected'
+
+        csv_rows.append({
+            'Address': full_address,
+            'Detected': detected,
+            'Confidence': conf_display,
+            'Original_Image': original_url,
+            'Detection_Result': result_image_url,
+            'Notes': notes
+        })
+
+        # Clean up temp files to save memory
+        try:
+            if os.path.exists(original_local):
+                os.remove(original_local)
+            if result_local and os.path.exists(result_local):
+                os.remove(result_local)
+        except Exception as e:
+            log.warning(f"Could not clean up temp file: {e}")
+
+        # Garbage collection every 50 addresses for large batches
+        if done % 50 == 0 and total > 100:
+            import gc
+            gc.collect()
+            log.info(f"Memory cleanup at {done}/{total} addresses")
 
         # Write partial results so frontend can display progress
         if write_partial_result:
@@ -274,53 +309,71 @@ def process_address_list(
     log.info(f"  ✗ Failed: {failed}")
     log.info(f"  📡 Cooling towers detected: {detections}")
 
-    # Build results CSV
+    # Build results CSV with warning header
     results_df = pd.DataFrame(csv_rows)
     csv_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.csv")
-    results_df.to_csv(csv_local, index=False)
+
+    # Write CSV with warning comment at the top
+    with open(csv_local, 'w', encoding='utf-8', newline='') as f:
+        # Add warning header (will appear as first row in Excel/Google Sheets)
+        f.write('⚠️ IMPORTANT: Image URLs expire when app is updated (typically 1-2 weeks). Download ZIP bundle for permanent backup.\n')
+        f.write('\n')  # Blank line for readability
+        # Write actual data
+        results_df.to_csv(f, index=False)
 
     csv_blob = f"results/{job_id}/results_{job_id}.csv"
     upload_file(csv_local, csv_blob)
     csv_url = make_signed_url(csv_blob)
 
-    # Generate HTML report with embedded images
+    # Generate HTML report with embedded images (skip for large batches to save memory)
+    skip_html = total > 200
     html_local = os.path.join(tempfile.gettempdir(), f"Report_{job_id}.html")
+    html_url = None
 
-    # We need a function to get local paths from blob paths for image encoding
-    # This lambda will be passed to the HTML generator
-    def blob_to_local(blob_path):
-        # For local storage, blob paths are relative to storage base
-        # The make_signed_url returns /files/<blob_path>
-        # We need to reconstruct the actual local path
-        from storage_helpers import get_file_path
-        return get_file_path(blob_path)
+    if skip_html:
+        log.info(f"Skipping HTML generation for large batch ({total} addresses) to conserve memory")
+    else:
+        # We need a function to get local paths from blob paths for image encoding
+        # This lambda will be passed to the HTML generator
+        def blob_to_local(blob_path):
+            # For local storage, blob paths are relative to storage base
+            # The make_signed_url returns /files/<blob_path>
+            # We need to reconstruct the actual local path
+            from storage_helpers import get_file_path
+            return get_file_path(blob_path)
 
-    try:
-        generate_html_report(
-            web_results=web_results,
-            job_id=job_id,
-            output_path=html_local,
-            get_local_path_func=blob_to_local
-        )
+        try:
+            generate_html_report(
+                web_results=web_results,
+                job_id=job_id,
+                output_path=html_local,
+                get_local_path_func=blob_to_local
+            )
 
-        # Upload HTML report
-        html_blob = f"results/{job_id}/Report_{job_id}.html"
-        upload_file(html_local, html_blob)
-        html_url = make_signed_url(html_blob)
-    except Exception as e:
-        print(f"Warning: Failed to generate HTML report: {e}")
-        html_url = None
+            # Upload HTML report
+            html_blob = f"results/{job_id}/Report_{job_id}.html"
+            upload_file(html_local, html_blob)
+            html_url = make_signed_url(html_blob)
+        except Exception as e:
+            log.warning(f"Failed to generate HTML report: {e}")
+            html_url = None
 
     # Create ZIP bundle with everything
     zip_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.zip")
 
     try:
+        # Define blob_to_local if not already defined
+        if skip_html:
+            from storage_helpers import get_file_path
+            def blob_to_local(blob_path):
+                return get_file_path(blob_path)
+
         # Extract all image paths
         image_paths = extract_image_paths_from_results(web_results, blob_to_local)
 
-        # Create the bundle
+        # Create the bundle (pass None for html_path if skipped)
         create_results_bundle(
-            html_path=html_local,
+            html_path=html_local if not skip_html and os.path.exists(html_local) else None,
             csv_path=csv_local,
             image_paths=image_paths,
             output_zip_path=zip_local,
@@ -332,7 +385,7 @@ def process_address_list(
         upload_file(zip_local, zip_blob)
         zip_url = make_signed_url(zip_blob)
     except Exception as e:
-        print(f"Warning: Failed to create ZIP bundle: {e}")
+        log.warning(f"Failed to create ZIP bundle: {e}")
         zip_url = None
 
     return {
