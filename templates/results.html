@@ -512,7 +512,9 @@
                     updateDashboard(finalTotal, finalTotal);
                 } else if (data.status === 'failed') {
                     clearInterval(pollingInterval);
-                    statusElement.textContent = 'Job Failed. Check the worker terminal for errors.';
+                    const errorMsg = data.message || 'Check the worker terminal for errors.';
+                    statusElement.textContent = `Job Failed: ${errorMsg}`;
+                    statusElement.style.color = '#dc3545';
                     loaderElement.style.display = 'none';
                     cancelButton.style.display = 'none';
                 }

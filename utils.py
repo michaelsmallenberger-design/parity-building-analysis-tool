@@ -43,6 +43,12 @@ NYC_BBOX = "-74.25909,40.477399,-73.700272,40.917577"  # NYC bounding box
 NOMINATIM_USER_AGENT = "ParityBuildingAnalysisTool/1.0"
 NOMINATIM_RATE_LIMIT = 1.0  # seconds between requests
 
+# Accuracy improvement: Center-crop analysis to reduce false positives
+# When enabled, YOLO only analyzes the center portion of the image to focus on target building
+CENTER_ANALYSIS_ENABLED = os.getenv("CENTER_ANALYSIS_ENABLED", "true").lower() == "true"
+CENTER_CROP_PERCENT = float(os.getenv("CENTER_CROP_PERCENT", "0.45"))  # Analyze center 45% of image
+SHOW_TARGET_ZONE = os.getenv("SHOW_TARGET_ZONE", "true").lower() == "true"  # Draw target zone indicator
+
 log = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -338,14 +344,108 @@ def _safe_basename(path: str) -> str:
     return os.path.splitext(base)[0]
 
 
+def _center_crop_image(img: Image.Image, crop_percent: float) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+    """
+    Crop image to center portion to focus on target building.
+
+    Args:
+        img: PIL Image
+        crop_percent: Percentage of image to keep (0.0-1.0). E.g., 0.45 = keep center 45%
+
+    Returns:
+        (cropped_image, crop_box) where crop_box is (left, top, right, bottom) in original coords
+    """
+    width, height = img.size
+
+    # Calculate crop box (center region)
+    crop_width = int(width * crop_percent)
+    crop_height = int(height * crop_percent)
+
+    left = (width - crop_width) // 2
+    top = (height - crop_height) // 2
+    right = left + crop_width
+    bottom = top + crop_height
+
+    crop_box = (left, top, right, bottom)
+    cropped = img.crop(crop_box)
+
+    return cropped, crop_box
+
+
+def _draw_target_zone(img: Image.Image, crop_box: Tuple[int, int, int, int], color: str = "#00FF00") -> Image.Image:
+    """
+    Draw a rectangle showing the target analysis zone.
+
+    Args:
+        img: PIL Image to draw on
+        crop_box: (left, top, right, bottom) coordinates of target zone
+        color: Color for the rectangle (hex or named color)
+
+    Returns:
+        Image with target zone indicator
+    """
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(img)
+    left, top, right, bottom = crop_box
+
+    # Draw rectangle with dashed effect
+    line_width = 3
+    dash_length = 15
+    gap_length = 10
+
+    # Top edge
+    for x in range(left, right, dash_length + gap_length):
+        draw.line([(x, top), (min(x + dash_length, right), top)], fill=color, width=line_width)
+
+    # Bottom edge
+    for x in range(left, right, dash_length + gap_length):
+        draw.line([(x, bottom), (min(x + dash_length, right), bottom)], fill=color, width=line_width)
+
+    # Left edge
+    for y in range(top, bottom, dash_length + gap_length):
+        draw.line([(left, y), (left, min(y + dash_length, bottom))], fill=color, width=line_width)
+
+    # Right edge
+    for y in range(top, bottom, dash_length + gap_length):
+        draw.line([(right, y), (right, min(y + dash_length, bottom))], fill=color, width=line_width)
+
+    # Add label
+    from PIL import ImageFont
+    try:
+        # Try to use a nice font if available
+        font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        # Fall back to default font
+        font = ImageFont.load_default()
+
+    label = "TARGET ZONE"
+    # Position label at top of zone
+    label_pos = (left + 10, top + 10)
+
+    # Draw background for label
+    try:
+        bbox = draw.textbbox(label_pos, label, font=font)
+        draw.rectangle(bbox, fill="black")
+        draw.text(label_pos, label, fill=color, font=font)
+    except:
+        # Fallback for older PIL versions
+        draw.text(label_pos, label, fill=color, font=font)
+
+    return img
+
+
 def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
     """
-    Runs YOLO on the given image_path.
+    Runs YOLO on the given image_path with optional center-crop analysis.
     Saves an annotated image under static/results/<base>_pred.jpg
     Returns (web_relative_url, confidence_float_or_None)
 
     - web_relative_url is a path like 'results/xxx_pred.jpg' (to be joined with 'static/' by caller)
     - confidence is max confidence among detections (0..1), or None if no detections.
+
+    If CENTER_ANALYSIS_ENABLED is True, only analyzes the center portion of the image
+    to reduce false positives from cooling towers on neighboring buildings.
     """
     # Ensure result folder exists
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -355,20 +455,34 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
     out_filename = f"{base}_pred.jpg"
     out_path = os.path.join(RESULTS_DIR, out_filename)
 
+    # Load original image
+    original_img = Image.open(image_path).convert("RGB")
+
     # Run model
     model = _get_model()
-
-    # Ultralytics predict:
-    # - conf: default is fine; tweak via env YOLO_CONF if desired
-    # - imgsz: optional (controls inference size)
     conf_thr = float(os.getenv("YOLO_CONF", "0.25"))
 
-    # We draw boxes ourselves if needed; but using save=True gives us an annotated image.
-    # However, save=True writes to a run directory; to control the exact output path,
-    # we'll run predict and then save the plotted image manually.
-    results = model.predict(source=image_path, conf=conf_thr, verbose=False)
+    # Determine analysis strategy
+    crop_box = None
+    inference_image_path = image_path
 
-    # Compute a reasonable confidence: max over boxes (if any)
+    if CENTER_ANALYSIS_ENABLED:
+        # Center-crop approach: Only analyze center portion
+        log.info(f"Center analysis enabled (crop_percent={CENTER_CROP_PERCENT})")
+
+        cropped_img, crop_box = _center_crop_image(original_img, CENTER_CROP_PERCENT)
+
+        # Save cropped image to temp file for YOLO
+        import tempfile
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".jpg")
+        os.close(temp_fd)
+        cropped_img.save(temp_path, format="JPEG", quality=92)
+        inference_image_path = temp_path
+
+    # Run YOLO inference
+    results = model.predict(source=inference_image_path, conf=conf_thr, verbose=False)
+
+    # Compute confidence: max over boxes (if any)
     det_conf: Optional[float] = None
     try:
         if results and len(results) > 0:
@@ -382,27 +496,68 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
                     # older versions: r0.boxes.conf may already be a list/ndarray
                     det_conf = float(max(r0.boxes.conf)) if len(r0.boxes.conf) else None
 
-            # Save annotated image
-            # r0.plot() returns a numpy array (BGR) with annotations
-            plotted = r0.plot()  # ndarray HxWxC in BGR
-            if plotted is not None:
-                # Convert BGR to RGB for PIL
+                log.info(f"Detection found with confidence: {det_conf:.3f}")
+
+            # Generate annotated image
+            if CENTER_ANALYSIS_ENABLED:
+                # For center-crop mode: Show full image with target zone indicator
+                # Draw YOLO detections on cropped region, then overlay on full image
                 import numpy as np
-                from PIL import Image
-                rgb = plotted[:, :, ::-1]
-                Image.fromarray(rgb).save(out_path, format="JPEG", quality=92)
+
+                # Get annotated crop from YOLO
+                plotted_crop = r0.plot()  # ndarray HxWxC in BGR
+                if plotted_crop is not None:
+                    rgb_crop = plotted_crop[:, :, ::-1]
+
+                    # Paste annotated crop back onto full image
+                    full_img_with_annotations = original_img.copy()
+                    crop_img_pil = Image.fromarray(rgb_crop)
+                    full_img_with_annotations.paste(crop_img_pil, (crop_box[0], crop_box[1]))
+
+                    # Draw target zone indicator if enabled
+                    if SHOW_TARGET_ZONE:
+                        full_img_with_annotations = _draw_target_zone(full_img_with_annotations, crop_box)
+
+                    full_img_with_annotations.save(out_path, format="JPEG", quality=92)
+                else:
+                    # Fallback: save original with target zone
+                    final_img = original_img.copy()
+                    if SHOW_TARGET_ZONE and crop_box:
+                        final_img = _draw_target_zone(final_img, crop_box)
+                    final_img.save(out_path, format="JPEG", quality=92)
             else:
-                # Fallback: copy original if plotting failed
-                Image.open(image_path).convert("RGB").save(out_path, format="JPEG", quality=92)
+                # Standard mode: Save YOLO annotated image directly
+                plotted = r0.plot()  # ndarray HxWxC in BGR
+                if plotted is not None:
+                    import numpy as np
+                    rgb = plotted[:, :, ::-1]
+                    Image.fromarray(rgb).save(out_path, format="JPEG", quality=92)
+                else:
+                    original_img.save(out_path, format="JPEG", quality=92)
         else:
-            # No result object; just copy the original
-            Image.open(image_path).convert("RGB").save(out_path, format="JPEG", quality=92)
+            # No detections
+            log.info("No detections found")
+            if CENTER_ANALYSIS_ENABLED and SHOW_TARGET_ZONE and crop_box:
+                # Show target zone even when no detections
+                final_img = original_img.copy()
+                final_img = _draw_target_zone(final_img, crop_box)
+                final_img.save(out_path, format="JPEG", quality=92)
+            else:
+                original_img.save(out_path, format="JPEG", quality=92)
+
     except Exception as e:
-        log.error("YOLO post-processing failed: %s", e)
-        # Try to at least copy the original image to the output
+        log.error("YOLO processing failed: %s", e, exc_info=True)
+        # Try to at least save the original image
         try:
-            Image.open(image_path).convert("RGB").save(out_path, format="JPEG", quality=92)
+            original_img.save(out_path, format="JPEG", quality=92)
         except Exception:
+            pass
+
+    # Clean up temp file if created
+    if CENTER_ANALYSIS_ENABLED and inference_image_path != image_path:
+        try:
+            os.unlink(inference_image_path)
+        except:
             pass
 
     # Return a **web path relative to /static**, matching your tasks code expectations
