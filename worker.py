@@ -84,6 +84,7 @@ class BackgroundWorker:
 
             # Get full path to uploaded CSV
             full_csv_path = get_file_path(csv_path)
+            log.info(f"Resolved CSV path: {full_csv_path}")
 
             if not full_csv_path.exists():
                 raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -121,6 +122,17 @@ class BackgroundWorker:
                 make_signed_url=make_url_fn,
                 write_partial_result=write_partial_fn,
             )
+
+            # Check if result contains an error (from early CSV parsing failures)
+            if isinstance(result, dict) and "error" in result:
+                error_msg = result["error"]
+                log.error(f"Job {job_id} failed during processing: {error_msg}")
+                write_result(job_id, result)  # Save error result for user visibility
+                update_job_status(job_id, status="failed",
+                                progress=0,
+                                total=max(int(total), 1),
+                                message=error_msg)
+                return
 
             # Save result
             write_result(job_id, result)
