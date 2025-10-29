@@ -10,7 +10,6 @@ import pandas as pd
 from typing import Callable, Dict, Any, Optional
 from utils import geocode_address_mapbox, get_satellite_image_mapbox, run_prediction
 from html_report import generate_html_report
-from zip_bundler import create_results_bundle, extract_image_paths_from_results
 
 log = logging.getLogger("tasks")
 
@@ -309,20 +308,6 @@ def process_address_list(
     log.info(f"  ✗ Failed: {failed}")
     log.info(f"  📡 Cooling towers detected: {detections}")
 
-    # Build results CSV
-    results_df = pd.DataFrame(csv_rows)
-    csv_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.csv")
-
-    # Write CSV with simple note at top
-    with open(csv_local, 'w', encoding='utf-8', newline='') as f:
-        f.write('💡 TIP: Copy this table and paste directly into Google Sheets. Image URLs are clickable.\n')
-        f.write('\n')
-        results_df.to_csv(f, index=False)
-
-    csv_blob = f"results/{job_id}/results_{job_id}.csv"
-    upload_file(csv_local, csv_blob)
-    csv_url = make_signed_url(csv_blob)
-
     # Generate HTML report with embedded images (skip for large batches to save memory)
     skip_html = total > 200
     html_local = os.path.join(tempfile.gettempdir(), f"Report_{job_id}.html")
@@ -356,39 +341,7 @@ def process_address_list(
             log.warning(f"Failed to generate HTML report: {e}")
             html_url = None
 
-    # Create ZIP bundle with everything
-    zip_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.zip")
-
-    try:
-        # Define blob_to_local if not already defined
-        if skip_html:
-            from storage_helpers import get_file_path
-            def blob_to_local(blob_path):
-                return get_file_path(blob_path)
-
-        # Extract all image paths
-        image_paths = extract_image_paths_from_results(web_results, blob_to_local)
-
-        # Create the bundle (pass None for html_path if skipped)
-        create_results_bundle(
-            html_path=html_local if not skip_html and os.path.exists(html_local) else None,
-            csv_path=csv_local,
-            image_paths=image_paths,
-            output_zip_path=zip_local,
-            job_id=job_id
-        )
-
-        # Upload ZIP bundle
-        zip_blob = f"results/{job_id}/results_{job_id}.zip"
-        upload_file(zip_local, zip_blob)
-        zip_url = make_signed_url(zip_blob)
-    except Exception as e:
-        log.warning(f"Failed to create ZIP bundle: {e}")
-        zip_url = None
-
     return {
         "web_results": web_results,
-        "csv_url": csv_url,
-        "html_url": html_url,
-        "zip_url": zip_url
+        "html_url": html_url
     }

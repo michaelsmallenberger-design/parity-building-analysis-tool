@@ -431,10 +431,23 @@
     };
     statusContainer.appendChild(cancelButton);
 
+    let fetchRetries = 0;
+    const MAX_FETCH_RETRIES = 3;
+
     function checkJobStatus() {
-        fetch(`/status/${jobId}`)
-            .then(response => response.json())
+        // Add timeout to fetch (30 seconds)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+        fetch(`/status/${jobId}`, { signal: controller.signal })
+            .then(response => {
+                clearTimeout(timeoutId);
+                return response.json();
+            })
             .then(data => {
+                // Reset retry counter on success
+                fetchRetries = 0;
+
                 if (data.status === 'processing') {
                     const progress = data.progress || 0;
                     const total = data.total || initialTotal;
@@ -466,45 +479,24 @@
                         displayNewResults(finalResult.web_results);
                     }
 
-                    // Add download buttons
-                    const staticBase = `{{ url_for('static', filename='') }}`;
-                    if (finalResult && !headerElement.querySelector('.download-buttons')) {
-                        const downloadContainer = document.createElement('div');
-                        downloadContainer.className = 'download-buttons';
-
-                        // Add ZIP bundle button (primary - most useful)
-                        if (finalResult.zip_url) {
-                            const zipButton = document.createElement('a');
-                            zipButton.href = finalResult.zip_url;
-                            zipButton.textContent = '📦 Download Complete Bundle (ZIP)';
-                            zipButton.className = 'download-button primary';
-                            zipButton.title = 'Includes HTML report, CSV, and all images';
-                            downloadContainer.appendChild(zipButton);
-                        }
-
-                        // Add HTML report button
-                        if (finalResult.html_url) {
-                            const htmlButton = document.createElement('a');
-                            htmlButton.href = finalResult.html_url;
-                            htmlButton.textContent = '📄 View HTML Report';
-                            htmlButton.className = 'download-button secondary';
-                            htmlButton.title = 'Self-contained report with embedded images';
-                            htmlButton.target = '_blank';
-                            downloadContainer.appendChild(htmlButton);
-                        }
-
-                        // Add CSV button
-                        if (finalResult.csv_url || finalResult.csv_path) {
-                            const csvButton = document.createElement('a');
-                            const csvUrl = finalResult.csv_url ? finalResult.csv_url : staticBase + finalResult.csv_path;
-                            csvButton.href = csvUrl;
-                            csvButton.textContent = '📊 Download CSV Only';
-                            csvButton.className = 'download-button';
-                            csvButton.title = 'Spreadsheet data without images';
-                            downloadContainer.appendChild(csvButton);
-                        }
-
-                        headerElement.appendChild(downloadContainer);
+                    // Add copy-paste instruction banner
+                    if (!headerElement.querySelector('.copy-paste-instructions')) {
+                        const instructionBanner = document.createElement('div');
+                        instructionBanner.className = 'copy-paste-instructions';
+                        instructionBanner.innerHTML = `
+                            <div style="background: #e7f3ff; border-left: 4px solid #2196F3; padding: 1rem 1.5rem; margin: 1.5rem 0; border-radius: 4px;">
+                                <strong style="color: #1976D2; font-size: 1.1rem;">📋 Copy to Google Sheets</strong>
+                                <p style="margin: 0.5rem 0 0 0; color: #333;">
+                                    Select the table below (click and drag or Ctrl+A), copy (Ctrl+C / Cmd+C), then paste into Google Sheets.
+                                    Image URLs are clickable for verification.
+                                </p>
+                                <p style="margin: 0.5rem 0 0 0; color: #d32f2f; font-size: 0.9rem;">
+                                    ⚠️ <strong>Important:</strong> Image URLs will stop working when the app is updated/redeployed.
+                                    Verify addresses promptly or save images separately for permanent access.
+                                </p>
+                            </div>
+                        `;
+                        headerElement.appendChild(instructionBanner);
                     }
 
                     // Update dashboard with final counts
@@ -520,10 +512,21 @@
                 }
             })
             .catch(err => {
-                console.error('Error fetching status:', err);
-                statusElement.textContent = 'Error fetching status.';
-                loaderElement.style.display = 'none';
-                clearInterval(pollingInterval);
+                clearTimeout(timeoutId);
+
+                // Retry logic for transient errors
+                fetchRetries++;
+                if (fetchRetries < MAX_FETCH_RETRIES) {
+                    console.warn(`Fetch failed (attempt ${fetchRetries}/${MAX_FETCH_RETRIES}), retrying...`, err);
+                    // Don't show error to user, just retry on next interval
+                    return;
+                }
+
+                // Only show error after max retries
+                console.error('Error fetching status after retries:', err);
+                statusElement.textContent = 'Connection issue - refresh page to check status';
+                statusElement.style.color = '#ff9800';
+                // Don't stop polling - let it continue trying
             });
     }
 
