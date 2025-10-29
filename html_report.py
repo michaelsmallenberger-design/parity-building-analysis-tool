@@ -493,7 +493,7 @@ def _generate_html_content(
     html += """
         <div class="footer">
             <p><strong>Imagery:</strong> © Maxar (via Mapbox) | <strong>Map Data:</strong> © OpenStreetMap contributors</p>
-            <p><strong>ML Framework:</strong> Ultralytics YOLO (AGPL-3.0) | Built for <strong>Parity Housing</strong></p>
+            <p><strong>ML Framework:</strong> Ultralytics YOLO (AGPL-3.0) | Built for <strong>Parity, Inc.</strong></p>
             <p style="margin-top: 1rem;">
                 <em>This report is self-contained and can be opened in any web browser.</em><br>
                 <em>Images are embedded directly - no internet connection required.</em>
