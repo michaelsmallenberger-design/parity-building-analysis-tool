@@ -5,8 +5,11 @@ Uses local filesystem for storing uploads, results, and status files.
 import os
 import json
 import shutil
+import logging
 from pathlib import Path
 from urllib.parse import quote
+
+log = logging.getLogger(__name__)
 
 # Base storage directory
 STORAGE_BASE = Path(os.getenv("STORAGE_DIR", "storage"))
@@ -19,6 +22,20 @@ def init_storage():
     """Initialize storage directories."""
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Log URL detection for debugging
+    app_url = os.getenv('APP_URL')
+    railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
+    static_url = os.getenv('RAILWAY_STATIC_URL')
+
+    if app_url:
+        log.info(f"Using APP_URL for file URLs: {app_url}")
+    elif railway_domain:
+        log.info(f"Using RAILWAY_PUBLIC_DOMAIN for file URLs: https://{railway_domain}")
+    elif static_url:
+        log.info(f"Using RAILWAY_STATIC_URL for file URLs: {static_url}")
+    else:
+        log.warning("No base URL detected - file URLs will be relative paths. Set APP_URL env var for absolute URLs.")
 
 def upload_file(local_path: str, dest_path: str) -> str:
     """
@@ -76,14 +93,32 @@ def make_url(blob_path: str, base_url: str = None) -> str:
 
     Args:
         blob_path: Relative path (e.g., "results/job123/image.jpg")
-        base_url: Optional base URL (defaults to /files/)
+        base_url: Optional base URL (defaults to auto-detect from Railway env)
 
     Returns:
-        URL path for accessing the file
+        Full URL or relative path for accessing the file
     """
-    if base_url:
-        return f"{base_url.rstrip('/')}/files/{blob_path}"
-    return f"/files/{blob_path}"
+    # Auto-detect base URL from environment
+    if base_url is None:
+        # Priority 1: Manual override via APP_URL env var
+        app_url = os.getenv('APP_URL')
+        if app_url:
+            base_url = app_url
+        else:
+            # Priority 2: Railway public domain
+            railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
+            if railway_domain:
+                base_url = f"https://{railway_domain}"
+            else:
+                # Priority 3: RAILWAY_STATIC_URL
+                static_url = os.getenv('RAILWAY_STATIC_URL')
+                if static_url:
+                    base_url = static_url
+                else:
+                    # Last resort: Use relative path (works for web UI, not for external use)
+                    return f"/files/{blob_path}"
+
+    return f"{base_url.rstrip('/')}/files/{blob_path}"
 
 def write_json(blob_path: str, data: dict):
     """Write JSON data to a file."""
