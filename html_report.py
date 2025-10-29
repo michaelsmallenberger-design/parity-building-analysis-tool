@@ -1,8 +1,10 @@
 """
 HTML Report Generator
 Generates self-contained HTML reports with base64-embedded images.
+Optimized for easy copy-paste to spreadsheets.
 """
 import os
+import json
 import base64
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -153,13 +155,17 @@ def _generate_html_content(
     job_id: str,
     total_count: int
 ) -> str:
-    """Generate the HTML content."""
+    """Generate the HTML content - optimized for copy-paste to spreadsheets."""
 
     timestamp = datetime.now().strftime("%Y-%m-%d %I:%M %p")
 
     # Summary stats
     towers_detected = len(high_confidence) + len(needs_review)
     detection_rate = (towers_detected / total_count * 100) if total_count > 0 else 0
+
+    # Combine all results into one list, sorted by index
+    all_results = high_confidence + needs_review + low_confidence
+    all_results.sort(key=lambda x: x['index'])
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -171,175 +177,168 @@ def _generate_html_content(
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica', 'Arial', sans-serif;
-            line-height: 1.6;
+            line-height: 1.5;
             color: #333;
             background: #f5f5f5;
-            padding: 2rem;
+            padding: 1.5rem;
         }}
         .container {{
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
             background: white;
-            padding: 3rem;
+            padding: 2rem;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }}
         .header {{
             text-align: center;
-            margin-bottom: 3rem;
-            padding-bottom: 2rem;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
             border-bottom: 3px solid #667eea;
         }}
         .header h1 {{
             color: #2c3e50;
-            font-size: 2.5rem;
+            font-size: 2rem;
             margin-bottom: 0.5rem;
         }}
         .header .subtitle {{
             color: #7f8c8d;
-            font-size: 1.1rem;
+            font-size: 1rem;
         }}
-        .metadata {{
+        .summary {{
             background: #f8f9fa;
-            padding: 1.5rem;
-            border-radius: 8px;
+            padding: 1rem;
+            border-radius: 6px;
             margin-bottom: 2rem;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
             gap: 1rem;
         }}
-        .metadata-item {{
+        .summary-item {{
             text-align: center;
         }}
-        .metadata-item .label {{
-            font-size: 0.9rem;
+        .summary-item .label {{
+            font-size: 0.85rem;
             color: #7f8c8d;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }}
-        .metadata-item .value {{
-            font-size: 1.5rem;
+        .summary-item .value {{
+            font-size: 1.25rem;
             font-weight: bold;
             color: #2c3e50;
             margin-top: 0.25rem;
         }}
-        .section {{
-            margin: 3rem 0;
-        }}
-        .section-header {{
-            display: flex;
-            align-items: center;
-            gap: 1rem;
+        .instructions {{
+            background: #e7f3ff;
+            border-left: 4px solid #2196F3;
+            padding: 1rem 1.5rem;
             margin-bottom: 1.5rem;
-            padding-bottom: 0.75rem;
-            border-bottom: 2px solid #e0e0e0;
+            border-radius: 4px;
         }}
-        .section-header h2 {{
-            font-size: 1.8rem;
-            color: #2c3e50;
+        .instructions strong {{
+            color: #1976D2;
         }}
-        .section-header .count {{
-            background: #667eea;
-            color: white;
-            padding: 0.25rem 0.75rem;
-            border-radius: 20px;
-            font-size: 1rem;
-            font-weight: bold;
-        }}
-        .section-header.high {{ border-bottom-color: #27ae60; }}
-        .section-header.high h2 {{ color: #27ae60; }}
-        .section-header.medium {{ border-bottom-color: #f39c12; }}
-        .section-header.medium h2 {{ color: #e67e22; }}
-        .section-header.low {{ border-bottom-color: #95a5a6; }}
-        .section-header.low h2 {{ color: #7f8c8d; }}
-
         table {{
             width: 100%;
             border-collapse: collapse;
             margin-top: 1rem;
             background: white;
+            font-size: 0.95rem;
         }}
         thead {{
-            background: #f8f9fa;
+            background: #2c3e50;
+            color: white;
+            position: sticky;
+            top: 0;
         }}
         th {{
-            padding: 1rem;
+            padding: 0.75rem 0.5rem;
             text-align: left;
             font-weight: 600;
-            color: #2c3e50;
-            border-bottom: 2px solid #dee2e6;
+            border-right: 1px solid #4a5f7f;
+        }}
+        th:last-child {{
+            border-right: none;
         }}
         td {{
-            padding: 1rem;
-            border-bottom: 1px solid #e9ecef;
-            vertical-align: top;
+            padding: 0.6rem 0.5rem;
+            border-bottom: 1px solid #dee2e6;
+            border-right: 1px solid #e9ecef;
         }}
-        tr:hover {{
+        td:last-child {{
+            border-right: none;
+        }}
+        tbody tr:nth-child(even) {{
             background: #f8f9fa;
         }}
-        .confidence-badge {{
-            display: inline-block;
-            padding: 0.4rem 0.8rem;
-            border-radius: 20px;
+        tbody tr:hover {{
+            background: #e3f2fd;
+        }}
+        .detected-yes {{
+            color: #2e7d32;
             font-weight: bold;
+        }}
+        .detected-no {{
+            color: #7f8c8d;
+        }}
+        .view-images {{
+            color: #1976D2;
+            text-decoration: none;
+            cursor: pointer;
             font-size: 0.9rem;
         }}
-        .confidence-high {{
-            background: #d4edda;
-            color: #155724;
+        .view-images:hover {{
+            text-decoration: underline;
         }}
-        .confidence-medium {{
-            background: #fff3cd;
-            color: #856404;
+        .image-modal {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.9);
+            overflow: auto;
         }}
-        .confidence-low {{
-            background: #f8d7da;
-            color: #721c24;
+        .modal-content {{
+            margin: 2% auto;
+            display: block;
+            max-width: 90%;
+            max-height: 85%;
         }}
-        .image-cell {{
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-        }}
-        .image-thumbnail {{
-            max-width: 150px;
-            max-height: 150px;
-            border-radius: 4px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        .close-modal {{
+            position: absolute;
+            top: 20px;
+            right: 40px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s;
         }}
-        .image-thumbnail:hover {{
-            transform: scale(1.05);
+        .close-modal:hover {{
+            color: #bbb;
         }}
-        .image-label {{
-            font-size: 0.85rem;
-            color: #7f8c8d;
+        .modal-caption {{
             text-align: center;
-            margin-top: 0.25rem;
-        }}
-        .image-container {{
-            text-align: center;
+            color: #ccc;
+            padding: 10px;
+            font-size: 1.1rem;
         }}
         .footer {{
-            margin-top: 4rem;
-            padding-top: 2rem;
+            margin-top: 3rem;
+            padding-top: 1.5rem;
             border-top: 2px solid #e0e0e0;
             text-align: center;
             color: #7f8c8d;
-            font-size: 0.9rem;
-        }}
-        .footer a {{
-            color: #667eea;
-            text-decoration: none;
-        }}
-        .footer a:hover {{
-            text-decoration: underline;
+            font-size: 0.85rem;
         }}
         @media print {{
             body {{ background: white; padding: 0; }}
             .container {{ box-shadow: none; }}
-            .image-thumbnail {{ max-width: 100px; max-height: 100px; }}
+            .instructions, .view-images {{ display: none; }}
         }}
     </style>
 </head>
@@ -347,189 +346,147 @@ def _generate_html_content(
     <div class="container">
         <div class="header">
             <h1>🏢 Cooling Tower Analysis Report</h1>
-            <p class="subtitle">Rooftop Satellite Imagery Analysis</p>
             <p class="subtitle">Generated on {timestamp}</p>
         </div>
 
-        <div class="metadata">
-            <div class="metadata-item">
-                <div class="label">Job ID</div>
-                <div class="value" style="font-size: 1rem; word-break: break-all;">{job_id}</div>
-            </div>
-            <div class="metadata-item">
+        <div class="summary">
+            <div class="summary-item">
                 <div class="label">Total Addresses</div>
                 <div class="value">{total_count}</div>
             </div>
-            <div class="metadata-item">
+            <div class="summary-item">
                 <div class="label">Towers Detected</div>
                 <div class="value">{towers_detected}</div>
             </div>
-            <div class="metadata-item">
+            <div class="summary-item">
                 <div class="label">Detection Rate</div>
                 <div class="value">{detection_rate:.1f}%</div>
             </div>
+            <div class="summary-item">
+                <div class="label">Job ID</div>
+                <div class="value" style="font-size: 0.9rem; word-break: break-all;">{job_id}</div>
+            </div>
         </div>
+
+        <div class="instructions">
+            <strong>📋 Copy to Spreadsheet:</strong> Click and drag to select the table below, then press Ctrl+C (Windows) or Cmd+C (Mac) to copy.
+            Paste directly into Excel or Google Sheets. Images can be viewed by clicking "View Images" links.
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th style="width: 40px;">#</th>
+                    <th>Address</th>
+                    <th style="width: 100px;">Detected</th>
+                    <th style="width: 100px;">Confidence</th>
+                    <th style="width: 150px;">Notes</th>
+                    <th style="width: 100px;">Images</th>
+                </tr>
+            </thead>
+            <tbody>
 """
 
-    # High Confidence Section
-    if high_confidence:
-        html += f"""
-        <div class="section">
-            <div class="section-header high">
-                <h2>✅ High Confidence Detections</h2>
-                <span class="count">{len(high_confidence)}</span>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 40px;">#</th>
-                        <th>Address</th>
-                        <th style="width: 120px;">Confidence</th>
-                        <th style="width: 350px;">Images</th>
-                    </tr>
-                </thead>
-                <tbody>
-"""
-        for item in high_confidence:
-            html += f"""
-                    <tr>
-                        <td>{item['index']}</td>
-                        <td>{item['address']}</td>
-                        <td><span class="confidence-badge confidence-{item['confidence_class']}">{item['confidence_text']}</span></td>
-                        <td>
-                            <div class="image-cell">
-"""
-            if item['original_img']:
-                html += f"""
-                                <div class="image-container">
-                                    <img src="{item['original_img']}" alt="Original" class="image-thumbnail">
-                                    <div class="image-label">Original</div>
-                                </div>
-"""
-            if item['result_img']:
-                html += f"""
-                                <div class="image-container">
-                                    <img src="{item['result_img']}" alt="Result" class="image-thumbnail">
-                                    <div class="image-label">Detection</div>
-                                </div>
-"""
-            html += """
-                            </div>
-                        </td>
-                    </tr>
-"""
-        html += """
-                </tbody>
-            </table>
-        </div>
-"""
-
-    # Needs Review Section
-    if needs_review:
-        html += f"""
-        <div class="section">
-            <div class="section-header medium">
-                <h2>⚠️ Needs Review</h2>
-                <span class="count">{len(needs_review)}</span>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 40px;">#</th>
-                        <th>Address</th>
-                        <th style="width: 120px;">Confidence</th>
-                        <th style="width: 350px;">Images</th>
-                    </tr>
-                </thead>
-                <tbody>
-"""
-        for item in needs_review:
-            html += f"""
-                    <tr>
-                        <td>{item['index']}</td>
-                        <td>{item['address']}</td>
-                        <td><span class="confidence-badge confidence-{item['confidence_class']}">{item['confidence_text']}</span></td>
-                        <td>
-                            <div class="image-cell">
-"""
-            if item['original_img']:
-                html += f"""
-                                <div class="image-container">
-                                    <img src="{item['original_img']}" alt="Original" class="image-thumbnail">
-                                    <div class="image-label">Original</div>
-                                </div>
-"""
-            if item['result_img']:
-                html += f"""
-                                <div class="image-container">
-                                    <img src="{item['result_img']}" alt="Result" class="image-thumbnail">
-                                    <div class="image-label">Detection</div>
-                                </div>
-"""
-            html += """
-                            </div>
-                        </td>
-                    </tr>
-"""
-        html += """
-                </tbody>
-            </table>
-        </div>
-"""
-
-    # Low/No Detection Section
-    if low_confidence:
-        html += f"""
-        <div class="section">
-            <div class="section-header low">
-                <h2>❌ Low/No Detection</h2>
-                <span class="count">{len(low_confidence)}</span>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 40px;">#</th>
-                        <th>Address</th>
-                        <th style="width: 120px;">Status</th>
-                        <th style="width: 180px;">Image</th>
-                    </tr>
-                </thead>
-                <tbody>
-"""
-        for item in low_confidence:
-            html += f"""
-                    <tr>
-                        <td>{item['index']}</td>
-                        <td>{item['address']}</td>
-                        <td>
-"""
-            if item.get('error'):
-                html += f"{item['confidence_text']}"
+    # Generate table rows - single unified table
+    for item in all_results:
+        # Determine detected status
+        if item.get('error'):
+            detected = "Error"
+            detected_class = "detected-no"
+            confidence_display = "—"
+            notes = item['confidence_text']
+        elif item['confidence'] is not None and item['confidence'] >= 0.40:
+            detected = "Yes"
+            detected_class = "detected-yes"
+            confidence_display = item['confidence_text']
+            if item['confidence'] >= 0.70:
+                notes = "High confidence"
             else:
-                html += f"<span class=\"confidence-badge confidence-{item['confidence_class']}\">{item['confidence_text']}</span>"
+                notes = "Review recommended"
+        else:
+            detected = "No"
+            detected_class = "detected-no"
+            confidence_display = item['confidence_text'] if not item.get('error') else "—"
+            notes = "No detection" if not item.get('error') else ""
 
-            html += """
-                        </td>
-                        <td>
-"""
-            if item['original_img']:
-                html += f"""
-                            <div class="image-container">
-                                <img src="{item['original_img']}" alt="Original" class="image-thumbnail">
-                                <div class="image-label">Original</div>
-                            </div>
-"""
-            else:
-                html += "N/A"
+        html += f"""
+                <tr>
+                    <td>{item['index']}</td>
+                    <td>{item['address']}</td>
+                    <td class="{detected_class}">{detected}</td>
+                    <td>{confidence_display}</td>
+                    <td>{notes}</td>
+                    <td>"""
 
-            html += """
-                        </td>
-                    </tr>
+        # Add view images link if images exist
+        if item.get('original_img') or item.get('result_img'):
+            html += f'<a href="#" class="view-images" onclick="showImages({item["index"]}, event); return false;">View Images</a>'
+        else:
+            html += "—"
+
+        html += """</td>
+                </tr>
 """
-        html += """
-                </tbody>
-            </table>
+
+    html += """
+            </tbody>
+        </table>
+
+        <!-- Image Modal -->
+        <div id="imageModal" class="image-modal" onclick="closeModal()">
+            <span class="close-modal" onclick="closeModal()">&times;</span>
+            <div class="modal-caption" id="modalCaption"></div>
+            <img class="modal-content" id="modalImage">
         </div>
+
+        <script>
+            // Store image data
+            const imageData = {
+"""
+
+    # Add image data for JavaScript
+    for item in all_results:
+        if item.get('original_img') or item.get('result_img'):
+            html += f"""
+                {item['index']}: {{
+                    address: {json.dumps(item['address'])},
+                    original: {json.dumps(item.get('original_img', ''))},
+                    result: {json.dumps(item.get('result_img', ''))}
+                }},
+"""
+
+    html += """
+            };
+
+            function showImages(index, event) {
+                event.stopPropagation();
+                const data = imageData[index];
+                if (!data) return;
+
+                const modal = document.getElementById('imageModal');
+                const img = document.getElementById('modalImage');
+                const caption = document.getElementById('modalCaption');
+
+                // Show result image if available, otherwise original
+                img.src = data.result || data.original;
+                caption.innerHTML = `<strong>#${index}: ${data.address}</strong><br>
+                    ${data.result ? 'Detection Result' : 'Original Image'}<br>
+                    <small>Click anywhere to close</small>`;
+
+                modal.style.display = 'block';
+            }
+
+            function closeModal() {
+                document.getElementById('imageModal').style.display = 'none';
+            }
+
+            // Close modal on Escape key
+            document.addEventListener('keydown', function(event) {
+                if (event.key === 'Escape') {
+                    closeModal();
+                }
+            });
+        </script>
 """
 
     # Footer
