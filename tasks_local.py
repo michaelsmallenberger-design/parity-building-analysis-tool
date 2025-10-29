@@ -309,16 +309,14 @@ def process_address_list(
     log.info(f"  ✗ Failed: {failed}")
     log.info(f"  📡 Cooling towers detected: {detections}")
 
-    # Build results CSV with warning header
+    # Build results CSV
     results_df = pd.DataFrame(csv_rows)
     csv_local = os.path.join(tempfile.gettempdir(), f"results_{job_id}.csv")
 
-    # Write CSV with warning comment at the top
+    # Write CSV with simple note at top
     with open(csv_local, 'w', encoding='utf-8', newline='') as f:
-        # Add warning header (will appear as first row in Excel/Google Sheets)
-        f.write('⚠️ IMPORTANT: Image URLs expire when app is updated (typically 1-2 weeks). Download ZIP bundle for permanent backup.\n')
-        f.write('\n')  # Blank line for readability
-        # Write actual data
+        f.write('💡 TIP: Copy this table and paste directly into Google Sheets. Image URLs are clickable.\n')
+        f.write('\n')
         results_df.to_csv(f, index=False)
 
     csv_blob = f"results/{job_id}/results_{job_id}.csv"
