@@ -36,46 +36,67 @@ def process_address_list(
 
     web_results, csv_rows = [], []
 
-    # Load CSV with comprehensive fallback handling
-    log.info(f"Reading CSV file: {uploaded_filepath}")
+    # Detect file type and load accordingly
+    file_ext = os.path.splitext(uploaded_filepath)[1].lower()
+    log.info(f"Reading file: {uploaded_filepath} (type: {file_ext})")
     df = None
 
-    # Try multiple encoding and delimiter combinations
-    encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
-    delimiters = [',', ';', '\t']
+    # Handle Excel files (.xlsx, .xls)
+    if file_ext in ['.xlsx', '.xls']:
+        try:
+            df = pd.read_excel(uploaded_filepath, engine='openpyxl' if file_ext == '.xlsx' else None)
 
-    for encoding in encodings:
-        if df is not None:
-            break
+            # Validate: must have at least 1 column and 1 row
+            if len(df.columns) >= 1 and len(df) > 0:
+                log.info(f"Excel file loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+            else:
+                df = None
+                error_msg = "Excel file is empty or has no valid data"
+                log.error(error_msg)
+                return {"error": error_msg}
+        except Exception as e:
+            error_msg = f"Failed to read Excel file: {str(e)}"
+            log.error(error_msg)
+            return {"error": error_msg}
 
-        for delimiter in delimiters:
-            try:
-                # Try to read with this combination
-                test_df = pd.read_csv(
-                    uploaded_filepath,
-                    encoding=encoding,
-                    sep=delimiter,
-                    skipinitialspace=True,   # Remove leading whitespace
-                    skip_blank_lines=True,   # Skip empty rows
-                    on_bad_lines='warn',     # Warn but don't fail on malformed rows
-                    engine='python'          # More flexible parser for edge cases
-                )
+    # Handle CSV files with comprehensive fallback handling
+    else:
+        # Try multiple encoding and delimiter combinations
+        encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
+        delimiters = [',', ';', '\t']
 
-                # Validate: must have at least 1 column and 1 row
-                if len(test_df.columns) >= 1 and len(test_df) > 0:
-                    df = test_df
-                    log.info(f"CSV loaded successfully with encoding='{encoding}', delimiter='{repr(delimiter)}'")
-                    break
+        for encoding in encodings:
+            if df is not None:
+                break
 
-            except Exception as e:
-                # Continue trying other combinations
-                continue
+            for delimiter in delimiters:
+                try:
+                    # Try to read with this combination
+                    test_df = pd.read_csv(
+                        uploaded_filepath,
+                        encoding=encoding,
+                        sep=delimiter,
+                        skipinitialspace=True,   # Remove leading whitespace
+                        skip_blank_lines=True,   # Skip empty rows
+                        on_bad_lines='warn',     # Warn but don't fail on malformed rows
+                        engine='python'          # More flexible parser for edge cases
+                    )
 
-    # If all attempts failed
-    if df is None:
-        error_msg = f"Failed to read CSV file. Tried encodings: {encodings}, delimiters: [comma, semicolon, tab]. Please ensure the file is a valid CSV."
-        log.error(error_msg)
-        return {"error": error_msg}
+                    # Validate: must have at least 1 column and 1 row
+                    if len(test_df.columns) >= 1 and len(test_df) > 0:
+                        df = test_df
+                        log.info(f"CSV loaded successfully with encoding='{encoding}', delimiter='{repr(delimiter)}'")
+                        break
+
+                except Exception as e:
+                    # Continue trying other combinations
+                    continue
+
+        # If all attempts failed
+        if df is None:
+            error_msg = f"Failed to read CSV file. Tried encodings: {encodings}, delimiters: [comma, semicolon, tab]. Please ensure the file is a valid CSV."
+            log.error(error_msg)
+            return {"error": error_msg}
 
     # Strip whitespace from column names
     df.columns = df.columns.str.strip()

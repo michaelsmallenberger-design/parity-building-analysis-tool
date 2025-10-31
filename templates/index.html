@@ -70,10 +70,10 @@
     <h1>Building Analysis Tool</h1>
     <h2>Made for <img src="/static/images/Parity-Logo.png" alt="Parity Icon" width="42"> by <a href="https://github.com/mahkuhse">Max Chen</a></h2>
     <p class="blurb">
-        Upload a CSV file with a list of addresses to begin analyzing.
+        Upload a CSV or Excel file with a list of addresses to begin analyzing.
     </p>
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" required accept=".csv,.txt">
+        <input type="file" name="file" required accept=".csv,.xlsx,.xls">
         <input type="submit" value="Start Analysis">
     </form>
 </div>

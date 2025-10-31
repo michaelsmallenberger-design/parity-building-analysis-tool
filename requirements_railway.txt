@@ -12,6 +12,7 @@ pillow==11.3.0
 # Data processing
 pandas==2.3.2
 numpy==2.2.6
+openpyxl==3.1.2  # Excel file support
 
 # HTTP requests
 requests==2.32.5
