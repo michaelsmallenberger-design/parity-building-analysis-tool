@@ -517,8 +517,8 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
     # Run model
     model = _get_model()
     # YOLO confidence threshold: Higher = fewer detections but higher precision
-    # 0.30 balances false positives vs false negatives better than 0.25
-    conf_thr = float(os.getenv("YOLO_CONF", "0.30"))
+    # 0.40 reduces false positives from low-confidence phantom detections
+    conf_thr = float(os.getenv("YOLO_CONF", "0.40"))
 
     # Multi-scale analysis: Run two passes at different crop sizes
     if MULTI_SCALE_ANALYSIS and CENTER_ANALYSIS_ENABLED:
