@@ -26,7 +26,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("models", "rooftop_model.pt"))
 
 # Mapbox static image settings
 MAPBOX_STYLE = "mapbox/satellite-v9"  # satellite basemap
-MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "19"))  # 18–20 are usually good for roofs
+MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "20"))  # 18–21 are good for roofs; 20 gives more detail
 MAPBOX_SIZE = os.getenv("MAPBOX_SIZE", "768x768")   # WxH; <= 1280x1280
 MAPBOX_HIGH_DPI = os.getenv("MAPBOX_DPI", "false").lower() == "true"  # @2x images
 # Optional bottom crop in pixels to remove API watermarks/logos; set via env
@@ -46,7 +46,17 @@ NOMINATIM_RATE_LIMIT = 1.0  # seconds between requests
 # Accuracy improvement: Center-crop analysis to reduce false positives
 # When enabled, YOLO only analyzes the center portion of the image to focus on target building
 CENTER_ANALYSIS_ENABLED = os.getenv("CENTER_ANALYSIS_ENABLED", "true").lower() == "true"
-CENTER_CROP_PERCENT = float(os.getenv("CENTER_CROP_PERCENT", "0.45"))  # Analyze center 45% of image
+
+# Aggressive crop mode: Use 30% crop instead of 45% to reduce false positives from nearby buildings
+# Trade-off: May miss off-center geocoding, but significantly reduces neighbor building detections
+AGGRESSIVE_CROP = os.getenv("AGGRESSIVE_CROP", "false").lower() == "true"
+
+# Set crop percentage based on mode
+if AGGRESSIVE_CROP:
+    CENTER_CROP_PERCENT = float(os.getenv("CENTER_CROP_PERCENT", "0.30"))  # Aggressive: center 30%
+else:
+    CENTER_CROP_PERCENT = float(os.getenv("CENTER_CROP_PERCENT", "0.45"))  # Standard: center 45%
+
 SHOW_TARGET_ZONE = os.getenv("SHOW_TARGET_ZONE", "true").lower() == "true"  # Draw target zone indicator
 
 log = logging.getLogger(__name__)
@@ -460,7 +470,9 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
 
     # Run model
     model = _get_model()
-    conf_thr = float(os.getenv("YOLO_CONF", "0.25"))
+    # YOLO confidence threshold: Higher = fewer detections but higher precision
+    # 0.30 balances false positives vs false negatives better than 0.25
+    conf_thr = float(os.getenv("YOLO_CONF", "0.30"))
 
     # Determine analysis strategy
     crop_box = None
