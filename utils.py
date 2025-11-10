@@ -47,11 +47,18 @@ NOMINATIM_RATE_LIMIT = 1.0  # seconds between requests
 # When enabled, YOLO only analyzes the center portion of the image to focus on target building
 CENTER_ANALYSIS_ENABLED = os.getenv("CENTER_ANALYSIS_ENABLED", "true").lower() == "true"
 
+# Multi-scale analysis: Run detection at two crop sizes to balance false positives and false negatives
+# Wide pass catches edge towers, tight pass provides high-precision center detections
+MULTI_SCALE_ANALYSIS = os.getenv("MULTI_SCALE_ANALYSIS", "false").lower() == "true"
+MULTI_SCALE_WIDE_PERCENT = float(os.getenv("MULTI_SCALE_WIDE_PERCENT", "0.60"))  # Wide: 60%
+MULTI_SCALE_TIGHT_PERCENT = float(os.getenv("MULTI_SCALE_TIGHT_PERCENT", "0.30"))  # Tight: 30%
+
 # Aggressive crop mode: Use 30% crop instead of 45% to reduce false positives from nearby buildings
 # Trade-off: May miss off-center geocoding, but significantly reduces neighbor building detections
+# Note: Superseded by MULTI_SCALE_ANALYSIS when enabled
 AGGRESSIVE_CROP = os.getenv("AGGRESSIVE_CROP", "false").lower() == "true"
 
-# Set crop percentage based on mode
+# Set crop percentage based on mode (only used when MULTI_SCALE_ANALYSIS is disabled)
 if AGGRESSIVE_CROP:
     CENTER_CROP_PERCENT = float(os.getenv("CENTER_CROP_PERCENT", "0.30"))  # Aggressive: center 30%
 else:
@@ -445,17 +452,56 @@ def _draw_target_zone(img: Image.Image, crop_box: Tuple[int, int, int, int], col
     return img
 
 
+def _run_inference_on_crop(model, original_img: Image.Image, crop_percent: float, conf_thr: float) -> Tuple[any, Tuple[int, int, int, int], Optional[float]]:
+    """
+    Helper function to run YOLO inference on a cropped portion of the image.
+
+    Returns:
+        (yolo_result, crop_box, confidence)
+    """
+    import tempfile
+
+    cropped_img, crop_box = _center_crop_image(original_img, crop_percent)
+
+    # Save cropped image to temp file for YOLO
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".jpg")
+    os.close(temp_fd)
+    cropped_img.save(temp_path, format="JPEG", quality=92)
+
+    try:
+        # Run YOLO inference
+        results = model.predict(source=temp_path, conf=conf_thr, verbose=False)
+
+        # Compute confidence
+        det_conf = None
+        if results and len(results) > 0:
+            r0 = results[0]
+            if hasattr(r0, "boxes") and r0.boxes is not None and len(r0.boxes) > 0:
+                try:
+                    det_conf = float(r0.boxes.conf.max().item())
+                except Exception:
+                    det_conf = float(max(r0.boxes.conf)) if len(r0.boxes.conf) else None
+
+        return (results[0] if results and len(results) > 0 else None, crop_box, det_conf)
+    finally:
+        # Cleanup temp file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+
 def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
     """
-    Runs YOLO on the given image_path with optional center-crop analysis.
+    Runs YOLO on the given image_path with optional center-crop or multi-scale analysis.
     Saves an annotated image under static/results/<base>_pred.jpg
     Returns (web_relative_url, confidence_float_or_None)
 
     - web_relative_url is a path like 'results/xxx_pred.jpg' (to be joined with 'static/' by caller)
     - confidence is max confidence among detections (0..1), or None if no detections.
 
-    If CENTER_ANALYSIS_ENABLED is True, only analyzes the center portion of the image
-    to reduce false positives from cooling towers on neighboring buildings.
+    Multi-scale mode: Runs inference at two crop sizes (wide + tight) to balance
+    false positives and false negatives across varying image zoom levels.
     """
     # Ensure result folder exists
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -474,44 +520,77 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
     # 0.30 balances false positives vs false negatives better than 0.25
     conf_thr = float(os.getenv("YOLO_CONF", "0.30"))
 
-    # Determine analysis strategy
-    crop_box = None
-    inference_image_path = image_path
+    # Multi-scale analysis: Run two passes at different crop sizes
+    if MULTI_SCALE_ANALYSIS and CENTER_ANALYSIS_ENABLED:
+        log.info(f"Multi-scale analysis: wide={MULTI_SCALE_WIDE_PERCENT*100:.0f}%, tight={MULTI_SCALE_TIGHT_PERCENT*100:.0f}%")
 
-    if CENTER_ANALYSIS_ENABLED:
+        # Wide pass: catches edge towers
+        wide_result, wide_box, wide_conf = _run_inference_on_crop(
+            model, original_img, MULTI_SCALE_WIDE_PERCENT, conf_thr
+        )
+
+        # Tight pass: high precision center
+        tight_result, tight_box, tight_conf = _run_inference_on_crop(
+            model, original_img, MULTI_SCALE_TIGHT_PERCENT, conf_thr
+        )
+
+        # Merge results
+        detected_wide = wide_conf is not None
+        detected_tight = tight_conf is not None
+
+        if detected_wide and detected_tight:
+            # Detection in BOTH zones = High confidence (use tighter zone result)
+            log.info(f"Multi-scale: Detected in BOTH zones (wide={wide_conf:.3f}, tight={tight_conf:.3f}) → HIGH CONFIDENCE")
+            results = [tight_result] if tight_result else None
+            crop_box = tight_box
+            det_conf = max(wide_conf, tight_conf)
+        elif detected_tight:
+            # Detection ONLY in tight zone = High confidence center detection
+            log.info(f"Multi-scale: Detected ONLY in tight zone ({tight_conf:.3f}) → HIGH CONFIDENCE")
+            results = [tight_result]
+            crop_box = tight_box
+            det_conf = tight_conf
+        elif detected_wide:
+            # Detection ONLY in wide zone = Possible edge tower or neighbor
+            log.info(f"Multi-scale: Detected ONLY in wide zone ({wide_conf:.3f}) → NEEDS REVIEW")
+            results = [wide_result]
+            crop_box = wide_box
+            det_conf = wide_conf
+        else:
+            # No detection in either zone
+            log.info("Multi-scale: No detection in either zone")
+            results = None
+            crop_box = wide_box  # Show wide zone for context
+            det_conf = None
+
+    # Standard single-pass analysis
+    elif CENTER_ANALYSIS_ENABLED:
         # Center-crop approach: Only analyze center portion
         log.info(f"Center analysis enabled (crop_percent={CENTER_CROP_PERCENT})")
 
-        cropped_img, crop_box = _center_crop_image(original_img, CENTER_CROP_PERCENT)
+        result, crop_box, det_conf = _run_inference_on_crop(
+            model, original_img, CENTER_CROP_PERCENT, conf_thr
+        )
+        results = [result] if result else None
 
-        # Save cropped image to temp file for YOLO
-        import tempfile
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".jpg")
-        os.close(temp_fd)
-        cropped_img.save(temp_path, format="JPEG", quality=92)
-        inference_image_path = temp_path
-
-    # Run YOLO inference
-    results = model.predict(source=inference_image_path, conf=conf_thr, verbose=False)
-
-    # Compute confidence: max over boxes (if any)
-    det_conf: Optional[float] = None
-    try:
+    else:
+        # Full image analysis (no cropping)
+        results = model.predict(source=image_path, conf=conf_thr, verbose=False)
+        crop_box = None
+        det_conf = None
         if results and len(results) > 0:
             r0 = results[0]
-            # r0.boxes.conf is a tensor; get max if there are boxes
             if hasattr(r0, "boxes") and r0.boxes is not None and len(r0.boxes) > 0:
-                # .conf is a Tensor[N,1] - take max
                 try:
                     det_conf = float(r0.boxes.conf.max().item())
                 except Exception:
-                    # older versions: r0.boxes.conf may already be a list/ndarray
                     det_conf = float(max(r0.boxes.conf)) if len(r0.boxes.conf) else None
 
-                log.info(f"Detection found with confidence: {det_conf:.3f}")
-
-            # Generate annotated image
-            if CENTER_ANALYSIS_ENABLED:
+    # Generate annotated image
+    try:
+        if results and len(results) > 0:
+            r0 = results[0]
+            if CENTER_ANALYSIS_ENABLED or MULTI_SCALE_ANALYSIS:
                 # For center-crop mode: Show full image with target zone indicator
                 # Draw YOLO detections on cropped region, then overlay on full image
                 import numpy as np
@@ -563,13 +642,6 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
         try:
             original_img.save(out_path, format="JPEG", quality=92)
         except Exception:
-            pass
-
-    # Clean up temp file if created
-    if CENTER_ANALYSIS_ENABLED and inference_image_path != image_path:
-        try:
-            os.unlink(inference_image_path)
-        except:
             pass
 
     # Return a **web path relative to /static**, matching your tasks code expectations
