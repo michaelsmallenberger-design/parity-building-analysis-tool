@@ -26,7 +26,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("models", "rooftop_model.pt"))
 
 # Mapbox static image settings
 MAPBOX_STYLE = "mapbox/satellite-v9"  # satellite basemap
-MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "20"))  # 18–21 are good for roofs; 20 gives more detail
+MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "19"))  # 18–20 are usually good for roofs; 19 is optimal
 MAPBOX_SIZE = os.getenv("MAPBOX_SIZE", "768x768")   # WxH; <= 1280x1280
 MAPBOX_HIGH_DPI = os.getenv("MAPBOX_DPI", "false").lower() == "true"  # @2x images
 # Optional bottom crop in pixels to remove API watermarks/logos; set via env
