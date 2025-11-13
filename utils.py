@@ -66,6 +66,14 @@ else:
 
 SHOW_TARGET_ZONE = os.getenv("SHOW_TARGET_ZONE", "true").lower() == "true"  # Draw target zone indicator
 
+# Distance-based filtering: Filter detections based on distance from image center
+# Eliminates false positives from neighboring buildings that appear in crop zones
+DISTANCE_FILTER_ENABLED = os.getenv("DISTANCE_FILTER_ENABLED", "false").lower() == "true"
+DISTANCE_FILTER_HIGH_CONF_PX = float(os.getenv("DISTANCE_FILTER_HIGH_CONF_PX", "150"))  # Inner zone: high confidence
+DISTANCE_FILTER_REVIEW_PX = float(os.getenv("DISTANCE_FILTER_REVIEW_PX", "200"))  # Middle zone: needs review
+DISTANCE_FILTER_MAX_PX = float(os.getenv("DISTANCE_FILTER_MAX_PX", "250"))  # Outer boundary: ignore beyond this
+SHOW_FILTER_ZONES = os.getenv("SHOW_FILTER_ZONES", "true").lower() == "true"  # Draw distance filter zones
+
 log = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -452,6 +460,111 @@ def _draw_target_zone(img: Image.Image, crop_box: Tuple[int, int, int, int], col
     return img
 
 
+def _calculate_detection_distance(bbox: Tuple[float, float, float, float], img_width: int, img_height: int) -> float:
+    """
+    Calculate Euclidean distance of detection center from image center.
+
+    Args:
+        bbox: YOLO bounding box (x1, y1, x2, y2) in pixel coordinates
+        img_width: Image width in pixels
+        img_height: Image height in pixels
+
+    Returns:
+        Distance in pixels from image center
+    """
+    import math
+
+    x1, y1, x2, y2 = bbox
+
+    # Calculate detection center
+    det_center_x = (x1 + x2) / 2
+    det_center_y = (y1 + y2) / 2
+
+    # Image center
+    img_center_x = img_width / 2
+    img_center_y = img_height / 2
+
+    # Euclidean distance
+    distance = math.sqrt((det_center_x - img_center_x)**2 + (det_center_y - img_center_y)**2)
+
+    return distance
+
+
+def _draw_filter_zones(img: Image.Image, high_conf_radius: float, review_radius: float, max_radius: float) -> Image.Image:
+    """
+    Draw concentric circles showing distance filter zones.
+
+    Args:
+        img: PIL Image to draw on
+        high_conf_radius: Inner circle radius (high confidence zone)
+        review_radius: Middle circle radius (needs review zone)
+        max_radius: Outer circle radius (filter boundary)
+
+    Returns:
+        Image with filter zone indicators
+    """
+    from PIL import ImageDraw, ImageFont
+    import math
+
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+    center_x, center_y = width / 2, height / 2
+
+    # Draw circles with dashed effect
+    def draw_dashed_circle(cx, cy, radius, color, dash_length=10, line_width=2):
+        """Draw a dashed circle"""
+        circumference = 2 * math.pi * radius
+        num_dashes = int(circumference / (dash_length * 2))
+
+        for i in range(num_dashes):
+            angle_start = (i * 2 * math.pi) / num_dashes
+            angle_end = ((i + 0.5) * 2 * math.pi) / num_dashes
+
+            # Calculate arc points
+            x1 = cx + radius * math.cos(angle_start)
+            y1 = cy + radius * math.sin(angle_start)
+            x2 = cx + radius * math.cos(angle_end)
+            y2 = cy + radius * math.sin(angle_end)
+
+            draw.line([(x1, y1), (x2, y2)], fill=color, width=line_width)
+
+    # Draw zones
+    if max_radius > 0 and max_radius <= min(center_x, center_y):
+        draw_dashed_circle(center_x, center_y, max_radius, "#FF0000", line_width=2)  # Red outer
+
+    if review_radius > 0 and review_radius <= min(center_x, center_y):
+        draw_dashed_circle(center_x, center_y, review_radius, "#FFA500", line_width=2)  # Orange middle
+
+    if high_conf_radius > 0 and high_conf_radius <= min(center_x, center_y):
+        draw_dashed_circle(center_x, center_y, high_conf_radius, "#00FF00", line_width=2)  # Green inner
+
+    # Add labels
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)
+    except:
+        font = ImageFont.load_default()
+
+    # Label positions (top-right quadrant)
+    label_x = center_x + 10
+    labels = [
+        (high_conf_radius, "HIGH CONFIDENCE", "#00FF00"),
+        (review_radius, "NEEDS REVIEW", "#FFA500"),
+        (max_radius, "FILTER BOUNDARY", "#FF0000")
+    ]
+
+    for i, (radius, label_text, color) in enumerate(labels):
+        if radius > 0 and radius <= min(center_x, center_y):
+            label_y = center_y - radius + (i * 20)
+            try:
+                bbox = draw.textbbox((label_x, label_y), label_text, font=font)
+                draw.rectangle(bbox, fill="black")
+                draw.text((label_x, label_y), label_text, fill=color, font=font)
+            except:
+                draw.text((label_x, label_y), label_text, fill=color, font=font)
+
+    return img
+
+
 def _run_inference_on_crop(model, original_img: Image.Image, crop_percent: float, conf_thr: float) -> Tuple[any, Tuple[int, int, int, int], Optional[float]]:
     """
     Helper function to run YOLO inference on a cropped portion of the image.
@@ -586,6 +699,65 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
                 except Exception:
                     det_conf = float(max(r0.boxes.conf)) if len(r0.boxes.conf) else None
 
+    # Apply distance-based filtering if enabled
+    if DISTANCE_FILTER_ENABLED and results and len(results) > 0:
+        r0 = results[0]
+        if hasattr(r0, "boxes") and r0.boxes is not None and len(r0.boxes) > 0:
+            import torch
+
+            # Get bounding boxes and confidences
+            boxes = r0.boxes.xyxy  # (x1, y1, x2, y2) format
+            confs = r0.boxes.conf
+            classes = r0.boxes.cls if hasattr(r0.boxes, "cls") else None
+
+            # Filter boxes based on distance from center
+            filtered_indices = []
+            img_width, img_height = original_img.size
+
+            for i in range(len(boxes)):
+                bbox = boxes[i].tolist() if hasattr(boxes[i], "tolist") else boxes[i]
+                distance = _calculate_detection_distance(bbox, img_width, img_height)
+
+                # Check if detection passes distance filter
+                if distance <= DISTANCE_FILTER_MAX_PX:
+                    filtered_indices.append(i)
+
+                    # Log distance classification
+                    if distance <= DISTANCE_FILTER_HIGH_CONF_PX:
+                        log.info(f"Distance filter: Detection at {distance:.1f}px → HIGH CONFIDENCE (≤{DISTANCE_FILTER_HIGH_CONF_PX}px)")
+                    elif distance <= DISTANCE_FILTER_REVIEW_PX:
+                        log.info(f"Distance filter: Detection at {distance:.1f}px → NEEDS REVIEW ({DISTANCE_FILTER_HIGH_CONF_PX}-{DISTANCE_FILTER_REVIEW_PX}px)")
+                    else:
+                        log.info(f"Distance filter: Detection at {distance:.1f}px → LIKELY NEIGHBOR ({DISTANCE_FILTER_REVIEW_PX}-{DISTANCE_FILTER_MAX_PX}px)")
+                else:
+                    log.info(f"Distance filter: Detection at {distance:.1f}px → FILTERED OUT (>{DISTANCE_FILTER_MAX_PX}px)")
+
+            # Update results with filtered detections
+            if filtered_indices:
+                # Keep only filtered detections
+                filtered_boxes = boxes[filtered_indices]
+                filtered_confs = confs[filtered_indices]
+                filtered_classes = classes[filtered_indices] if classes is not None else None
+
+                # Update r0.boxes
+                r0.boxes.xyxy = filtered_boxes
+                r0.boxes.conf = filtered_confs
+                if filtered_classes is not None:
+                    r0.boxes.cls = filtered_classes
+
+                # Update confidence
+                try:
+                    det_conf = float(filtered_confs.max().item())
+                except:
+                    det_conf = float(max(filtered_confs)) if len(filtered_confs) else None
+
+                log.info(f"Distance filter: Kept {len(filtered_indices)} of {len(boxes)} detections")
+            else:
+                # No detections passed filter
+                log.info("Distance filter: All detections filtered out")
+                results = None
+                det_conf = None
+
     # Generate annotated image
     try:
         if results and len(results) > 0:
@@ -609,12 +781,28 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
                     if SHOW_TARGET_ZONE:
                         full_img_with_annotations = _draw_target_zone(full_img_with_annotations, crop_box)
 
+                    # Draw distance filter zones if enabled
+                    if DISTANCE_FILTER_ENABLED and SHOW_FILTER_ZONES:
+                        full_img_with_annotations = _draw_filter_zones(
+                            full_img_with_annotations,
+                            DISTANCE_FILTER_HIGH_CONF_PX,
+                            DISTANCE_FILTER_REVIEW_PX,
+                            DISTANCE_FILTER_MAX_PX
+                        )
+
                     full_img_with_annotations.save(out_path, format="JPEG", quality=92)
                 else:
                     # Fallback: save original with target zone
                     final_img = original_img.copy()
                     if SHOW_TARGET_ZONE and crop_box:
                         final_img = _draw_target_zone(final_img, crop_box)
+                    if DISTANCE_FILTER_ENABLED and SHOW_FILTER_ZONES:
+                        final_img = _draw_filter_zones(
+                            final_img,
+                            DISTANCE_FILTER_HIGH_CONF_PX,
+                            DISTANCE_FILTER_REVIEW_PX,
+                            DISTANCE_FILTER_MAX_PX
+                        )
                     final_img.save(out_path, format="JPEG", quality=92)
             else:
                 # Standard mode: Save YOLO annotated image directly
@@ -628,10 +816,18 @@ def run_prediction(image_path: str) -> Tuple[str, Optional[float]]:
         else:
             # No detections
             log.info("No detections found")
-            if CENTER_ANALYSIS_ENABLED and SHOW_TARGET_ZONE and crop_box:
-                # Show target zone even when no detections
+            if (CENTER_ANALYSIS_ENABLED or DISTANCE_FILTER_ENABLED) and (SHOW_TARGET_ZONE or SHOW_FILTER_ZONES):
+                # Show target zone and/or filter zones even when no detections
                 final_img = original_img.copy()
-                final_img = _draw_target_zone(final_img, crop_box)
+                if SHOW_TARGET_ZONE and crop_box:
+                    final_img = _draw_target_zone(final_img, crop_box)
+                if DISTANCE_FILTER_ENABLED and SHOW_FILTER_ZONES:
+                    final_img = _draw_filter_zones(
+                        final_img,
+                        DISTANCE_FILTER_HIGH_CONF_PX,
+                        DISTANCE_FILTER_REVIEW_PX,
+                        DISTANCE_FILTER_MAX_PX
+                    )
                 final_img.save(out_path, format="JPEG", quality=92)
             else:
                 original_img.save(out_path, format="JPEG", quality=92)
