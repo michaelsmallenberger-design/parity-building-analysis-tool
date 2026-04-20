@@ -13,6 +13,7 @@ import os
 import math
 import time
 import logging
+import threading
 from typing import Optional, Tuple, List, Dict, Any
 
 import requests
@@ -29,8 +30,13 @@ OVERPASS_TIMEOUT = int(os.getenv("OVERPASS_TIMEOUT", "15"))
 FOOTPRINT_SEARCH_RADIUS = int(os.getenv("FOOTPRINT_SEARCH_RADIUS", "50"))
 
 # Rate limiting for Overpass (be respectful to public API)
+_overpass_lock = threading.Lock()
 _last_overpass_call = 0.0
 OVERPASS_RATE_LIMIT = 1.0  # seconds between requests
+
+# Retry policy for transient Overpass failures
+OVERPASS_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+OVERPASS_MAX_ATTEMPTS = 4
 
 
 # -------------------------------------------------------------------------
@@ -158,10 +164,12 @@ def get_building_footprint(
     if search_radius is None:
         search_radius = FOOTPRINT_SEARCH_RADIUS
 
-    # Rate limiting
-    elapsed = time.time() - _last_overpass_call
-    if elapsed < OVERPASS_RATE_LIMIT:
-        time.sleep(OVERPASS_RATE_LIMIT - elapsed)
+    # Rate limiting: claim slot inside lock so next thread sees updated timestamp
+    with _overpass_lock:
+        elapsed = time.time() - _last_overpass_call
+        if elapsed < OVERPASS_RATE_LIMIT:
+            time.sleep(OVERPASS_RATE_LIMIT - elapsed)
+        _last_overpass_call = time.time()
 
     # Overpass query: find building polygons near the point
     # 'way' covers most buildings; 'relation' covers complex multipolygon buildings
@@ -174,82 +182,95 @@ def get_building_footprint(
     out body geom;
     """
 
-    try:
-        response = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            timeout=OVERPASS_TIMEOUT + 5
-        )
-        _last_overpass_call = time.time()
+    response = None
+    for attempt in range(OVERPASS_MAX_ATTEMPTS):
+        try:
+            response = requests.post(
+                OVERPASS_URL,
+                data={"data": query},
+                headers={"User-Agent": "parity-building-analysis-tool/1.0"},
+                timeout=OVERPASS_TIMEOUT + 15
+            )
 
-        if response.status_code != 200:
-            log.warning(f"Overpass API returned {response.status_code}: {response.text[:200]}")
-            return None
-
-        data = response.json()
-        elements = data.get("elements", [])
-
-        if not elements:
-            log.info(f"No buildings found within {search_radius}m of ({lat:.6f}, {lon:.6f})")
-            return None
-
-        log.info(f"Found {len(elements)} building(s) near ({lat:.6f}, {lon:.6f})")
-
-        # Convert OSM elements to Shapely polygons
-        target_point = Point(lon, lat)  # Shapely uses (x, y) = (lon, lat)
-        best_building = None
-        best_distance = float('inf')
-        contains_match = None
-
-        for element in elements:
-            polygon = _osm_element_to_polygon(element)
-            if polygon is None:
+            if response.status_code in OVERPASS_TRANSIENT_CODES:
+                log.warning(f"Overpass API returned {response.status_code} (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS})")
+                if attempt < OVERPASS_MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
                 continue
 
-            # Check if this building contains our target point
-            if polygon.contains(target_point):
-                contains_match = {
-                    'polygon': polygon,
-                    'source': 'osm_overpass',
-                    'osm_id': element.get('id'),
-                    'osm_type': element.get('type'),
-                    'tags': element.get('tags', {}),
-                    'contains_point': True,
-                }
-                log.info(f"Building {element.get('id')} contains target point")
-                break  # Exact match, no need to keep looking
+            if response.status_code != 200:
+                log.warning(f"Overpass API returned {response.status_code}: {response.text[:200]}")
+                return None
 
-            # Track nearest building as fallback
-            dist = polygon.distance(target_point)
-            if dist < best_distance:
-                best_distance = dist
-                best_building = {
-                    'polygon': polygon,
-                    'source': 'osm_overpass',
-                    'osm_id': element.get('id'),
-                    'osm_type': element.get('type'),
-                    'tags': element.get('tags', {}),
-                    'contains_point': False,
-                }
+            break  # success
 
-        if contains_match:
-            return contains_match
-
-        if best_building:
-            log.info(f"No building contains point; using nearest "
-                     f"(OSM ID {best_building['osm_id']}, distance: {best_distance:.6f}°)")
-            return best_building
-
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            log.warning(f"Overpass API transient error (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS}): {e}")
+            if attempt < OVERPASS_MAX_ATTEMPTS - 1:
+                time.sleep(2 ** attempt)
+            continue
+        except Exception as e:
+            log.error(f"Overpass API error: {e}", exc_info=True)
+            return None
+    else:
+        log.warning(f"Overpass API failed after {OVERPASS_MAX_ATTEMPTS} attempts for ({lat:.6f}, {lon:.6f})")
         return None
 
-    except requests.exceptions.Timeout:
-        log.warning(f"Overpass API timeout for ({lat:.6f}, {lon:.6f})")
-        _last_overpass_call = time.time()
+    data = response.json()
+    elements = data.get("elements", [])
+
+    if not elements:
+        log.info(f"No buildings found within {search_radius}m of ({lat:.6f}, {lon:.6f})")
         return None
-    except Exception as e:
-        log.error(f"Overpass API error: {e}", exc_info=True)
-        _last_overpass_call = time.time()
-        return None
+
+    log.info(f"Found {len(elements)} building(s) near ({lat:.6f}, {lon:.6f})")
+
+    # Convert OSM elements to Shapely polygons
+    target_point = Point(lon, lat)  # Shapely uses (x, y) = (lon, lat)
+    best_building = None
+    best_distance = float('inf')
+    contains_match = None
+
+    for element in elements:
+        polygon = _osm_element_to_polygon(element)
+        if polygon is None:
+            continue
+
+        # Check if this building contains our target point
+        if polygon.contains(target_point):
+            contains_match = {
+                'polygon': polygon,
+                'source': 'osm_overpass',
+                'osm_id': element.get('id'),
+                'osm_type': element.get('type'),
+                'tags': element.get('tags', {}),
+                'contains_point': True,
+            }
+            log.info(f"Building {element.get('id')} contains target point")
+            break  # Exact match, no need to keep looking
+
+        # Track nearest building as fallback
+        dist = polygon.distance(target_point)
+        if dist < best_distance:
+            best_distance = dist
+            best_building = {
+                'polygon': polygon,
+                'source': 'osm_overpass',
+                'osm_id': element.get('id'),
+                'osm_type': element.get('type'),
+                'tags': element.get('tags', {}),
+                'contains_point': False,
+            }
+
+    if contains_match:
+        return contains_match
+
+    if best_building:
+        log.info(f"No building contains point; using nearest "
+                 f"(OSM ID {best_building['osm_id']}, distance: {best_distance:.6f}°)")
+        return best_building
+
+    return None
 
 
 def _osm_element_to_polygon(element: Dict) -> Optional[Polygon]:
@@ -312,13 +333,45 @@ def _osm_element_to_polygon(element: Dict) -> Optional[Polygon]:
             return None
 
         try:
-            # Build polygon from first outer ring with inner rings as holes
-            poly = Polygon(outers[0], holes=inners if inners else None)
-            if poly.is_valid:
-                return poly
-            poly = poly.buffer(0)
-            if poly.is_valid and not poly.is_empty:
-                return poly if isinstance(poly, Polygon) else None
+            # Build inner-ring polygons defensively; skip any that fail to construct or are invalid
+            inner_polys = []
+            valid_inners = []
+            for c in inners:
+                try:
+                    ip = Polygon(c)
+                    if ip.is_valid and not ip.is_empty:
+                        inner_polys.append(ip)
+                        valid_inners.append(c)
+                except Exception:
+                    continue  # skip malformed inner ring
+
+            if len(outers) == 1:
+                # Single outer ring — return a simple Polygon with valid inners as holes
+                poly = Polygon(outers[0], holes=valid_inners if valid_inners else None)
+                if poly.is_valid:
+                    return poly
+                poly = poly.buffer(0)
+                if poly.is_valid and not poly.is_empty:
+                    return poly if isinstance(poly, Polygon) else None
+                return None
+
+            # Multiple outer rings — assign each inner to the outer that contains it
+            sub_polys = []
+            for outer_coords in outers:
+                outer_poly = Polygon(outer_coords)
+                assigned_holes = [
+                    c for c, ip in zip(valid_inners, inner_polys)
+                    if outer_poly.contains(ip.centroid)
+                ]
+                poly = Polygon(outer_coords, holes=assigned_holes if assigned_holes else None)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_valid and not poly.is_empty:
+                    if isinstance(poly, Polygon):
+                        sub_polys.append(poly)
+            if sub_polys:
+                return MultiPolygon(sub_polys) if len(sub_polys) > 1 else sub_polys[0]
+            return None
         except Exception:
             return None
 
