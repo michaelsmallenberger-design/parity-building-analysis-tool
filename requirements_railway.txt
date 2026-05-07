@@ -20,5 +20,10 @@ requests==2.32.5
 # Geocoding
 geopy==2.4.1
 
+# Phase 3: building footprints + VLM verification
+shapely
+google-genai
+python-dotenv
+
 # Utilities
 croniter==6.0.0
