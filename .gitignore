@@ -24,3 +24,17 @@ models/rooftop_model.pt
 # Test artifacts
 math_test*.jpg
 test_esb.jpg
+pipeline_test_outputs/
+test_addresses_local.csv
+geometry (1).py
+
+# Sensitive / local-only files (do not publish on public fork)
+Existing_Market_TAM.xlsx
+jobs.db
+storage/
+temp_uploads/
+training_images/
+training_addresses.csv
+training_setup/
+download_training_images.py
+.gitattributes
