@@ -38,3 +38,9 @@ training_addresses.csv
 training_setup/
 download_training_images.py
 .gitattributes
+
+# Scratch / one-off validation files (Phase 3, throwaway)
+scratch_*.py
+scratch_*.csv
+scratch_results.json
+smoke_*.py
