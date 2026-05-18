@@ -63,7 +63,7 @@ Geocoded centroid is inside building footprint: {contains_point}
 
 === DETECTION CONTEXT ===
 The full satellite tile is 768x768 pixels at zoom 19 from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile.
-The TARGET building is the one whose footprint is centered in Image B around pixel (384, 384). Buildings around or adjacent to this central footprint are NEIGHBORS — cooling towers on neighbor rooftops should be classified as "neighbor_only", not "confirmed".
+The TARGET building is outlined by a RED polygon drawn on Image B, centered around pixel (384, 384). Use the red outline as the authoritative boundary of the target building. Anything inside the red polygon is on the TARGET rooftop. Anything outside the red polygon is on a NEIGHBOR rooftop — cooling towers on neighbor rooftops should be classified as "neighbor_only", not "confirmed".
 The YOLO model proposed a candidate at pixel bounding box: ({x1}, {y1}) to ({x2}, {y2}).
 
 === IMAGES YOU WILL RECEIVE ===
@@ -83,7 +83,18 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 
 Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest")."""
 
-_REFERENCE_BLOCK_TEMPLATE = "\n\n=== REFERENCE IMAGES ===\nYou will also receive {n_pos} confirmed-positive example image(s) and {n_neg} confirmed-negative example image(s) from prior verified cases. Use these as visual anchors for what does and does not count as a cooling tower in this dataset."
+_REFERENCE_BLOCK_POSITIVE = """
+
+=== REFERENCE IMAGES ===
+After Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from the same 768x768 zoom-19 Mapbox satellite imagery you are analyzing now.
+
+Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
+
+When evaluating the candidate in Image A, compare its features against the positives. A candidate that shares the fan pattern, scale, and enclosure characteristics of the positives should lean toward "confirmed" or "likely"."""
+
+_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
+
+You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if the candidate in Image A more closely resembles a negative reference than any positive reference, lean toward "not_detected"."""
 
 
 class _VerificationResponse(BaseModel):
@@ -192,10 +203,11 @@ def _build_prompt(
 
     x1, y1, x2, y2 = detection_bbox
 
-    if n_pos > 0 or n_neg > 0:
-        reference_block = _REFERENCE_BLOCK_TEMPLATE.format(n_pos=n_pos, n_neg=n_neg)
-    else:
-        reference_block = ""
+    reference_block = ""
+    if n_pos > 0:
+        reference_block = _REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
+        if n_neg > 0:
+            reference_block += _REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _USER_PROMPT_TEMPLATE.format(
         address=address,
