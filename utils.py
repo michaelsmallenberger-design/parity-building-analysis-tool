@@ -39,7 +39,6 @@ RETRY_BACKOFF = 0.7
 
 # Geocoding configuration
 GEOCODE_CONFIDENCE_THRESHOLD = float(os.getenv("GEOCODE_CONFIDENCE_THRESHOLD", "0.70"))
-NYC_BBOX = "-74.25909,40.477399,-73.700272,40.917577"  # NYC bounding box
 NOMINATIM_USER_AGENT = "ParityBuildingAnalysisTool/1.0"
 NOMINATIM_RATE_LIMIT = 1.0  # seconds between requests
 
@@ -115,16 +114,16 @@ def _clean_address(address: str) -> List[str]:
     Generate multiple query variations for geocoding.
 
     Returns list of query strings to try, in priority order.
+    Caller is responsible for providing complete address context
+    (city, state) — this function does not append geographic context.
 
     Examples:
-        "52 East 72nd St (Claremont House)" →
-            ["52 East 72nd St (Claremont House)",
-             "52 East 72nd St",
-             "52 East 72nd St, NY"]
+        "52 East 72nd St (Claremont House), New York, NY" →
+            ["52 East 72nd St (Claremont House), New York, NY",
+             "52 East 72nd St, New York, NY"]
 
-        "The Octavia Condo" →
-            ["The Octavia Condo",
-             "The Octavia Condo, New York, NY"]
+        "790 E Broward Blvd, Fort Lauderdale, FL" →
+            ["790 E Broward Blvd, Fort Lauderdale, FL"]
     """
     queries = []
 
@@ -139,27 +138,13 @@ def _clean_address(address: str) -> List[str]:
     if cleaned != address and cleaned:
         queries.append(cleaned)
 
-    # If address has street number, try street-only
+    # If address has street number, try street-only as a fallback variation
     if re.search(r'^\d+', address):
         street_only = re.split(r'[\(]', address)[0].strip()
         if street_only not in queries and street_only:
             queries.append(street_only)
-            # Add NYC context to street address
-            if 'NY' not in street_only.upper():
-                queries.append(f"{street_only}, NY")
-    else:
-        # Building name only - add NYC context
-        if 'NY' not in address.upper() and 'NEW YORK' not in address.upper():
-            queries.append(f"{address}, New York, NY")
 
     return queries
-
-
-def _is_in_nyc(lat: float, lon: float) -> bool:
-    """Check if coordinates are within NYC bounding box."""
-    # NYC bbox: -74.25909,40.477399,-73.700272,40.917577
-    return (40.477399 <= lat <= 40.917577 and
-            -74.25909 <= lon <= -73.700272)
 
 
 def _geocode_mapbox(query: str) -> Optional[Tuple[Tuple[float, float], float]]:
@@ -173,11 +158,9 @@ def _geocode_mapbox(query: str) -> Optional[Tuple[Tuple[float, float], float]]:
         mb_params = {
             "access_token": MAPBOX_API_KEY,
             "limit": 1,
-            "proximity": "-73.9857,40.7484",  # Midtown Manhattan bias
             "types": "address,poi,place,neighborhood,locality",
             "autocomplete": "true",
             "country": "US",
-            "bbox": NYC_BBOX,  # NYC bounding box (strict filter)
         }
         mb_data = _http_get(mb_url, mb_params)
 
@@ -211,12 +194,7 @@ def _geocode_nominatim(address: str) -> Optional[Tuple[float, float]]:
 
         geolocator = _get_nominatim_client()
 
-        # Add NYC bias if not already in query
-        query = address
-        if 'NY' not in address.upper() and 'NEW YORK' not in address.upper():
-            query = f"{address}, New York, NY, USA"
-
-        location = geolocator.geocode(query, timeout=HTTP_TIMEOUT)
+        location = geolocator.geocode(address, timeout=HTTP_TIMEOUT)
         _last_nominatim_call = time.time()
 
         if location:
@@ -235,8 +213,12 @@ def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
     Strategy:
       1. Try Mapbox with multiple query variations (cleaned addresses)
       2. Check confidence threshold (default 0.70)
-      3. Validate result is in NYC
-      4. Fall back to Nominatim (free, good with building names)
+      3. Fall back to Nominatim (free, good with building names)
+      4. If Nominatim fails, fall back to low-confidence Mapbox result
+
+    Caller is responsible for providing complete address context
+    (city, state) — this function does not constrain results to any
+    geographic region.
 
     Returns (lat, lon) or None.
     """
@@ -259,13 +241,12 @@ def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
                 best_result = coords
                 best_relevance = relevance
 
-            # If high confidence and in NYC, use it
+            # If high confidence, use it
             if relevance >= GEOCODE_CONFIDENCE_THRESHOLD:
                 lat, lon = coords
-                if _is_in_nyc(lat, lon):
-                    log.info(f"Mapbox geocoded '{original_query}' → ({lat:.6f}, {lon:.6f}) "
-                            f"[relevance: {relevance:.2f}, query: '{q}']")
-                    return coords
+                log.info(f"Mapbox geocoded '{original_query}' → ({lat:.6f}, {lon:.6f}) "
+                        f"[relevance: {relevance:.2f}, query: '{q}']")
+                return coords
 
     # If we have a result but low confidence, log it
     if best_result:
@@ -279,12 +260,8 @@ def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
     coords = _geocode_nominatim(original_query)
     if coords:
         lat, lon = coords
-        # Double-check it's in NYC
-        if _is_in_nyc(lat, lon):
-            log.info(f"Nominatim geocoded '{original_query}' → ({lat:.6f}, {lon:.6f})")
-            return coords
-        else:
-            log.warning(f"Nominatim result outside NYC for '{original_query}': ({lat:.6f}, {lon:.6f})")
+        log.info(f"Nominatim geocoded '{original_query}' → ({lat:.6f}, {lon:.6f})")
+        return coords
 
     # If Nominatim failed but we had a Mapbox result, use it as last resort
     if best_result:
