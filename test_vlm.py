@@ -1,9 +1,10 @@
-"""Gemini-only test harness for vlm.verify_detection.
+"""Dual-VLM test harness for vlm.verify_detection (Gemini + Grok consensus).
 
 Runs vlm.verify_detection end-to-end against two known-good raw satellite
 tiles from pipeline_test_outputs/. Exits 0 only when both fixtures pass
 structure AND semantics checks. Any other outcome (pre-flight failure,
-structural mismatch, wrong verdict, API/network error) exits nonzero.
+structural mismatch, wrong verdict, API/network error in either sub-model)
+exits nonzero.
 """
 
 from __future__ import annotations
@@ -42,6 +43,12 @@ _YOLO_MODEL_PATH = "models/rooftop_model.pt"
 _YOLO_CONF = 0.18
 _FULL_IMAGE_BBOX = (0, 0, 768, 768)
 _VALID_VERDICTS = {"confirmed", "likely", "neighbor_only", "needs_review", "not_detected"}
+_SUB_MODEL_KEYS = {"verdict", "confidence", "reasoning", "construction"}
+_TOP_LEVEL_KEYS = {
+    "verdict", "confidence", "reasoning", "construction",
+    "gemini", "grok", "agreement",
+}
+_CONSENSUS_NEEDS_REVIEW_MARKERS = ("disagreed", "threshold", "timeout")
 _API_ERROR_MARKERS = (
     "after 4 attempts",
     "Network timeout",
@@ -55,6 +62,16 @@ _API_ERROR_MARKERS = (
     "VLM API error",
     "VLM returned an empty response",
     "schema mismatch",
+    "Grok network timeout",
+    "Grok network connection error",
+    "Grok API transient error",
+    "Grok API authentication error",
+    "Grok API authorization error",
+    "Grok API rejected the request",
+    "Grok API client error",
+    "Grok VLM API error",
+    "Grok returned an empty response",
+    "Grok response shape unexpected",
 )
 
 
@@ -68,11 +85,12 @@ def _print_fail(label: str) -> None:
 
 def _preflight() -> bool:
     print("=== PRE-FLIGHT ===")
-    if os.environ.get("GEMINI_API_KEY"):
-        _print_pass("GEMINI_API_KEY is set")
-    else:
-        _print_fail("GEMINI_API_KEY is not set")
-        return False
+    for var in ("GEMINI_API_KEY", "XAI_API_KEY"):
+        if os.environ.get(var):
+            _print_pass(f"{var} is set")
+        else:
+            _print_fail(f"{var} is not set")
+            return False
 
     paths = (
         ("140 West End raw image", TEST_140_WEST_END["image_path"]),
@@ -122,6 +140,34 @@ def _build_building_context(fixture: dict) -> dict:
     }
 
 
+def _validate_sub_dict(name: str, sub) -> list[tuple[bool, str]]:
+    checks: list[tuple[bool, str]] = []
+    sub_is_dict = isinstance(sub, dict)
+    checks.append((sub_is_dict, f"{name} sub-dict is a dict (got: {type(sub).__name__})"))
+    if not sub_is_dict:
+        return checks
+    sub_keys = set(sub.keys())
+    checks.append((
+        sub_keys == _SUB_MODEL_KEYS,
+        f"{name} sub-dict has exactly four keys (got: {sorted(sub_keys)})",
+    ))
+    v = sub.get("verdict")
+    checks.append((v in _VALID_VERDICTS, f"{name}.verdict is a valid literal (got: {v!r})"))
+    c = sub.get("confidence")
+    checks.append((
+        isinstance(c, float) and 0.0 <= c <= 1.0,
+        f"{name}.confidence is float in [0.0, 1.0] (got: {c!r})",
+    ))
+    r = sub.get("reasoning")
+    checks.append((
+        isinstance(r, str) and len(r) > 0,
+        f"{name}.reasoning is a non-empty string (length: {len(r) if isinstance(r, str) else None})",
+    ))
+    k = sub.get("construction")
+    checks.append((isinstance(k, bool), f"{name}.construction is a bool (got: {k!r})"))
+    return checks
+
+
 def _validate_structure(resp) -> tuple[bool, list[tuple[bool, str]]]:
     checks: list[tuple[bool, str]] = []
 
@@ -131,9 +177,10 @@ def _validate_structure(resp) -> tuple[bool, list[tuple[bool, str]]]:
         return False, checks
 
     keys = set(resp.keys())
-    expected_keys = {"verdict", "confidence", "reasoning", "construction"}
-    keys_ok = keys == expected_keys
-    checks.append((keys_ok, f"response has exactly four keys (got: {sorted(keys)})"))
+    checks.append((
+        keys == _TOP_LEVEL_KEYS,
+        f"response has exactly seven keys (got: {sorted(keys)})",
+    ))
 
     verdict = resp.get("verdict")
     checks.append(
@@ -153,6 +200,30 @@ def _validate_structure(resp) -> tuple[bool, list[tuple[bool, str]]]:
     checks.append(
         (isinstance(construction, bool), f"construction is a bool (got: {construction!r})")
     )
+
+    agreement = resp.get("agreement")
+    checks.append(
+        (isinstance(agreement, bool), f"agreement is a bool (got: {agreement!r})")
+    )
+
+    checks.extend(_validate_sub_dict("gemini", resp.get("gemini")))
+    checks.extend(_validate_sub_dict("grok", resp.get("grok")))
+
+    # Conditional structure check: when top verdict is needs_review and
+    # neither sub-model itself failed with an API error, the synthesized
+    # reasoning must lead with a recognizable marker.
+    if verdict == "needs_review":
+        gemini_sub = resp.get("gemini") if isinstance(resp.get("gemini"), dict) else {}
+        grok_sub = resp.get("grok") if isinstance(resp.get("grok"), dict) else {}
+        sub_failed = _is_api_inconclusive(gemini_sub.get("reasoning")) or _is_api_inconclusive(
+            grok_sub.get("reasoning")
+        )
+        if not sub_failed and isinstance(reasoning, str):
+            has_marker = any(m in reasoning.lower() for m in _CONSENSUS_NEEDS_REVIEW_MARKERS)
+            checks.append((
+                has_marker,
+                "needs_review reasoning contains 'disagreed'/'threshold'/'timeout' marker",
+            ))
 
     all_ok = all(p for p, _ in checks)
     return all_ok, checks
@@ -189,13 +260,20 @@ def _run_fixture(name: str, fixture: dict) -> dict:
     print(f"  VLM call returned in {elapsed:.2f}s")
 
     print()
-    print("  --- VLM response ---")
+    print("  --- VLM consensus response ---")
     if isinstance(response, dict):
-        for k in ("verdict", "confidence", "reasoning", "construction"):
+        for k in ("verdict", "confidence", "reasoning", "construction", "agreement"):
             if k in response:
                 print(f"  {k}: {response[k]!r}")
+        for sub_name in ("gemini", "grok"):
+            sub = response.get(sub_name)
+            if isinstance(sub, dict):
+                print(f"  --- {sub_name} ---")
+                for k in ("verdict", "confidence", "reasoning", "construction"):
+                    if k in sub:
+                        print(f"    {k}: {sub[k]!r}")
         for k in sorted(response.keys()):
-            if k not in ("verdict", "confidence", "reasoning", "construction"):
+            if k not in _TOP_LEVEL_KEYS:
                 print(f"  [unexpected key] {k}: {response[k]!r}")
     else:
         print(f"  response (not a dict): {response!r}")
@@ -241,7 +319,7 @@ def _run_fixture(name: str, fixture: dict) -> dict:
 
 def main() -> int:
     t_start = time.perf_counter()
-    print("test_vlm.py - Gemini verification harness")
+    print("test_vlm.py - dual-VLM verification harness (Gemini + Grok)")
     print()
 
     if not _preflight():

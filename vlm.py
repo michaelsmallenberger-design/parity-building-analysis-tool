@@ -1,14 +1,19 @@
-"""Phase 3 VLM verification of YOLO cooling-tower detections via Gemini 3.1 Pro.
+"""Phase 3 dual-VLM verification of YOLO cooling-tower detections.
 
 Public surface: a single function ``verify_detection`` that takes a satellite
 tile path, a YOLO bounding box, and a building-context dict, and returns a
-4-key result dict describing whether the candidate is a real cooling tower on
-the target rooftop. All recoverable failures map to a ``needs_review`` result;
-configuration errors (missing ``GEMINI_API_KEY``) propagate as ``KeyError``.
+result dict describing whether the candidate is a real cooling tower on the
+target rooftop. Every call runs Gemini 3.1 Pro and Grok 4.3 in parallel and
+combines their verdicts via consensus: bucket-agreement on a confident answer
+= final verdict; disagreement OR below-threshold confidence = ``needs_review``.
+All recoverable failures map to ``needs_review``; configuration errors
+(missing ``GEMINI_API_KEY`` or ``XAI_API_KEY``) propagate as ``KeyError``.
 """
 
 from __future__ import annotations
 
+import base64
+import concurrent.futures
 import functools
 import io
 import json
@@ -16,12 +21,15 @@ import logging
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import httpx
+import openai
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from openai import OpenAI
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 
@@ -35,6 +43,13 @@ _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
 
 _DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
+_DEFAULT_GROK_MODEL = "grok-4.3"
+_GROK_BASE_URL = "https://api.x.ai/v1"
+_DEFAULT_TIMEOUT_S = 120
+_DEFAULT_CONSENSUS_THRESHOLD = 0.7
+
+_POSITIVE_VERDICTS = frozenset({"confirmed", "likely"})
+_NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only"})
 
 _SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
 
@@ -122,6 +137,30 @@ def _needs_review(reasoning: str) -> dict:
 @functools.lru_cache(maxsize=1)
 def _get_gemini_client(api_key: str):
     return genai.Client(api_key=api_key)
+
+
+@functools.lru_cache(maxsize=1)
+def _get_grok_client(api_key: str):
+    return OpenAI(api_key=api_key, base_url=_GROK_BASE_URL)
+
+
+def _strip_md_fences(text: str) -> str:
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    parts = s.split("\n", 1)
+    s = parts[1] if len(parts) > 1 else s[3:]
+    if s.rstrip().endswith("```"):
+        s = s.rstrip()[:-3]
+    return s.strip()
+
+
+def _to_image_url_part(jpeg_bytes: bytes) -> dict:
+    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+    }
 
 
 def _load_reference_dir(dir_path: str) -> list[bytes]:
@@ -257,6 +296,7 @@ def _verify_gemini(
     image_path: str,
     detection_bbox: tuple[int, int, int, int],
     building_context: dict,
+    timeout_s: int,
 ) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -291,6 +331,7 @@ def _verify_gemini(
         system_instruction=_SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
+        http_options=types.HttpOptions(timeout=timeout_s * 1000),
     )
 
     last_transient_result: dict | None = None
@@ -349,12 +390,199 @@ def _verify_gemini(
     return last_transient_result or _needs_review("Network timeout after 4 attempts.")
 
 
+def _verify_grok(
+    image_path: str,
+    detection_bbox: tuple[int, int, int, int],
+    building_context: dict,
+    timeout_s: int,
+) -> dict:
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        raise KeyError("XAI_API_KEY")
+    model_id = os.environ.get("GROK_MODEL") or _DEFAULT_GROK_MODEL
+
+    try:
+        crop_bytes = _make_crop_bytes(image_path, detection_bbox)
+        tile_bytes = _read_full_tile_bytes(image_path)
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    pos_imgs, neg_imgs = _load_reference_images()
+    prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
+
+    content_parts: list = [{"type": "text", "text": prompt}]
+    for img_bytes in pos_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    for img_bytes in neg_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    content_parts.append({"type": "text", "text": "--- Image A (candidate crop) ---"})
+    content_parts.append(_to_image_url_part(crop_bytes))
+    content_parts.append({"type": "text", "text": "--- Image B (full satellite tile) ---"})
+    content_parts.append(_to_image_url_part(tile_bytes))
+
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": content_parts},
+    ]
+
+    client = _get_grok_client(api_key)
+    last_transient_result: dict | None = None
+
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                response_format={"type": "json_object"},
+                timeout=timeout_s,
+            )
+        except openai.APITimeoutError as e:
+            _LOGGER.debug("Grok attempt %d timeout: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                "Grok network timeout after 4 attempts."
+            )
+            continue
+        except openai.RateLimitError as e:
+            _LOGGER.debug("Grok attempt %d rate-limited: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+            )
+            continue
+        except openai.AuthenticationError:
+            return _needs_review(
+                "Grok API authentication error (HTTP 401): XAI_API_KEY may be invalid or revoked."
+            )
+        except openai.APIConnectionError as e:
+            _LOGGER.debug("Grok attempt %d connect error: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+            )
+            continue
+        except openai.APIStatusError as e:
+            code = getattr(e, "status_code", None) or 0
+            if code in (408, 429) or 500 <= code < 600:
+                _LOGGER.debug(
+                    "Grok attempt %d transient (HTTP %s): %s",
+                    attempt + 1, code, _truncate(e),
+                )
+                last_transient_result = _needs_review(
+                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                )
+                continue
+            if code == 403:
+                return _needs_review(
+                    f"Grok API authorization error (HTTP 403): {_truncate(e)}"
+                )
+            if code == 400:
+                return _needs_review(
+                    f"Grok API rejected the request (HTTP 400): {_truncate(e)}. "
+                    f"This usually indicates a malformed prompt or unsupported format."
+                )
+            return _needs_review(
+                f"Grok API client error (HTTP {code}): {_truncate(e)}"
+            )
+        except openai.APIError as e:
+            return _needs_review(
+                f"Grok VLM API error: {type(e).__name__}: {_truncate(e)}"
+            )
+
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as e:
+            return _needs_review(f"Grok response shape unexpected: {_truncate(e)}")
+
+        if not content:
+            return _needs_review("Grok returned an empty response (no content).")
+
+        shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
+        return _parse_response(shim)
+
+    return last_transient_result or _needs_review(
+        "Grok network timeout after 4 attempts."
+    )
+
+
+def _combine_verdicts(
+    gemini_result: dict, grok_result: dict, threshold: float
+) -> dict:
+    """Apply consensus rule. Returns the full 7-key dual-verify dict."""
+
+    def bucket(verdict: str) -> str:
+        if verdict in _POSITIVE_VERDICTS:
+            return "positive"
+        if verdict in _NEGATIVE_VERDICTS:
+            return "negative"
+        return "abstain"
+
+    g_bucket = bucket(gemini_result["verdict"])
+    k_bucket = bucket(grok_result["verdict"])
+    g_conf = gemini_result["confidence"]
+    k_conf = grok_result["confidence"]
+
+    agree = (g_bucket == k_bucket) and (g_bucket != "abstain")
+    confident = (g_conf >= threshold) and (k_conf >= threshold)
+
+    if agree and confident:
+        final_verdict = (
+            gemini_result["verdict"] if g_conf >= k_conf else grok_result["verdict"]
+        )
+        final_confidence = min(g_conf, k_conf)
+        final_reasoning = (
+            f"Consensus ({g_bucket}). "
+            f"Gemini: {gemini_result['reasoning']} "
+            f"Grok: {grok_result['reasoning']}"
+        )
+        final_construction = bool(
+            gemini_result["construction"] and grok_result["construction"]
+        )
+    else:
+        final_verdict = "needs_review"
+        final_confidence = 0.0
+        if not agree:
+            reason = (
+                f"Models disagreed. "
+                f"Gemini: {gemini_result['verdict']} "
+                f"({g_bucket}, conf={g_conf:.2f}). "
+                f"Grok: {grok_result['verdict']} "
+                f"({k_bucket}, conf={k_conf:.2f}). "
+                f"Manual review required."
+            )
+        else:
+            reason = (
+                f"Below confidence threshold ({threshold}). "
+                f"Gemini conf={g_conf:.2f}, Grok conf={k_conf:.2f}. "
+                f"Manual review required."
+            )
+        final_reasoning = (
+            f"{reason} "
+            f"Gemini detail: {gemini_result['reasoning']} "
+            f"Grok detail: {grok_result['reasoning']}"
+        )
+        final_construction = False
+
+    return {
+        "verdict": final_verdict,
+        "confidence": final_confidence,
+        "reasoning": final_reasoning,
+        "construction": final_construction,
+        "gemini": gemini_result,
+        "grok": grok_result,
+        "agreement": agree and confident,
+    }
+
+
 def verify_detection(
     image_path: str,
     detection_bbox: tuple[int, int, int, int],
     building_context: dict,
 ) -> dict:
-    """Verify a YOLO cooling-tower detection using Gemini vision.
+    """Verify a YOLO cooling-tower detection using parallel Gemini + Grok consensus.
 
     Args:
         image_path: Path to the full 768x768 satellite tile (JPEG/PNG).
@@ -368,26 +596,38 @@ def verify_detection(
             the OSM footprint).
 
     Returns:
-        A dict with exactly four keys:
+        A dict with exactly seven keys. The first four are the consensus
+        result (backward-compatible with the prior single-model shape);
+        the remaining three expose per-model detail.
 
-        - ``verdict`` (str): one of ``"confirmed"``, ``"likely"``,
-          ``"neighbor_only"``, ``"needs_review"``, ``"not_detected"``.
-        - ``confidence`` (float): value in ``[0.0, 1.0]``.
-        - ``reasoning`` (str): 2-5 sentence sales-team-readable explanation.
-          For ``needs_review`` results generated by this module (validation
-          or transport failures), the reasoning describes the specific
-          failure mode.
-        - ``construction`` (bool): ``True`` only when active construction
-          is visibly underway on or adjacent to the target.
+        - ``verdict`` (str): consensus verdict, or ``"needs_review"`` when
+          the two models disagree, either falls below the confidence
+          threshold, or either failed via timeout/transport error.
+        - ``confidence`` (float): ``min(gemini_conf, grok_conf)`` when
+          consensus reached; ``0.0`` otherwise.
+        - ``reasoning`` (str): synthesized explanation that embeds both
+          models' raw reasoning. For ``needs_review`` it leads with the
+          reason ("Models disagreed.", "Below confidence threshold.", or
+          a per-model timeout/transport failure embedded in sub-detail).
+        - ``construction`` (bool): ``True`` only when both models flagged
+          active construction.
+        - ``gemini`` (dict): Gemini's own 4-key result dict.
+        - ``grok`` (dict): Grok's own 4-key result dict.
+        - ``agreement`` (bool): ``True`` iff the two models confidently
+          agreed on a bucket.
 
         All recoverable failures (bad inputs, network errors, schema
-        mismatches, etc.) are mapped to a ``needs_review`` dict so the
-        caller can always rely on the four-key shape.
+        mismatches, per-model timeouts, etc.) are mapped to ``needs_review``
+        in the relevant sub-dict; that naturally routes the top-level result
+        to ``needs_review`` via the disagreement rule. Pre-flight validation
+        failures (bad inputs, unreadable image, degenerate bbox) short-circuit
+        and return ``needs_review`` directly without calling either model
+        (and without the per-model sub-dicts).
 
     Raises:
-        KeyError: If the ``GEMINI_API_KEY`` environment variable is unset
-            or empty. This is treated as a configuration error rather than
-            a per-call failure and is surfaced loudly.
+        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
+            or empty. Both are required configuration; missing keys are
+            surfaced loudly rather than routed to ``needs_review``.
     """
     if not isinstance(building_context, dict):
         return _needs_review(
@@ -431,4 +671,36 @@ def verify_detection(
             f"Detection bbox {detection_bbox} is entirely outside image bounds (image is {w}x{h})."
         )
 
-    return _verify_gemini(image_path, detection_bbox, building_context)
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise KeyError("GEMINI_API_KEY")
+    if not os.environ.get("XAI_API_KEY"):
+        raise KeyError("XAI_API_KEY")
+
+    timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
+    threshold = float(
+        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        gemini_future = ex.submit(
+            _verify_gemini, image_path, detection_bbox, building_context, timeout_s
+        )
+        grok_future = ex.submit(
+            _verify_grok, image_path, detection_bbox, building_context, timeout_s
+        )
+
+        try:
+            gemini_result = gemini_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            gemini_result = _needs_review(
+                f"Gemini exceeded {timeout_s}s wall-clock timeout."
+            )
+
+        try:
+            grok_result = grok_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            grok_result = _needs_review(
+                f"Grok exceeded {timeout_s}s wall-clock timeout."
+            )
+
+    return _combine_verdicts(gemini_result, grok_result, threshold)
