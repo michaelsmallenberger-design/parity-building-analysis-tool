@@ -189,7 +189,7 @@ def _build_csv_row(
     original_url: Optional[str],
     result_url: Optional[str],
 ) -> Dict[str, Any]:
-    """Build a CSV row dict matching the 15-column Fork 5 schema."""
+    """Build a CSV row dict matching the 15-column Fork 5 schema. Also consumed by csv_export.web_results_to_csv_rows for headless runners; do not delete as dead code."""
     if consensus_dict is not None:
         confidence = consensus_dict.get('confidence')
         conf_display = f"{(confidence * 100):.1f}%" if isinstance(confidence, (int, float)) else "N/A"
