@@ -167,7 +167,7 @@ def extract_image_paths_from_results(
         # Skip errors
         if result.get('error'):
             # Even errors might have original images
-            original_url = result.get('original_image_url', '')
+            original_url = result.get('original_image_url') or ''
             if original_url.startswith('/files/'):
                 blob = original_url.replace('/files/', '')
                 local_path = str(get_local_path_func(blob))
@@ -176,8 +176,8 @@ def extract_image_paths_from_results(
             continue
 
         # Extract image URLs
-        original_url = result.get('original_image_url', '')
-        result_url = result.get('result_image_url', '')
+        original_url = result.get('original_image_url') or ''
+        result_url = result.get('result_image_url') or ''
 
         # Convert to local paths
         if original_url.startswith('/files/'):
