@@ -39,10 +39,23 @@ TEST_22_NORTH_6TH = {
     "expected_verdict": ["confirmed", "likely"],
 }
 
+TEST_ROOFTOP_CITYLIGHTS = {
+    "image_path": "pipeline_test_outputs/4-74_48_Avenue_Long_Island_City_NY_11109_raw.jpg",
+    "address": "4-74 48 Avenue, Long Island City, NY 11109",
+    "lat": 40.744390,
+    "lon": -73.957179,
+    "footprint_metadata": {"osm_id": 735023197, "tags": {}, "contains_point": True},
+    "expected_verdict": ["no_cooling_tower"],
+    "expected_construction": False,
+}
+
 _YOLO_MODEL_PATH = "models/rooftop_model.pt"
 _YOLO_CONF = 0.18
 _FULL_IMAGE_BBOX = (0, 0, 768, 768)
-_VALID_VERDICTS = {"confirmed", "likely", "neighbor_only", "needs_review", "not_detected"}
+_VALID_VERDICTS = {
+    "confirmed", "likely", "neighbor_only", "needs_review", "not_detected",
+    "cooling_tower_present", "cooling_tower_possible", "no_cooling_tower",
+}
 _SUB_MODEL_KEYS = {"verdict", "confidence", "reasoning", "construction"}
 _TOP_LEVEL_KEYS = {
     "verdict", "confidence", "reasoning", "construction",
@@ -95,6 +108,7 @@ def _preflight() -> bool:
     paths = (
         ("140 West End raw image", TEST_140_WEST_END["image_path"]),
         ("22 North 6th raw image", TEST_22_NORTH_6TH["image_path"]),
+        ("4-74 48 Avenue raw image (rooftop)", TEST_ROOFTOP_CITYLIGHTS["image_path"]),
         ("YOLO model", _YOLO_MODEL_PATH),
     )
     for label, path in paths:
@@ -317,6 +331,94 @@ def _run_fixture(name: str, fixture: dict) -> dict:
     }
 
 
+def _run_rooftop_fixture(name: str, fixture: dict) -> dict:
+    """Run a single rooftop fixture (verify_rooftop path). Returns dict with structure_pass, semantics_pass, inconclusive."""
+    print()
+    print(f"=== TEST (rooftop): {name} ===")
+    print(f"  address: {fixture['address']}")
+    print(f"  image:   {fixture['image_path']}")
+    print("  YOLO skipped (rooftop fixture — verify_rooftop fires without a YOLO bbox)")
+
+    ctx = _build_building_context(fixture)
+
+    print("  Calling vlm.verify_rooftop() ...")
+    t0 = time.perf_counter()
+    response = vlm.verify_rooftop(fixture["image_path"], ctx)
+    elapsed = time.perf_counter() - t0
+    print(f"  VLM call returned in {elapsed:.2f}s")
+
+    print()
+    print("  --- VLM consensus response ---")
+    if isinstance(response, dict):
+        for k in ("verdict", "confidence", "reasoning", "construction", "agreement"):
+            if k in response:
+                print(f"  {k}: {response[k]!r}")
+        for sub_name in ("gemini", "grok"):
+            sub = response.get(sub_name)
+            if isinstance(sub, dict):
+                print(f"  --- {sub_name} ---")
+                for k in ("verdict", "confidence", "reasoning", "construction"):
+                    if k in sub:
+                        print(f"    {k}: {sub[k]!r}")
+        for k in sorted(response.keys()):
+            if k not in _TOP_LEVEL_KEYS:
+                print(f"  [unexpected key] {k}: {response[k]!r}")
+    else:
+        print(f"  response (not a dict): {response!r}")
+
+    print()
+    print("  Structure checks:")
+    structure_pass, checks = _validate_structure(response)
+    for passed, label in checks:
+        (_print_pass if passed else _print_fail)(label)
+
+    print("  Semantics check:")
+    inconclusive = False
+    semantics_pass = False
+    if isinstance(response, dict):
+        verdict = response.get("verdict")
+        reasoning = response.get("reasoning", "")
+        if verdict == "needs_review" and _is_api_inconclusive(reasoning):
+            inconclusive = True
+            _print_fail(
+                f"verdict='needs_review' from an API/network/schema condition (INCONCLUSIVE). "
+                f"reasoning: {reasoning!r}"
+            )
+        elif verdict in fixture["expected_verdict"]:
+            semantics_pass = True
+            _print_pass(
+                f"verdict {verdict!r} is in expected {fixture['expected_verdict']}"
+            )
+        else:
+            _print_fail(
+                f"verdict {verdict!r} NOT in expected {fixture['expected_verdict']}"
+            )
+
+        # Soft construction check — warn but don't fail
+        expected_construction = fixture.get("expected_construction")
+        actual_construction = response.get("construction")
+        if expected_construction is not None and isinstance(actual_construction, bool):
+            if actual_construction == expected_construction:
+                _print_pass(
+                    f"construction {actual_construction!r} matches expected {expected_construction!r}"
+                )
+            else:
+                print(
+                    f"  [WARN] construction {actual_construction!r} does NOT match expected "
+                    f"{expected_construction!r} (soft check — not failing the test)"
+                )
+    else:
+        _print_fail("cannot check semantics (response is not a dict)")
+
+    return {
+        "name": name,
+        "structure_pass": structure_pass,
+        "semantics_pass": semantics_pass,
+        "inconclusive": inconclusive,
+        "elapsed": elapsed,
+    }
+
+
 def main() -> int:
     t_start = time.perf_counter()
     print("test_vlm.py - dual-VLM verification harness (Gemini + Grok)")
@@ -327,14 +429,19 @@ def main() -> int:
         print("FAILURE: pre-flight check failed; see [FAIL] line above.")
         return 2
 
-    fixtures = (
+    detection_fixtures = (
         ("140 West End Avenue, New York, NY 10023", TEST_140_WEST_END),
         ("22 North 6th Street, Brooklyn, NY 11249", TEST_22_NORTH_6TH),
     )
+    rooftop_fixtures = (
+        ("4-74 48 Avenue, Long Island City, NY 11109 (rooftop)", TEST_ROOFTOP_CITYLIGHTS),
+    )
 
     results = []
-    for name, fx in fixtures:
+    for name, fx in detection_fixtures:
         results.append(_run_fixture(name, fx))
+    for name, fx in rooftop_fixtures:
+        results.append(_run_rooftop_fixture(name, fx))
 
     total_elapsed = time.perf_counter() - t_start
 

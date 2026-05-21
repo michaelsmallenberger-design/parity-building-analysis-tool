@@ -48,8 +48,8 @@ _GROK_BASE_URL = "https://api.x.ai/v1"
 _DEFAULT_TIMEOUT_S = 120
 _DEFAULT_CONSENSUS_THRESHOLD = 0.7
 
-_POSITIVE_VERDICTS = frozenset({"confirmed", "likely"})
-_NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only"})
+_POSITIVE_VERDICTS = frozenset({"confirmed", "likely", "cooling_tower_present", "cooling_tower_possible"})
+_NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only", "no_cooling_tower"})
 
 _SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
 
@@ -112,8 +112,78 @@ _REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if the candidate in Image A more closely resembles a negative reference than any positive reference, lean toward "not_detected"."""
 
 
+_ROOFTOP_SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
+
+Your task is to scan a target building's rooftop AND its immediate surroundings in a satellite image, and report whether a cooling tower (rooftop or ground-mounted, per the definition below) is present serving the target building. There is no candidate detection from a prior model — an automated YOLO pass already ran on this image and found no cooling towers on the target rooftop, so you are the last line of defense. Your verdict drives a B2B sales pipeline; accuracy matters, and ambiguous cases should be flagged honestly rather than guessed.
+
+A cooling tower in this domain is a rooftop heat-rejection unit, typically rectangular or cylindrical, with louvered air intakes on the sides, fan housings or fan stacks on top, and visible piping or condenser coils. Older or open-design cooling towers may instead appear as a square or rectangular enclosure with a visible centrifugal or radial fan blade pattern inside, viewed from directly above. They sit on the rooftops of commercial, multifamily, or institutional buildings. Outside dense urban areas (most of the U.S. except cities like New York, Chicago, Boston, and San Francisco), cooling equipment serving a building is often ground-mounted instead — on a concrete pad next to the building, in a fenced enclosure, or in a mechanical yard. Treat ground-mounted cooling equipment serving the target building the same way you treat rooftop cooling towers for purposes of this verdict.
+
+They are NOT:
+- Rooftop air handler units (AHUs) — flat boxes without prominent fan stacks
+- Solar panels (rectangular, dark, flush with the roof)
+- Skylights or roof hatches
+- Rooftop water tanks (cylindrical wooden, or stainless-steel domed)
+- Elevator penthouses or stairwell bulkheads (windowless rooms on the roof)
+- Roof-mounted satellite dishes, antennas, or signage
+
+You will receive ONE satellite tile that shows the target building and its neighbors. The target building is the structure centered in the tile — its OSM footprint is described in the user prompt. Only equipment serving the target building should influence your cooling-tower verdict — this means equipment on the target building's rooftop, OR ground-mounted cooling equipment immediately adjacent to the target building per the user prompt. Anything on a neighboring building's rooftop should be ignored for the cooling-tower verdict.
+
+You also need to flag visible active construction (cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone) on the target rooftop or the surrounding area — this is a separate signal the sales team uses to prioritize follow-up, distinct from whether a cooling tower is present.
+
+Return a structured JSON response with four fields: verdict, confidence, reasoning, construction. Be calibrated and honest about uncertainty."""
+
+_ROOFTOP_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
+Address: {address}
+Geocoded coordinates: ({lat}, {lon})
+OSM building id: {osm_id}
+OSM tags: {osm_tags}
+Geocoded centroid is inside building footprint: {contains_point}
+
+=== DETECTION CONTEXT ===
+The satellite tile is 768x768 pixels at zoom 19 from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile. The TARGET building is the structure centered around pixel (384, 384) — its footprint corresponds to the OSM building described above. Equipment on a neighboring building's rooftop should be ignored. However, ground-mounted cooling equipment immediately adjacent to the target building — on a concrete pad, in a fenced enclosure, or in a mechanical yard within roughly 30 feet of the target building — counts as serving the target and should be reported.
+
+An automated YOLO computer-vision pass already ran on this tile. No cooling-tower detections were found. You are the last line of defense — scan the target building's rooftop and its immediate surroundings, and decide whether a cooling tower (rooftop or ground-mounted) is actually present.
+
+=== IMAGES YOU WILL RECEIVE ===
+- The full 768x768 satellite tile showing the target building (centered) and its neighbors.{reference_block}
+
+=== YOUR TASK ===
+Pick the single verdict that best describes whether a cooling tower is on the target rooftop:
+
+- "cooling_tower_present"  — a cooling tower is clearly visible on the target building (rooftop or ground-mounted). Use confidence > 0.7.
+- "cooling_tower_possible" — something that might be a cooling tower is visible on the target building (rooftop or ground-mounted), with ambiguity (partial occlusion, marginal image quality, similar but not certain). Use confidence 0.4-0.7.
+- "no_cooling_tower"       — confident no cooling tower is on the target building (rooftop or ground-mounted).
+- "needs_review"           — you cannot decide with reasonable confidence. The reasoning field MUST explain what is preventing a decision.
+
+If your verdict is "cooling_tower_present" or "cooling_tower_possible", your reasoning MUST cite specific visible features from the cooling tower definition in the system prompt. Acceptable feature citations include: louvers, fan stacks, condenser coils, a visible centrifugal or axial fan blade pattern from above, finned heat-exchanger coil banks, or visible piping consistent with chilled-water or refrigerant lines. Vague descriptions like "mechanical equipment on the roof", "rooftop structure", or "equipment on the pad" are not sufficient justification. If you cannot cite specific features, the correct verdict is "no_cooling_tower" (if you are confident in the absence) or "needs_review" (if you are uncertain).
+
+Set "construction": true ONLY if you can see active construction — cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone on the target rooftop or adjacent area. Do NOT set true just because the building looks modern, recently built, or well-maintained. Completed buildings = false.
+
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
+
+_ROOFTOP_REFERENCE_BLOCK_POSITIVE = """
+
+=== REFERENCE IMAGES ===
+After the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from the same 768x768 zoom-19 Mapbox satellite imagery you are analyzing now.
+
+Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
+
+When scanning the target rooftop in the satellite tile, compare what you see against the positives. Equipment that shares the fan pattern, scale, and enclosure characteristics of the positives should lean toward "cooling_tower_present" or "cooling_tower_possible"."""
+
+_ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
+
+You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if equipment on the target rooftop more closely resembles a negative reference than any positive reference, lean toward "no_cooling_tower"."""
+
+
 class _VerificationResponse(BaseModel):
     verdict: Literal["confirmed", "likely", "neighbor_only", "needs_review", "not_detected"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = Field(min_length=1)
+    construction: bool
+
+
+class _RooftopResponse(BaseModel):
+    verdict: Literal["cooling_tower_present", "cooling_tower_possible", "no_cooling_tower", "needs_review"]
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=1)
     construction: bool
@@ -263,6 +333,47 @@ def _build_prompt(
     )
 
 
+def _build_rooftop_prompt(
+    building_context: dict,
+    n_pos: int,
+    n_neg: int,
+) -> str:
+    fm = building_context.get("footprint_metadata")
+    if not isinstance(fm, dict):
+        fm = {}
+
+    address = building_context.get("address") or "(not provided)"
+    lat = building_context.get("lat")
+    lon = building_context.get("lon")
+    lat_s = "?" if lat is None else lat
+    lon_s = "?" if lon is None else lon
+
+    osm_id = fm.get("osm_id")
+    osm_id_s = "?" if osm_id is None else osm_id
+
+    tags = fm.get("tags")
+    tags_s = "(not provided)" if not tags else tags
+
+    contains = fm.get("contains_point")
+    contains_s = "unknown" if contains is None else str(bool(contains)).lower()
+
+    reference_block = ""
+    if n_pos > 0:
+        reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
+        if n_neg > 0:
+            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+
+    return _ROOFTOP_USER_PROMPT_TEMPLATE.format(
+        address=address,
+        lat=lat_s,
+        lon=lon_s,
+        osm_id=osm_id_s,
+        osm_tags=tags_s,
+        contains_point=contains_s,
+        reference_block=reference_block,
+    )
+
+
 def _result_from_validated(parsed: _VerificationResponse) -> dict:
     return {
         "verdict": parsed.verdict,
@@ -272,9 +383,9 @@ def _result_from_validated(parsed: _VerificationResponse) -> dict:
     }
 
 
-def _parse_response(response) -> dict:
+def _parse_response(response, model_cls) -> dict:
     parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, _VerificationResponse):
+    if isinstance(parsed, model_cls):
         return _result_from_validated(parsed)
 
     raw_text = getattr(response, "text", None)
@@ -283,7 +394,7 @@ def _parse_response(response) -> dict:
 
     try:
         data = json.loads(raw_text)
-        validated = _VerificationResponse(**data)
+        validated = model_cls(**data)
     except (ValueError, ValidationError, TypeError):
         _LOGGER.warning("VLM schema mismatch. Full raw output: %s", raw_text)
         return _needs_review(
@@ -385,7 +496,101 @@ def _verify_gemini(
         except genai_errors.APIError as e:
             return _needs_review(f"VLM API error: {type(e).__name__}: {_truncate(e)}")
 
-        return _parse_response(response)
+        return _parse_response(response, _VerificationResponse)
+
+    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+
+
+def _verify_gemini_rooftop(
+    image_path: str,
+    building_context: dict,
+    timeout_s: int,
+) -> dict:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise KeyError("GEMINI_API_KEY")
+    model_id = os.environ.get("GEMINI_MODEL") or _DEFAULT_GEMINI_MODEL
+
+    try:
+        tile_bytes = _read_full_tile_bytes(image_path)
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    pos_imgs, neg_imgs = _load_reference_images()
+    prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
+
+    contents: list = [prompt]
+    for img_bytes in pos_imgs:
+        contents.append("--- Reference: positive example ---")
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    for img_bytes in neg_imgs:
+        contents.append("--- Reference: negative example ---")
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    contents.append("--- Satellite tile (target building centered) ---")
+    contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
+
+    client = _get_gemini_client(api_key)
+    config = types.GenerateContentConfig(
+        system_instruction=_ROOFTOP_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=_RooftopResponse,
+        http_options=types.HttpOptions(timeout=timeout_s * 1000),
+    )
+
+    last_transient_result: dict | None = None
+
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            response = client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=config,
+            )
+        except httpx.TimeoutException as e:
+            _LOGGER.debug("Rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            continue
+        except httpx.ConnectError as e:
+            _LOGGER.debug("Rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+            )
+            continue
+        except genai_errors.ServerError as e:
+            code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
+            _LOGGER.debug("Rooftop attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
+            last_transient_result = _needs_review(
+                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+            )
+            continue
+        except genai_errors.ClientError as e:
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            if code in (408, 429):
+                name = "Request Timeout" if code == 408 else "Too Many Requests"
+                _LOGGER.debug("Rooftop attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
+                last_transient_result = _needs_review(
+                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                )
+                continue
+            if code == 401:
+                return _needs_review(
+                    "API authentication error (HTTP 401): GEMINI_API_KEY may be invalid or revoked."
+                )
+            if code == 403:
+                return _needs_review(f"API authorization error (HTTP 403): {_truncate(e)}")
+            if code == 400:
+                return _needs_review(
+                    f"API rejected the request (HTTP 400): {_truncate(e)}. This usually indicates a malformed prompt or unsupported schema."
+                )
+            return _needs_review(f"API client error (HTTP {code}): {_truncate(e)}")
+        except genai_errors.APIError as e:
+            return _needs_review(f"VLM API error: {type(e).__name__}: {_truncate(e)}")
+
+        return _parse_response(response, _RooftopResponse)
 
     return last_transient_result or _needs_review("Network timeout after 4 attempts.")
 
@@ -501,7 +706,121 @@ def _verify_grok(
             return _needs_review("Grok returned an empty response (no content).")
 
         shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
-        return _parse_response(shim)
+        return _parse_response(shim, _VerificationResponse)
+
+    return last_transient_result or _needs_review(
+        "Grok network timeout after 4 attempts."
+    )
+
+
+def _verify_grok_rooftop(
+    image_path: str,
+    building_context: dict,
+    timeout_s: int,
+) -> dict:
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        raise KeyError("XAI_API_KEY")
+    model_id = os.environ.get("GROK_MODEL") or _DEFAULT_GROK_MODEL
+
+    try:
+        tile_bytes = _read_full_tile_bytes(image_path)
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    pos_imgs, neg_imgs = _load_reference_images()
+    prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
+
+    content_parts: list = [{"type": "text", "text": prompt}]
+    for img_bytes in pos_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    for img_bytes in neg_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    content_parts.append({"type": "text", "text": "--- Satellite tile (target building centered) ---"})
+    content_parts.append(_to_image_url_part(tile_bytes))
+
+    messages = [
+        {"role": "system", "content": _ROOFTOP_SYSTEM_PROMPT},
+        {"role": "user", "content": content_parts},
+    ]
+
+    client = _get_grok_client(api_key)
+    last_transient_result: dict | None = None
+
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                response_format={"type": "json_object"},
+                timeout=timeout_s,
+            )
+        except openai.APITimeoutError as e:
+            _LOGGER.debug("Grok rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                "Grok network timeout after 4 attempts."
+            )
+            continue
+        except openai.RateLimitError as e:
+            _LOGGER.debug("Grok rooftop attempt %d rate-limited: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+            )
+            continue
+        except openai.AuthenticationError:
+            return _needs_review(
+                "Grok API authentication error (HTTP 401): XAI_API_KEY may be invalid or revoked."
+            )
+        except openai.APIConnectionError as e:
+            _LOGGER.debug("Grok rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+            )
+            continue
+        except openai.APIStatusError as e:
+            code = getattr(e, "status_code", None) or 0
+            if code in (408, 429) or 500 <= code < 600:
+                _LOGGER.debug(
+                    "Grok rooftop attempt %d transient (HTTP %s): %s",
+                    attempt + 1, code, _truncate(e),
+                )
+                last_transient_result = _needs_review(
+                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                )
+                continue
+            if code == 403:
+                return _needs_review(
+                    f"Grok API authorization error (HTTP 403): {_truncate(e)}"
+                )
+            if code == 400:
+                return _needs_review(
+                    f"Grok API rejected the request (HTTP 400): {_truncate(e)}. "
+                    f"This usually indicates a malformed prompt or unsupported format."
+                )
+            return _needs_review(
+                f"Grok API client error (HTTP {code}): {_truncate(e)}"
+            )
+        except openai.APIError as e:
+            return _needs_review(
+                f"Grok VLM API error: {type(e).__name__}: {_truncate(e)}"
+            )
+
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as e:
+            return _needs_review(f"Grok response shape unexpected: {_truncate(e)}")
+
+        if not content:
+            return _needs_review("Grok returned an empty response (no content).")
+
+        shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
+        return _parse_response(shim, _RooftopResponse)
 
     return last_transient_result or _needs_review(
         "Grok network timeout after 4 attempts."
@@ -687,6 +1006,99 @@ def verify_detection(
         )
         grok_future = ex.submit(
             _verify_grok, image_path, detection_bbox, building_context, timeout_s
+        )
+
+        try:
+            gemini_result = gemini_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            gemini_result = _needs_review(
+                f"Gemini exceeded {timeout_s}s wall-clock timeout."
+            )
+
+        try:
+            grok_result = grok_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            grok_result = _needs_review(
+                f"Grok exceeded {timeout_s}s wall-clock timeout."
+            )
+
+    return _combine_verdicts(gemini_result, grok_result, threshold)
+
+
+def verify_rooftop(
+    image_path: str,
+    building_context: dict,
+) -> dict:
+    """Scan a target rooftop for cooling towers when YOLO found nothing.
+
+    This is the "last line of defense" path: it fires when an earlier YOLO
+    pass returned zero kept detections on the target rooftop. Instead of
+    verifying a candidate detection, it asks the VLMs to scan the rooftop
+    directly and report whether a cooling tower is present, plus whether
+    active construction is visible.
+
+    Args:
+        image_path: Path to the full 768x768 satellite tile (JPEG/PNG),
+            centered on the OSM building centroid.
+        building_context: Dict describing the target building. Must contain
+            either ``address`` (truthy str) or both ``lat`` and ``lon``
+            (numeric). May additionally contain a ``footprint_metadata``
+            sub-dict with ``osm_id``, ``tags``, and ``contains_point``.
+
+    Returns:
+        A dict with exactly seven keys, matching the shape of
+        ``verify_detection``. The verdict literals come from the rooftop
+        schema: ``cooling_tower_present``, ``cooling_tower_possible``,
+        ``no_cooling_tower``, or ``needs_review``. Construction is True only
+        when both models flagged active construction (same consensus rule
+        as ``verify_detection``).
+
+    Raises:
+        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
+            or empty.
+    """
+    if not isinstance(building_context, dict):
+        return _needs_review(
+            f"building_context must be a dict, got {type(building_context).__name__}."
+        )
+
+    has_address = bool(building_context.get("address"))
+    lat = building_context.get("lat")
+    lon = building_context.get("lon")
+    has_valid_coords = isinstance(lat, (int, float)) and not isinstance(lat, bool) \
+        and isinstance(lon, (int, float)) and not isinstance(lon, bool)
+    if not has_address and not has_valid_coords:
+        return _needs_review(
+            "building_context provided no identifying information (no address, no coordinates)."
+        )
+
+    if not os.path.isfile(image_path):
+        return _needs_review(f"Image file not found: {image_path}")
+
+    try:
+        with Image.open(image_path) as img:
+            _ = img.size
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise KeyError("GEMINI_API_KEY")
+    if not os.environ.get("XAI_API_KEY"):
+        raise KeyError("XAI_API_KEY")
+
+    timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
+    threshold = float(
+        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        gemini_future = ex.submit(
+            _verify_gemini_rooftop, image_path, building_context, timeout_s
+        )
+        grok_future = ex.submit(
+            _verify_grok_rooftop, image_path, building_context, timeout_s
         )
 
         try:
