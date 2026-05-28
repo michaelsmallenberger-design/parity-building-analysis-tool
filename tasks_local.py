@@ -12,6 +12,7 @@ from shapely.geometry import MultiPolygon
 
 from utils import geocode_address_mapbox, get_satellite_image_mapbox, YOLO_CONF, _get_model
 from geometry import get_building_footprint, footprint_filter_pipeline
+from nyc_opendata import lookup_nyc_registry
 from vlm import verify_detection, verify_rooftop
 from pipeline_render import render_annotated_image
 from html_report import generate_html_report
@@ -23,6 +24,7 @@ log = logging.getLogger("tasks")
 _POSITIVE_VERDICTS = frozenset({
     "confirmed", "likely",
     "cooling_tower_present", "cooling_tower_possible",
+    "registry_confirmed",
 })
 _AMBIGUOUS_VERDICTS = frozenset({"needs_review"})
 _NEGATIVE_VERDICTS = frozenset({
@@ -78,6 +80,8 @@ def _build_notes(row_state: Dict[str, Any]) -> str:
     """
     verdict = row_state.get('verdict')
 
+    if verdict == 'registry_confirmed':
+        return row_state.get('registry_citation', 'Confirmed via NYC OpenData registry')
     if verdict == 'footprint_missing':
         return "No OSM footprint found, manual verification needed"
     if row_state.get('geocode_failed'):
@@ -540,6 +544,64 @@ def process_address_list(
         original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
         upload_file(original_local, original_blob)
         original_url = make_signed_url(original_blob)
+
+        # ====================================================================
+        # Registry-first: BIN-matched NYC OpenData hit → confirm, skip YOLO+VLM
+        # ====================================================================
+        registry = lookup_nyc_registry(geo_lat, geo_lon, footprint)
+        if registry['confirmed']:
+            log.info(
+                f"Row {i+1}/{total}: Registry-confirmed "
+                f"({registry['source']}, BIN {registry['bin']}); skipping YOLO+VLM"
+            )
+            render_annotated_image(
+                raw_image_path=original_local,
+                output_path=annotated_local,
+                footprint=footprint,
+                centroid_lat=centroid_lat,
+                centroid_lon=centroid_lon,
+                enriched_detections=[],
+                winner=None,
+            )
+            result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
+            upload_file(annotated_local, result_blob)
+            result_url = make_signed_url(result_blob)
+
+            notes = _build_notes({
+                'verdict': 'registry_confirmed',
+                'registry_citation': registry['citation'],
+            })
+            web_results.append(_build_web_entry(
+                full_address=full_address,
+                verdict='registry_confirmed',
+                consensus_dict=None,
+                detection_count=0,
+                construction=False,
+                notes=notes,
+                original_url=original_url,
+                result_url=result_url,
+            ))
+            csv_rows.append(_build_csv_row(
+                full_address=full_address,
+                verdict='registry_confirmed',
+                consensus_dict=None,
+                detection_count=0,
+                construction=False,
+                notes=notes,
+                original_url=original_url,
+                result_url=result_url,
+            ))
+
+            for p in (original_local, annotated_local):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    log.warning(f"Could not clean up temp file {p}: {e}")
+
+            if write_partial_result:
+                write_partial_result({"web_results": web_results})
+            continue
 
         log.info(f"Row {i+1}/{total}: Running YOLO at conf={YOLO_CONF}")
         model = _get_model()
