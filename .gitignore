@@ -43,4 +43,5 @@ download_training_images.py
 scratch_*.py
 scratch_*.csv
 scratch_results.json
+scratch_*/
 smoke_*.py
