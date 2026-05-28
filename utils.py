@@ -110,6 +110,21 @@ def _clean_address(address: str) -> List[str]:
     return queries
 
 
+def is_fully_qualified_address(address: str) -> bool:
+    """True if the address carries a 5-digit ZIP, which disambiguates it.
+
+    Used to gate the registry-first skip: that path has no VLM safety net, so a
+    misgeocode would silently confirm the wrong building. A ZIP forces the
+    geocoder onto the right block (e.g. '641 Fifth Avenue, New York, NY' is
+    ambiguous between Midtown and Park Slope; '...NY 10022' is not).
+
+    A leading street number is stripped first so '10000 Main St' (no ZIP) is not
+    a false positive.
+    """
+    body = re.sub(r'^\s*\d+(?:-\d+)?\s+', '', address or '')
+    return bool(re.search(r'\b\d{5}(?:-\d{4})?\b', body))
+
+
 def _geocode_mapbox(query: str) -> Optional[Tuple[Tuple[float, float], float]]:
     """
     Geocode using Mapbox API.
@@ -122,7 +137,7 @@ def _geocode_mapbox(query: str) -> Optional[Tuple[Tuple[float, float], float]]:
             "access_token": MAPBOX_API_KEY,
             "limit": 1,
             "types": "address,poi,place,neighborhood,locality",
-            "autocomplete": "true",
+            "autocomplete": "false",
             "country": "US",
         }
         mb_data = _http_get(mb_url, mb_params)

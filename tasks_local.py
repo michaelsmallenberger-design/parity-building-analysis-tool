@@ -10,7 +10,7 @@ import pandas as pd
 from typing import Callable, Dict, Any, List, Optional, Tuple
 from shapely.geometry import MultiPolygon
 
-from utils import geocode_address_mapbox, get_satellite_image_mapbox, YOLO_CONF, _get_model
+from utils import geocode_address_mapbox, get_satellite_image_mapbox, is_fully_qualified_address, YOLO_CONF, _get_model
 from geometry import get_building_footprint, footprint_filter_pipeline
 from nyc_opendata import lookup_nyc_registry
 from vlm import verify_detection, verify_rooftop
@@ -547,8 +547,18 @@ def process_address_list(
 
         # ====================================================================
         # Registry-first: BIN-matched NYC OpenData hit → confirm, skip YOLO+VLM
+        # The skip has no VLM safety net, so require a fully-qualified (ZIP-bearing)
+        # address — a misgeocode would otherwise confirm the wrong building.
+        # Under-qualified addresses fall through to the full pipeline.
         # ====================================================================
-        registry = lookup_nyc_registry(geo_lat, geo_lon, footprint)
+        registry = {'confirmed': False}
+        if is_fully_qualified_address(full_address):
+            registry = lookup_nyc_registry(geo_lat, geo_lon, footprint)
+        else:
+            log.info(
+                f"Row {i+1}/{total}: Address not fully-qualified (no ZIP); "
+                f"registry skip ineligible, running full pipeline"
+            )
         if registry['confirmed']:
             log.info(
                 f"Row {i+1}/{total}: Registry-confirmed "
