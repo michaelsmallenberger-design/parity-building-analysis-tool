@@ -716,7 +716,7 @@ def process_address_list(
     # Log summary statistics
     successful = sum(1 for r in web_results if not r.get('error'))
     failed = sum(1 for r in web_results if r.get('error'))
-    detections = sum(1 for r in web_results if r.get('confidence_score'))
+    detections = sum(1 for r in web_results if r.get('verdict') in _POSITIVE_VERDICTS)
 
     log.info(f"Processing complete: {total} total addresses")
     log.info(f"  ✓ Successful: {successful}")
