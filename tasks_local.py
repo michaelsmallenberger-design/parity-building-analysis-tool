@@ -4,14 +4,22 @@ Processes address lists using local filesystem instead of GCS.
 """
 import os
 import re
+import math
 import tempfile
 import logging
 import pandas as pd
 from typing import Callable, Dict, Any, List, Optional, Tuple
 from shapely.geometry import MultiPolygon
+from shapely.ops import transform
 
-from utils import geocode_address_mapbox, get_satellite_image_mapbox, is_fully_qualified_address, YOLO_CONF, _get_model
-from geometry import get_building_footprint, footprint_filter_pipeline
+from utils import (
+    geocode_address_mapbox, get_satellite_image_mapbox, is_fully_qualified_address,
+    YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
+)
+from geometry import (
+    get_building_footprint, classify_detections, filter_detections,
+    extract_detections_from_yolo, ensemble_dedupe_detections, geo_dedupe_detections,
+)
 from nyc_opendata import lookup_nyc_registry
 from vlm import verify_detection, verify_rooftop
 from pipeline_render import render_annotated_image
@@ -30,6 +38,55 @@ _AMBIGUOUS_VERDICTS = frozenset({"needs_review"})
 _NEGATIVE_VERDICTS = frozenset({
     "not_detected", "neighbor_only", "no_cooling_tower",
 })
+
+# Area gate: footprints smaller than this (square meters) are gated as
+# likely_residential before any tile fetch / YOLO / VLM. Floor sits well below
+# the smallest measured real cooling-tower building (720.8 sq m; see
+# scratch_footprint_areas.py) so OSM trace noise can't gate out a real lead --
+# the VLM house-check backstops the 200-720 band.
+MIN_COMMERCIAL_FOOTPRINT_SQM = 200
+
+
+def _detect_on_tile(
+    tile_path: str,
+    tile_zoom: int,
+    footprint: Dict[str, Any],
+    centroid_lat: float,
+    centroid_lon: float,
+) -> List[Dict[str, Any]]:
+    """Run the YOLO ensemble on one tile, classify against the footprint, and
+    return kept detections tagged with tile provenance.
+
+    Both models run on the tile; their outputs are deduped within the tile by
+    pixel IoU (valid at a single zoom). Cross-tile dedupe across zoom levels is
+    done later in geo space via geo_dedupe_detections. filter_detections honors
+    YOLO_KEEP_OUTSIDE so off-building (ground) candidates pass through to the VLM.
+    """
+    ensemble_dets: List[Dict[str, Any]] = []
+    for label, model in _get_models():
+        ct_idx = ct_class_indices(model)
+        if not ct_idx:
+            log.warning(f"  [z{tile_zoom}] {label}: no cooling_tower class in {model.names}; skipping")
+            continue
+        yolo_result = model.predict(source=tile_path, conf=YOLO_CONF, verbose=False)[0]
+        raw = extract_detections_from_yolo(yolo_result)
+        filtered = [d for d in raw if d.get('class') in ct_idx]
+        for d in filtered:
+            d['source_model'] = label
+        ensemble_dets.extend(filtered)
+
+    deduped = ensemble_dedupe_detections(ensemble_dets, iou_threshold=0.5)
+    classified = classify_detections(
+        deduped, footprint, centroid_lat, centroid_lon, tile_zoom, 768, 768
+    )
+    kept, _rejected = filter_detections(classified)
+    for d in kept:
+        d['tile_zoom'] = tile_zoom
+        d['tile_path'] = tile_path
+    log.info(
+        f"  [z{tile_zoom}] ensemble union {len(ensemble_dets)} → dedupe {len(deduped)} → kept {len(kept)}"
+    )
+    return kept
 
 
 def _pick_winner(enriched_detections: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -84,10 +141,18 @@ def _build_notes(row_state: Dict[str, Any]) -> str:
         return row_state.get('registry_citation', 'Confirmed via NYC OpenData registry')
     if verdict == 'footprint_missing':
         return "No OSM footprint found, manual verification needed"
+    if verdict == 'likely_residential':
+        return (f"Footprint below commercial size floor ({MIN_COMMERCIAL_FOOTPRINT_SQM} sq m) "
+                "- likely residential; manual verification recommended")
+    if verdict == 'ambiguous_footprint':
+        return ("Geocoded point falls outside any building footprint "
+                "(nearest-match area unreliable); manual verification recommended")
     if row_state.get('geocode_failed'):
         return "Address could not be geocoded"
     if row_state.get('imagery_failed'):
         return "Satellite image could not be downloaded"
+    if row_state.get('construction_review'):
+        return "Construction visible — Mapbox imagery may be stale; flagged for manual review/lookup"
     if verdict == 'needs_review':
         return "Manual review recommended"
 
@@ -128,6 +193,22 @@ def _centroid_latlon(footprint: Dict[str, Any]) -> Tuple[float, float]:
     return (centroid.y, centroid.x)
 
 
+def _footprint_area_m2(footprint: Dict[str, Any]) -> float:
+    """Footprint area in square meters via a local equirectangular projection
+    about the centroid (Option A -- no pyproj). Accurate to <0.1% at building
+    scale. Projects the whole geometry, so MultiPolygon areas sum correctly."""
+    polygon = footprint['polygon']
+    c = polygon.centroid
+    lat0, lon0 = c.y, c.x
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
+    projected = transform(
+        lambda lon, lat: ((lon - lon0) * m_per_deg_lon, (lat - lat0) * m_per_deg_lat),
+        polygon,
+    )
+    return projected.area
+
+
 def _build_web_entry(
     full_address: str,
     verdict: str,
@@ -138,10 +219,12 @@ def _build_web_entry(
     original_url: Optional[str],
     result_url: Optional[str],
     error: Optional[str] = None,
+    result_url_wide: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a web_results entry. Keeps backward-compatible keys for html_report.py
     (address, confidence_score, result_image_url, original_image_url, error) plus
-    the new pipeline fields surfaced for downstream consumers.
+    the new pipeline fields surfaced for downstream consumers. result_url_wide is
+    the annotated wide-context tile (None for non-VLM rows).
     """
     if consensus_dict is not None:
         confidence_score = consensus_dict.get('confidence')
@@ -166,6 +249,7 @@ def _build_web_entry(
         "address": full_address,
         "confidence_score": confidence_score,
         "result_image_url": result_url,
+        "result_image_url_wide": result_url_wide,
         "original_image_url": original_url,
         "verdict": verdict,
         "detection_count": detection_count,
@@ -440,6 +524,10 @@ def process_address_list(
             tempfile.gettempdir(),
             f"{job_id}_{i}_{clean_addr}_annotated.jpg",
         )
+        annotated_wide_local = os.path.join(
+            tempfile.gettempdir(),
+            f"{job_id}_{i}_{clean_addr}_annotated_wide.jpg",
+        )
 
         # ====================================================================
         # BRANCH A — footprint_missing: fetch geocoded-point tile, no VLM
@@ -520,6 +608,56 @@ def process_address_list(
         # ====================================================================
         log.info(f"Row {i+1}/{total}: Footprint found (OSM ID {footprint.get('osm_id')})")
         centroid_lat, centroid_lon = _centroid_latlon(footprint)
+
+        # ====================================================================
+        # AREA GATE -- cheapest exit, BEFORE any Mapbox tile fetch / YOLO / VLM.
+        # Mirrors the footprint_missing branch: emit a verdict, no rendered
+        # tile, route to manual review.
+        #   - contains_point False (nearest-building fallback): the area is
+        #     untrustworthy -- a real tower building can match a tiny adjacent
+        #     polygon (e.g. 530 East 76 -> 159 sq m wrong polygon) -- so do NOT
+        #     gate on area; route to review as ambiguous_footprint.
+        #   - contains_point True AND area < floor: gate as likely_residential.
+        # OPEN: this sits before the registry-first check below; whether an
+        # ambiguous_footprint should still get a registry shot is flagged for
+        # review (a BIN match off a wrong footprint is itself unreliable).
+        # ====================================================================
+        if not footprint.get('contains_point'):
+            log.info(f"Row {i+1}/{total}: Footprint is a nearest-building fallback "
+                     f"(contains_point=False); routing to review as ambiguous_footprint")
+            notes = _build_notes({'verdict': 'ambiguous_footprint'})
+            web_results.append(_build_web_entry(
+                full_address=full_address, verdict='ambiguous_footprint',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ))
+            csv_rows.append(_build_csv_row(
+                full_address=full_address, verdict='ambiguous_footprint',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ))
+            if write_partial_result:
+                write_partial_result({"web_results": web_results})
+            continue
+
+        footprint_area = _footprint_area_m2(footprint)
+        if footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
+            log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
+                     f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
+            notes = _build_notes({'verdict': 'likely_residential'})
+            web_results.append(_build_web_entry(
+                full_address=full_address, verdict='likely_residential',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ))
+            csv_rows.append(_build_csv_row(
+                full_address=full_address, verdict='likely_residential',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ))
+            if write_partial_result:
+                write_partial_result({"web_results": web_results})
+            continue
 
         log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image")
         ok = get_satellite_image_mapbox(centroid_lat, centroid_lon, original_local)
@@ -613,16 +751,30 @@ def process_address_list(
                 write_partial_result({"web_results": web_results})
             continue
 
-        log.info(f"Row {i+1}/{total}: Running YOLO at conf={YOLO_CONF}")
-        model = _get_model()
-        yolo_result = model.predict(source=original_local, conf=YOLO_CONF, verbose=False)[0]
+        # Fetch the wider tile (ground-mounted CTs / parcel context). original_local is
+        # the detail tile (z19); wide_local is z17. Both centered on the same centroid.
+        wide_local = os.path.join(
+            tempfile.gettempdir(),
+            f"{job_id}_{i}_{clean_addr}_wide.jpg",
+        )
+        log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
+        if not get_satellite_image_mapbox(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
+            log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
+            wide_local = None
 
-        pipeline = footprint_filter_pipeline(
-            yolo_result, centroid_lat, centroid_lon,
-            zoom=19, img_width=768, img_height=768,
+        log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF} on both zooms")
+        detail_kept = _detect_on_tile(original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon)
+        wide_kept = (
+            _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon)
+            if wide_local else []
+        )
+        merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
+        log.info(
+            f"  Cross-zoom: detail {len(detail_kept)} + wide {len(wide_kept)} "
+            f"→ {len(merged)} after geo dedupe"
         )
 
-        ctx = {
+        base_ctx = {
             "address": full_address,
             "lat": centroid_lat,
             "lon": centroid_lon,
@@ -635,72 +787,130 @@ def process_address_list(
 
         enriched: List[Dict[str, Any]] = []
         winner: Optional[Dict[str, Any]] = None
-        if pipeline['kept']:
+        if merged:
             log.info(
-                f"Row {i+1}/{total}: {len(pipeline['kept'])} kept detection(s); "
+                f"Row {i+1}/{total}: {len(merged)} kept detection(s) across zooms; "
                 f"running verify_detection per candidate"
             )
-            for det in pipeline['kept']:
-                vlm_result = verify_detection(original_local, det['bbox'], ctx)
+            for det in merged:
+                det_tile = det['tile_path']
+                det_zoom = det['tile_zoom']
+                # Context = the opposite-zoom tile of the same target (if available).
+                if det_tile == original_local and wide_local:
+                    context_path, context_zoom = wide_local, MAPBOX_ZOOM_WIDE
+                elif det_tile == wide_local:
+                    context_path, context_zoom = original_local, MAPBOX_ZOOM
+                else:
+                    context_path, context_zoom = None, None
+                det_ctx = {
+                    **base_ctx,
+                    "detection_location": det.get('location', 'unknown'),
+                    "tile_zoom": det_zoom,
+                    "context_zoom": context_zoom,
+                }
+                vlm_result = verify_detection(
+                    det_tile, det['bbox'], det_ctx, context_image_path=context_path
+                )
                 enriched.append({**det, 'vlm_result': vlm_result})
             winner = _pick_winner(enriched)
             consensus_dict = winner['vlm_result']
             rooftop_path = False
-            detection_count = len(pipeline['kept'])
+            detection_count = len(merged)
             winner_is_boundary = (winner.get('location') == 'boundary')
+            render_tile, render_zoom = winner['tile_path'], winner['tile_zoom']
         else:
+            # Rooftop scan: lead with the wide tile (ground CTs are the concern),
+            # passing the detail tile as cross-zoom context.
             log.info(f"Row {i+1}/{total}: No kept detections; running verify_rooftop")
-            consensus_dict = verify_rooftop(original_local, ctx)
+            scan_path = wide_local or original_local
+            scan_zoom = MAPBOX_ZOOM_WIDE if wide_local else MAPBOX_ZOOM
+            context_path = original_local if wide_local else None
+            rooftop_ctx = {
+                **base_ctx,
+                "tile_zoom": scan_zoom,
+                "context_zoom": MAPBOX_ZOOM if wide_local else None,
+            }
+            consensus_dict = verify_rooftop(scan_path, rooftop_ctx, context_image_path=context_path)
             rooftop_path = True
             detection_count = 0
             winner_is_boundary = False
+            render_tile, render_zoom = scan_path, scan_zoom
 
-        render_annotated_image(
-            raw_image_path=original_local,
-            output_path=annotated_local,
-            footprint=footprint,
-            centroid_lat=centroid_lat,
-            centroid_lon=centroid_lon,
-            enriched_detections=enriched,
-            winner=winner,
-        )
-        result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
-        upload_file(annotated_local, result_blob)
-        result_url = make_signed_url(result_blob)
+        # Render BOTH tiles so manual review always has a clear close-up (z19
+        # detail, primary) plus the wider context (secondary). Each tile is
+        # annotated only with its own detections — cross-zoom pixel coords don't
+        # transfer — and the winner is highlighted on whichever tile it came from.
+        def _render_tile(tile_path, tile_zoom, out_path):
+            if not tile_path:
+                return None
+            dets = [e for e in enriched if e.get('tile_path') == tile_path]
+            win = winner if (winner and winner.get('tile_path') == tile_path) else None
+            render_annotated_image(
+                raw_image_path=tile_path,
+                output_path=out_path,
+                footprint=footprint,
+                centroid_lat=centroid_lat,
+                centroid_lon=centroid_lon,
+                enriched_detections=dets,
+                winner=win,
+                zoom=tile_zoom,
+            )
+            blob = f"results/{job_id}/{os.path.basename(out_path)}"
+            upload_file(out_path, blob)
+            return make_signed_url(blob)
+
+        result_url = _render_tile(original_local, MAPBOX_ZOOM, annotated_local)
+        result_url_wide = _render_tile(wide_local, MAPBOX_ZOOM_WIDE, annotated_wide_local)
+
+        # Construction → needs_review: active construction means the Mapbox tile may
+        # predate the current building state, so the cooling-tower call isn't reliable.
+        # Route to manual review (operator verifies against fresher sources). The
+        # underlying per-VLM verdicts/reasoning are preserved in consensus_dict.
+        construction = consensus_dict.get('construction', False)
+        effective_verdict = consensus_dict['verdict']
+        construction_review = construction and effective_verdict != 'needs_review'
+        if construction_review:
+            log.info(
+                f"Row {i+1}/{total}: construction flagged (VLM verdict "
+                f"'{effective_verdict}') → routing to needs_review for manual lookup"
+            )
+            effective_verdict = 'needs_review'
 
         row_state = {
-            'verdict': consensus_dict['verdict'],
+            'verdict': effective_verdict,
             'detection_count': detection_count,
             'rooftop_path': rooftop_path,
-            'construction': consensus_dict.get('construction', False),
+            'construction': construction,
             'winner_is_boundary': winner_is_boundary,
+            'construction_review': construction_review,
         }
         notes = _build_notes(row_state)
 
         web_results.append(_build_web_entry(
             full_address=full_address,
-            verdict=consensus_dict['verdict'],
+            verdict=effective_verdict,
             consensus_dict=consensus_dict,
             detection_count=detection_count,
-            construction=consensus_dict.get('construction', False),
+            construction=construction,
             notes=notes,
             original_url=original_url,
             result_url=result_url,
+            result_url_wide=result_url_wide,
         ))
         csv_rows.append(_build_csv_row(
             full_address=full_address,
-            verdict=consensus_dict['verdict'],
+            verdict=effective_verdict,
             consensus_dict=consensus_dict,
             detection_count=detection_count,
-            construction=consensus_dict.get('construction', False),
+            construction=construction,
             notes=notes,
             original_url=original_url,
             result_url=result_url,
         ))
 
-        for p in (original_local, annotated_local):
+        for p in (original_local, wide_local, annotated_local, annotated_wide_local):
             try:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     os.remove(p)
             except Exception as e:
                 log.warning(f"Could not clean up temp file {p}: {e}")

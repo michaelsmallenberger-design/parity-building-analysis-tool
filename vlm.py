@@ -42,9 +42,13 @@ _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
 
-_DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
+_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 _DEFAULT_GROK_MODEL = "grok-4.3"
 _GROK_BASE_URL = "https://api.x.ai/v1"
+# Reasoning depth. Grok 4.3 defaults to "low" if unset; Gemini 3.x to "medium".
+# Default both to "high" here — accuracy is prioritized over cost/latency on this tool.
+_GROK_REASONING_EFFORT = os.environ.get("GROK_REASONING_EFFORT", "high")
+_GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "high")
 _DEFAULT_TIMEOUT_S = 120
 _DEFAULT_CONSENSUS_THRESHOLD = 0.7
 
@@ -57,6 +61,8 @@ Your task is to verify whether a candidate detection by a YOLO computer-vision m
 
 A cooling tower in this domain is a rooftop heat-rejection unit, typically rectangular or cylindrical, with louvered air intakes on the sides, fan housings or fan stacks on top, and visible piping or condenser coils. Older or open-design cooling towers may instead appear as a square or rectangular enclosure with a visible centrifugal or radial fan blade pattern inside, viewed from directly above. They sit on the rooftops of commercial, multifamily, or institutional buildings.
 
+GROUND-MOUNTED COOLING EQUIPMENT — a first-line consideration, not an edge case: outside dense urban cores (most of the U.S. except cities like New York, Chicago, Boston, and San Francisco), cooling equipment serving a building is frequently ground-mounted rather than on the roof — on a concrete pad next to the building, inside a fenced enclosure, or in a mechanical yard adjacent to the structure. A ground-mounted cooling tower shows the SAME visual signatures (louvers, fan stacks, fan-blade pattern from above, coil banks) as a rooftop unit, just at ground level beside the building. The candidate you are verifying may be a ground-mounted unit, not only a rooftop one — treat ground-mounted cooling equipment serving the target building the same as a rooftop cooling tower for the verdict.
+
 They are NOT:
 - Rooftop air handler units (AHUs) — flat boxes without prominent fan stacks
 - Solar panels (rectangular, dark, flush with the roof)
@@ -65,9 +71,17 @@ They are NOT:
 - Elevator penthouses or stairwell bulkheads (windowless rooms on the roof)
 - Roof-mounted satellite dishes, antennas, or signage
 
-You will receive a tight crop of the candidate plus a wider satellite tile that shows the entire target building and its neighbors. Use the tight crop for fine detail of the candidate object. Use the wider tile to confirm whether the candidate sits on the TARGET rooftop or on an adjacent building.
+WATER TANK / WATER TOWER vs COOLING TOWER — the most common error in this domain:
 
-Return a structured JSON response with four fields: verdict, confidence, reasoning, construction. Be calibrated and honest about uncertainty."""
+A NYC-style rooftop wooden water tank, viewed from directly above, appears as a DARK CIRCLE inside a square wooden cradle. The dark circle is the open or covered top of the tank — it is NOT a fan blade pattern, NOT a cooling tower, and NOT mechanical equipment. Stainless-steel water tanks appear as a bright domed or conical shape, also NOT a cooling tower.
+
+A cooling tower's circular top, when present, shows DISCRETE FAN BLADES that you can count (typically 4-8), a hub at the center, and protective metal grating. A water tank top shows none of these — just a uniform dark or reflective surface.
+
+If you cannot count individual fan blades and identify a central hub, it is not a cooling tower fan. Default to "not_detected" / "no_cooling_tower" rather than guessing on a borderline circular feature.
+
+You will receive a tight crop of the candidate plus a wider satellite tile that shows the entire target building and its neighbors, and you may also receive a second tile of the same target at a different zoom level for added context. Use the tight crop for fine detail of the candidate object. Use the wider/second tiles to confirm whether the candidate sits on (or, if ground-mounted, immediately beside and serving) the TARGET building rather than an adjacent one.
+
+Return a structured JSON response with five fields: verdict, confidence, reasoning, construction, is_house. Be calibrated and honest about uncertainty."""
 
 _USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -77,31 +91,35 @@ OSM tags: {osm_tags}
 Geocoded centroid is inside building footprint: {contains_point}
 
 === DETECTION CONTEXT ===
-The full satellite tile is 768x768 pixels at zoom 19 from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile.
-The TARGET building is outlined by a RED polygon drawn on Image B, centered around pixel (384, 384). Use the red outline as the authoritative boundary of the target building. Anything inside the red polygon is on the TARGET rooftop. Anything outside the red polygon is on a NEIGHBOR rooftop — cooling towers on neighbor rooftops should be classified as "neighbor_only", not "confirmed".
-The YOLO model proposed a candidate at pixel bounding box: ({x1}, {y1}) to ({x2}, {y2}).
+The full satellite tile is 768x768 pixels at zoom {tile_zoom} from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile.
+
+The red polygon on Image B is the OSM building footprint at the geocoded address. Geocoding is not always perfect — sometimes the polygon outlines a neighboring building rather than the actual target. The YOLO model proposes candidates ANYWHERE in the tile, not only inside the red polygon. The current candidate at pixel bbox ({x1}, {y1}) to ({x2}, {y2}) is classified geometrically as: {detection_location} (inside / boundary / outside relative to the red polygon).
+
+If the candidate is OUTSIDE the red polygon, do NOT auto-reject. Use the satellite view to judge: does the building under the candidate plausibly match the address ({address})? If yes, treat it as on-target and proceed to verdict. If clearly a different building (a school across the street, a different apartment block, a building with a noticeably different footprint shape than the addressed one), classify as "neighbor_only".
 
 === IMAGES YOU WILL RECEIVE ===
 - Image A: a tight crop of the candidate detection with ~50px padding (clipped to tile edges). Use this for fine detail of the candidate object itself.
-- Image B: the full 768x768 satellite tile showing the entire target building and its neighbors. Use this to confirm whether the candidate sits on the TARGET rooftop or a neighbor's.{reference_block}
+- Image B: the full 768x768 satellite tile (zoom {tile_zoom}) showing the entire target building and its neighbors. Use this to confirm whether the candidate sits on the TARGET rooftop or a neighbor's.{context_block}{reference_block}
 
 === YOUR TASK ===
 Pick the single verdict that best describes the candidate:
 
-- "confirmed"      — clearly a cooling tower AND clearly on the target rooftop. Use confidence > 0.8.
-- "likely"         — probably a cooling tower with minor ambiguity (partial occlusion, marginal image quality, similar but not certain). Use confidence 0.5-0.8.
-- "neighbor_only"  — appears to be a cooling tower but located on an adjacent building, not the target rooftop.
+- "confirmed"      — clearly a cooling tower AND clearly serving the target building (on the target rooftop, OR ground-mounted on a pad / in an enclosure / in a mechanical yard immediately beside the target). Use confidence > 0.8.
+- "likely"         — probably a cooling tower (rooftop or ground-mounted) serving the target with minor ambiguity (partial occlusion, marginal image quality, similar but not certain). Use confidence 0.5-0.8.
+- "neighbor_only"  — appears to be a cooling tower but located on or beside an adjacent building, not serving the target.
 - "not_detected"   — the candidate is not a cooling tower at all (false positive: AHU, skylight, water tank, shadow artifact, generic mechanical box).
 - "needs_review"   — you cannot decide with reasonable confidence. The reasoning field MUST explain what is preventing a decision.
 
 Set "construction": true ONLY if you can see active construction — cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone on the roof or adjacent area. Do NOT set true just because the building looks modern, recently built, or well-maintained. Completed buildings = false.
+
+Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
 Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest")."""
 
 _REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from the same 768x768 zoom-19 Mapbox satellite imagery you are analyzing now.
+After Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the candidate tile may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -126,11 +144,19 @@ They are NOT:
 - Elevator penthouses or stairwell bulkheads (windowless rooms on the roof)
 - Roof-mounted satellite dishes, antennas, or signage
 
+WATER TANK / WATER TOWER vs COOLING TOWER — the most common error in this domain:
+
+A NYC-style rooftop wooden water tank, viewed from directly above, appears as a DARK CIRCLE inside a square wooden cradle. The dark circle is the open or covered top of the tank — it is NOT a fan blade pattern, NOT a cooling tower, and NOT mechanical equipment. Stainless-steel water tanks appear as a bright domed or conical shape, also NOT a cooling tower.
+
+A cooling tower's circular top, when present, shows DISCRETE FAN BLADES that you can count (typically 4-8), a hub at the center, and protective metal grating. A water tank top shows none of these — just a uniform dark or reflective surface.
+
+If you cannot count individual fan blades and identify a central hub, it is not a cooling tower fan. Default to "not_detected" / "no_cooling_tower" rather than guessing on a borderline circular feature.
+
 You will receive ONE satellite tile that shows the target building and its neighbors. The target building is the structure centered in the tile — its OSM footprint is described in the user prompt. Only equipment serving the target building should influence your cooling-tower verdict — this means equipment on the target building's rooftop, OR ground-mounted cooling equipment immediately adjacent to the target building per the user prompt. Anything on a neighboring building's rooftop should be ignored for the cooling-tower verdict.
 
 You also need to flag visible active construction (cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone) on the target rooftop or the surrounding area — this is a separate signal the sales team uses to prioritize follow-up, distinct from whether a cooling tower is present.
 
-Return a structured JSON response with four fields: verdict, confidence, reasoning, construction. Be calibrated and honest about uncertainty."""
+Return a structured JSON response with five fields: verdict, confidence, reasoning, construction, is_house. Be calibrated and honest about uncertainty."""
 
 _ROOFTOP_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -140,12 +166,12 @@ OSM tags: {osm_tags}
 Geocoded centroid is inside building footprint: {contains_point}
 
 === DETECTION CONTEXT ===
-The satellite tile is 768x768 pixels at zoom 19 from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile. The TARGET building is the structure centered around pixel (384, 384) — its footprint corresponds to the OSM building described above. Equipment on a neighboring building's rooftop should be ignored. However, ground-mounted cooling equipment immediately adjacent to the target building — on a concrete pad, in a fenced enclosure, or in a mechanical yard within roughly 30 feet of the target building — counts as serving the target and should be reported.
+The satellite tile is 768x768 pixels at zoom {tile_zoom} from Mapbox, centered on the OSM building centroid above. Pixel (0,0) is the top-left of the tile. The TARGET building is the structure centered around pixel (384, 384) — its footprint corresponds to the OSM building described above. Equipment on a neighboring building's rooftop should be ignored. However, ground-mounted cooling equipment immediately adjacent to the target building — on a concrete pad, in a fenced enclosure, or in a mechanical yard within roughly 30 feet of the target building — counts as serving the target and should be reported.
 
 An automated YOLO computer-vision pass already ran on this tile. No cooling-tower detections were found. You are the last line of defense — scan the target building's rooftop and its immediate surroundings, and decide whether a cooling tower (rooftop or ground-mounted) is actually present.
 
 === IMAGES YOU WILL RECEIVE ===
-- The full 768x768 satellite tile showing the target building (centered) and its neighbors.{reference_block}
+- The full 768x768 satellite tile (zoom {tile_zoom}) showing the target building (centered) and its neighbors.{context_block}{reference_block}
 
 === YOUR TASK ===
 Pick the single verdict that best describes whether a cooling tower is on the target rooftop:
@@ -159,12 +185,14 @@ If your verdict is "cooling_tower_present" or "cooling_tower_possible", your rea
 
 Set "construction": true ONLY if you can see active construction — cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone on the target rooftop or adjacent area. Do NOT set true just because the building looks modern, recently built, or well-maintained. Completed buildings = false.
 
+Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
+
 Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
 
 _ROOFTOP_REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from the same 768x768 zoom-19 Mapbox satellite imagery you are analyzing now.
+After the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the tile you are scanning may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -180,6 +208,7 @@ class _VerificationResponse(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=1)
     construction: bool
+    is_house: bool
 
 
 class _RooftopResponse(BaseModel):
@@ -187,6 +216,7 @@ class _RooftopResponse(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=1)
     construction: bool
+    is_house: bool
 
 
 def _truncate(s, n: int = 120) -> str:
@@ -201,6 +231,7 @@ def _needs_review(reasoning: str) -> dict:
         "confidence": 0.0,
         "reasoning": reasoning,
         "construction": False,
+        "is_house": False,
     }
 
 
@@ -285,6 +316,40 @@ def _read_full_tile_bytes(image_path: str) -> bytes:
         return _encode_jpeg(img)
 
 
+def _maybe_read_context_tile(context_image_path):
+    """Read an optional cross-zoom context tile. Returns JPEG bytes or None.
+
+    The context image is supplementary; if it's missing or unreadable we skip
+    it silently rather than failing the whole verification.
+    """
+    if not context_image_path:
+        return None
+    try:
+        return _read_full_tile_bytes(context_image_path)
+    except (UnidentifiedImageError, OSError):
+        return None
+
+
+def _context_block(tile_zoom: int, context_zoom) -> str:
+    """Build the 'Image C' context-image clause for the user prompt.
+
+    Returns '' when no context image is present. Phrasing depends on whether
+    the context tile is wider (good for ground-mounted equipment) or closer
+    (good for fine rooftop detail) than the primary tile.
+    """
+    if context_zoom is None:
+        return ""
+    if context_zoom < tile_zoom:
+        desc = (
+            "a WIDER view — use it to spot ground-mounted cooling equipment "
+            "(on a concrete pad, in a fenced enclosure, or a mechanical yard) "
+            "immediately beside the target building, not only rooftop units"
+        )
+    else:
+        desc = "a CLOSER view — use it for finer detail of the equipment and the target rooftop"
+    return f"\n- Image C: the same target building at zoom {context_zoom} ({desc})."
+
+
 def _build_prompt(
     building_context: dict,
     detection_bbox: tuple[int, int, int, int],
@@ -310,6 +375,11 @@ def _build_prompt(
     contains = fm.get("contains_point")
     contains_s = "unknown" if contains is None else str(bool(contains)).lower()
 
+    detection_location = building_context.get("detection_location") or "unknown"
+
+    tile_zoom = building_context.get("tile_zoom", 19)
+    context_zoom = building_context.get("context_zoom")
+
     x1, y1, x2, y2 = detection_bbox
 
     reference_block = ""
@@ -325,6 +395,9 @@ def _build_prompt(
         osm_id=osm_id_s,
         osm_tags=tags_s,
         contains_point=contains_s,
+        detection_location=detection_location,
+        tile_zoom=tile_zoom,
+        context_block=_context_block(tile_zoom, context_zoom),
         x1=x1,
         y1=y1,
         x2=x2,
@@ -357,6 +430,9 @@ def _build_rooftop_prompt(
     contains = fm.get("contains_point")
     contains_s = "unknown" if contains is None else str(bool(contains)).lower()
 
+    tile_zoom = building_context.get("tile_zoom", 19)
+    context_zoom = building_context.get("context_zoom")
+
     reference_block = ""
     if n_pos > 0:
         reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
@@ -370,6 +446,8 @@ def _build_rooftop_prompt(
         osm_id=osm_id_s,
         osm_tags=tags_s,
         contains_point=contains_s,
+        tile_zoom=tile_zoom,
+        context_block=_context_block(tile_zoom, context_zoom),
         reference_block=reference_block,
     )
 
@@ -380,6 +458,7 @@ def _result_from_validated(parsed: _VerificationResponse) -> dict:
         "confidence": parsed.confidence,
         "reasoning": parsed.reasoning,
         "construction": parsed.construction,
+        "is_house": parsed.is_house,
     }
 
 
@@ -408,6 +487,7 @@ def _verify_gemini(
     detection_bbox: tuple[int, int, int, int],
     building_context: dict,
     timeout_s: int,
+    context_image_path: str = None,
 ) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -421,6 +501,8 @@ def _verify_gemini(
         return _needs_review(
             f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
         )
+
+    context_bytes = _maybe_read_context_tile(context_image_path)
 
     pos_imgs, neg_imgs = _load_reference_images()
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
@@ -436,12 +518,16 @@ def _verify_gemini(
     contents.append(types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"))
     contents.append("--- Image B (full satellite tile) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
+    if context_bytes is not None:
+        contents.append(f"--- Image C (same target, zoom {building_context.get('context_zoom')}) ---")
+        contents.append(types.Part.from_bytes(data=context_bytes, mime_type="image/jpeg"))
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
         system_instruction=_SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
+        thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
         http_options=types.HttpOptions(timeout=timeout_s * 1000),
     )
 
@@ -505,6 +591,7 @@ def _verify_gemini_rooftop(
     image_path: str,
     building_context: dict,
     timeout_s: int,
+    context_image_path: str = None,
 ) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -518,6 +605,8 @@ def _verify_gemini_rooftop(
             f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
         )
 
+    context_bytes = _maybe_read_context_tile(context_image_path)
+
     pos_imgs, neg_imgs = _load_reference_images()
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
@@ -530,12 +619,16 @@ def _verify_gemini_rooftop(
         contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
     contents.append("--- Satellite tile (target building centered) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
+    if context_bytes is not None:
+        contents.append(f"--- Context tile (same target, zoom {building_context.get('context_zoom')}) ---")
+        contents.append(types.Part.from_bytes(data=context_bytes, mime_type="image/jpeg"))
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
         system_instruction=_ROOFTOP_SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=_RooftopResponse,
+        thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
         http_options=types.HttpOptions(timeout=timeout_s * 1000),
     )
 
@@ -600,6 +693,7 @@ def _verify_grok(
     detection_bbox: tuple[int, int, int, int],
     building_context: dict,
     timeout_s: int,
+    context_image_path: str = None,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -613,6 +707,8 @@ def _verify_grok(
         return _needs_review(
             f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
         )
+
+    context_bytes = _maybe_read_context_tile(context_image_path)
 
     pos_imgs, neg_imgs = _load_reference_images()
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
@@ -628,6 +724,9 @@ def _verify_grok(
     content_parts.append(_to_image_url_part(crop_bytes))
     content_parts.append({"type": "text", "text": "--- Image B (full satellite tile) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
+    if context_bytes is not None:
+        content_parts.append({"type": "text", "text": f"--- Image C (same target, zoom {building_context.get('context_zoom')}) ---"})
+        content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -645,6 +744,7 @@ def _verify_grok(
                 model=model_id,
                 messages=messages,
                 response_format={"type": "json_object"},
+                reasoning_effort=_GROK_REASONING_EFFORT,
                 timeout=timeout_s,
             )
         except openai.APITimeoutError as e:
@@ -717,6 +817,7 @@ def _verify_grok_rooftop(
     image_path: str,
     building_context: dict,
     timeout_s: int,
+    context_image_path: str = None,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -730,6 +831,8 @@ def _verify_grok_rooftop(
             f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
         )
 
+    context_bytes = _maybe_read_context_tile(context_image_path)
+
     pos_imgs, neg_imgs = _load_reference_images()
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
@@ -742,6 +845,9 @@ def _verify_grok_rooftop(
         content_parts.append(_to_image_url_part(img_bytes))
     content_parts.append({"type": "text", "text": "--- Satellite tile (target building centered) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
+    if context_bytes is not None:
+        content_parts.append({"type": "text", "text": f"--- Context tile (same target, zoom {building_context.get('context_zoom')}) ---"})
+        content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
         {"role": "system", "content": _ROOFTOP_SYSTEM_PROMPT},
@@ -759,6 +865,7 @@ def _verify_grok_rooftop(
                 model=model_id,
                 messages=messages,
                 response_format={"type": "json_object"},
+                reasoning_effort=_GROK_REASONING_EFFORT,
                 timeout=timeout_s,
             )
         except openai.APITimeoutError as e:
@@ -860,6 +967,9 @@ def _combine_verdicts(
         final_construction = bool(
             gemini_result["construction"] and grok_result["construction"]
         )
+        final_is_house = bool(
+            gemini_result["is_house"] and grok_result["is_house"]
+        )
     else:
         final_verdict = "needs_review"
         final_confidence = 0.0
@@ -884,12 +994,14 @@ def _combine_verdicts(
             f"Grok detail: {grok_result['reasoning']}"
         )
         final_construction = False
+        final_is_house = False
 
     return {
         "verdict": final_verdict,
         "confidence": final_confidence,
         "reasoning": final_reasoning,
         "construction": final_construction,
+        "is_house": final_is_house,
         "gemini": gemini_result,
         "grok": grok_result,
         "agreement": agree and confident,
@@ -900,6 +1012,7 @@ def verify_detection(
     image_path: str,
     detection_bbox: tuple[int, int, int, int],
     building_context: dict,
+    context_image_path: str = None,
 ) -> dict:
     """Verify a YOLO cooling-tower detection using parallel Gemini + Grok consensus.
 
@@ -1002,10 +1115,12 @@ def verify_detection(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
         gemini_future = ex.submit(
-            _verify_gemini, image_path, detection_bbox, building_context, timeout_s
+            _verify_gemini, image_path, detection_bbox, building_context, timeout_s,
+            context_image_path,
         )
         grok_future = ex.submit(
-            _verify_grok, image_path, detection_bbox, building_context, timeout_s
+            _verify_grok, image_path, detection_bbox, building_context, timeout_s,
+            context_image_path,
         )
 
         try:
@@ -1028,6 +1143,7 @@ def verify_detection(
 def verify_rooftop(
     image_path: str,
     building_context: dict,
+    context_image_path: str = None,
 ) -> dict:
     """Scan a target rooftop for cooling towers when YOLO found nothing.
 
@@ -1095,10 +1211,12 @@ def verify_rooftop(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
         gemini_future = ex.submit(
-            _verify_gemini_rooftop, image_path, building_context, timeout_s
+            _verify_gemini_rooftop, image_path, building_context, timeout_s,
+            context_image_path,
         )
         grok_future = ex.submit(
-            _verify_grok_rooftop, image_path, building_context, timeout_s
+            _verify_grok_rooftop, image_path, building_context, timeout_s,
+            context_image_path,
         )
 
         try:
@@ -1116,3 +1234,4 @@ def verify_rooftop(
             )
 
     return _combine_verdicts(gemini_result, grok_result, threshold)
+

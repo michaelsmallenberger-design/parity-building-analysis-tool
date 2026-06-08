@@ -56,9 +56,9 @@ _VALID_VERDICTS = {
     "confirmed", "likely", "neighbor_only", "needs_review", "not_detected",
     "cooling_tower_present", "cooling_tower_possible", "no_cooling_tower",
 }
-_SUB_MODEL_KEYS = {"verdict", "confidence", "reasoning", "construction"}
+_SUB_MODEL_KEYS = {"verdict", "confidence", "reasoning", "construction", "is_house"}
 _TOP_LEVEL_KEYS = {
-    "verdict", "confidence", "reasoning", "construction",
+    "verdict", "confidence", "reasoning", "construction", "is_house",
     "gemini", "grok", "agreement",
 }
 _CONSENSUS_NEEDS_REVIEW_MARKERS = ("disagreed", "threshold", "timeout")
@@ -163,7 +163,7 @@ def _validate_sub_dict(name: str, sub) -> list[tuple[bool, str]]:
     sub_keys = set(sub.keys())
     checks.append((
         sub_keys == _SUB_MODEL_KEYS,
-        f"{name} sub-dict has exactly four keys (got: {sorted(sub_keys)})",
+        f"{name} sub-dict has exactly five keys (got: {sorted(sub_keys)})",
     ))
     v = sub.get("verdict")
     checks.append((v in _VALID_VERDICTS, f"{name}.verdict is a valid literal (got: {v!r})"))
@@ -193,7 +193,7 @@ def _validate_structure(resp) -> tuple[bool, list[tuple[bool, str]]]:
     keys = set(resp.keys())
     checks.append((
         keys == _TOP_LEVEL_KEYS,
-        f"response has exactly seven keys (got: {sorted(keys)})",
+        f"response has exactly eight keys (got: {sorted(keys)})",
     ))
 
     verdict = resp.get("verdict")

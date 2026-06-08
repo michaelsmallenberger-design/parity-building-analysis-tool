@@ -468,6 +468,11 @@ def filter_detections(
     """
     Split classified detections into kept (on-building) and rejected (off-building).
 
+    With YOLO_KEEP_OUTSIDE=true (the default), all detections are kept so the
+    downstream VLM can use spatial reasoning + satellite imagery to decide whether
+    an outside candidate is actually on the target (geocoded polygon was wrong).
+    The 'location' label survives on each detection dict for the VLM prompt.
+
     Args:
         classified: Output from classify_detections()
         keep_boundary: Whether to keep detections on the boundary (default True)
@@ -477,6 +482,7 @@ def filter_detections(
     """
     kept = []
     rejected = []
+    keep_outside = os.getenv("YOLO_KEEP_OUTSIDE", "true").lower() == "true"
 
     for det in classified:
         loc = det['location']
@@ -484,6 +490,13 @@ def filter_detections(
             kept.append(det)
         elif loc == 'boundary' and keep_boundary:
             kept.append(det)
+        elif keep_outside:
+            kept.append(det)
+            log.info(
+                f"Kept OUTSIDE detection for VLM judgment at "
+                f"({det['det_latlon'][0]:.6f}, {det['det_latlon'][1]:.6f}) "
+                f"(distance: {det['distance_to_building']:.6f}°)"
+            )
         else:
             rejected.append(det)
             log.info(
@@ -496,6 +509,123 @@ def filter_detections(
              f"out of {len(classified)} total detections")
 
     return kept, rejected
+
+
+def _iou(box_a: Tuple[float, float, float, float], box_b: Tuple[float, float, float, float]) -> float:
+    """Standard axis-aligned IoU. Boxes are (x1, y1, x2, y2)."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def ensemble_dedupe_detections(
+    detections: List[Dict[str, Any]],
+    iou_threshold: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Greedy NMS-style dedupe across ensemble model outputs.
+
+    Highest-confidence box wins. Lower-conf boxes with IoU >= threshold are
+    treated as the same detection and recorded into the winner's source_models
+    tuple (so the audit can see which ensemble models found each candidate).
+
+    Inputs MUST carry 'source_model' (str) and 'confidence' (float).
+    Returns: deduped list with 'source_models' (tuple[str, ...]) added per dict.
+    Original 'source_model' is preserved as the highest-confidence finder.
+    """
+    if not detections:
+        return []
+    sorted_dets = sorted(detections, key=lambda d: -d.get('confidence', 0.0))
+    kept: List[Dict[str, Any]] = []
+    for det in sorted_dets:
+        merged_into = None
+        for k in kept:
+            if _iou(det['bbox'], k['bbox']) >= iou_threshold:
+                merged_into = k
+                break
+        if merged_into is not None:
+            sources = set(merged_into.get('source_models', ()))
+            sources.add(det.get('source_model', '?'))
+            merged_into['source_models'] = tuple(sorted(sources))
+        else:
+            new = dict(det)
+            new['source_models'] = (det.get('source_model', '?'),)
+            kept.append(new)
+    return kept
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters between two lat/lon points."""
+    R = 6371000.0  # Earth radius, meters
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def geo_dedupe_detections(
+    detections: List[Dict[str, Any]],
+    dist_threshold_m: float = 10.0,
+) -> List[Dict[str, Any]]:
+    """Dedupe detections across zoom levels in geographic space.
+
+    ``ensemble_dedupe_detections`` uses pixel IoU, which is meaningless across
+    tiles captured at different zoom levels. This merges detections whose
+    ``det_latlon`` centers are within ``dist_threshold_m`` meters. The
+    representative is chosen by (tile_zoom DESC, confidence DESC) so the
+    more-detailed tile's box wins for crop quality; merged finders' provenance
+    is preserved.
+
+    Inputs MUST carry ``det_latlon`` ((lat, lon)), ``confidence``, and
+    ``tile_zoom``. May carry ``source_model`` or ``source_models``. Returns a
+    deduped list with merged ``source_models`` (tuple) and ``source_zooms``
+    (tuple) added per dict.
+    """
+    if not detections:
+        return []
+
+    def _zoom(d):
+        return d.get('tile_zoom', 0) or 0
+
+    def _models(d):
+        existing = d.get('source_models')
+        if existing:
+            return set(existing)
+        return {d.get('source_model', '?')}
+
+    sorted_dets = sorted(detections, key=lambda d: (-_zoom(d), -d.get('confidence', 0.0)))
+    kept: List[Dict[str, Any]] = []
+    for det in sorted_dets:
+        dl = det.get('det_latlon')
+        merged_into = None
+        if dl is not None:
+            for k in kept:
+                kl = k.get('det_latlon')
+                if kl is not None and _haversine_m(dl[0], dl[1], kl[0], kl[1]) <= dist_threshold_m:
+                    merged_into = k
+                    break
+        if merged_into is not None:
+            merged_into['source_models'] = tuple(sorted(
+                set(merged_into['source_models']) | _models(det)
+            ))
+            merged_into['source_zooms'] = tuple(sorted(
+                set(merged_into['source_zooms']) | {_zoom(det)}
+            ))
+        else:
+            new = dict(det)
+            new['source_models'] = tuple(sorted(_models(det)))
+            new['source_zooms'] = (_zoom(det),)
+            kept.append(new)
+    return kept
 
 
 def extract_detections_from_yolo(yolo_result) -> List[Dict[str, Any]]:
@@ -537,23 +667,23 @@ def extract_detections_from_yolo(yolo_result) -> List[Dict[str, Any]]:
 # -------------------------------------------------------------------------
 
 def footprint_filter_pipeline(
-    yolo_result,
-    center_lat: float, center_lon: float,
+    yolo_result=None,
+    center_lat: float = None, center_lon: float = None,
     zoom: int = 19,
     img_width: int = 768, img_height: int = 768,
     search_radius: int = None,
+    detections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Full footprint filtering pipeline: fetch building → classify detections → filter.
 
-    This is the main entry point for the pipeline. Call this after YOLO inference.
-
-    Args:
-        yolo_result: Ultralytics YOLO result object
-        center_lat, center_lon: Satellite image center
-        zoom: Mapbox zoom level
-        img_width, img_height: Image dimensions
-        search_radius: Building search radius in meters
+    Two input modes (use one or the other, not both):
+      - yolo_result: legacy single-model path. The function extracts detections
+        from the YOLO result object.
+      - detections: pre-extracted list of detection dicts (ensemble path). Each
+        dict must carry 'bbox', 'confidence', 'class' at minimum. Use this when
+        the caller has already merged multiple YOLO outputs via
+        ensemble_dedupe_detections.
 
     Returns:
         Dict with:
@@ -563,8 +693,11 @@ def footprint_filter_pipeline(
             - 'all_classified': all detections with location labels
             - 'footprint_found': bool
     """
-    # Step 1: Extract detections from YOLO
-    detections = extract_detections_from_yolo(yolo_result)
+    if detections is None and yolo_result is None:
+        raise ValueError("footprint_filter_pipeline requires either yolo_result or detections")
+    if detections is None:
+        # Step 1: Extract detections from YOLO
+        detections = extract_detections_from_yolo(yolo_result)
 
     if not detections:
         log.info("No YOLO detections to filter")

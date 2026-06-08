@@ -13,7 +13,7 @@ config.py
 service.yaml
 
 # Ignore trained model weights (too large for git, stored on Google Drive)
-models/rooftop_model.pt
+models/*.pt
 
 # Secrets and env files
 .env
@@ -42,6 +42,9 @@ download_training_images.py
 # Scratch / one-off validation files (Phase 3, throwaway)
 scratch_*.py
 scratch_*.csv
+scratch_*.html
+scratch_*.md
+scratch_*.log
 scratch_results.json
 scratch_*/
 smoke_*.py
