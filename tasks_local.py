@@ -236,6 +236,9 @@ def _build_web_entry(
         gemini_confidence = gemini.get('confidence')
         grok_verdict = grok.get('verdict', '')
         grok_confidence = grok.get('confidence')
+        is_house = bool(consensus_dict.get('is_house'))
+        gemini_is_house = gemini.get('is_house')
+        grok_is_house = grok.get('is_house')
     else:
         confidence_score = None
         reasoning = ''
@@ -244,6 +247,9 @@ def _build_web_entry(
         gemini_confidence = None
         grok_verdict = ''
         grok_confidence = None
+        is_house = None
+        gemini_is_house = None
+        grok_is_house = None
 
     entry = {
         "address": full_address,
@@ -260,6 +266,9 @@ def _build_web_entry(
         "gemini_confidence": gemini_confidence,
         "grok_verdict": grok_verdict,
         "grok_confidence": grok_confidence,
+        "is_house": is_house,
+        "gemini_is_house": gemini_is_house,
+        "grok_is_house": grok_is_house,
         "notes": notes,
     }
     if error:
