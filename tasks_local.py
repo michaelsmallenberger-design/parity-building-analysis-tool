@@ -46,6 +46,11 @@ _NEGATIVE_VERDICTS = frozenset({
 # the VLM house-check backstops the 200-720 band.
 MIN_COMMERCIAL_FOOTPRINT_SQM = 200
 
+# Area-gate master switch. Default ON. Set AREA_GATE_ENABLED=0 to disable the
+# gate entirely so EVERY non-registry address gets VLM eyes (registry-only
+# exclusion) -- safer recall at higher VLM cost.
+AREA_GATE_ENABLED = os.environ.get("AREA_GATE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
 
 def _detect_on_tile(
     tile_path: str,
@@ -631,7 +636,7 @@ def process_address_list(
         # ambiguous_footprint should still get a registry shot is flagged for
         # review (a BIN match off a wrong footprint is itself unreliable).
         # ====================================================================
-        if not footprint.get('contains_point'):
+        if AREA_GATE_ENABLED and not footprint.get('contains_point'):
             log.info(f"Row {i+1}/{total}: Footprint is a nearest-building fallback "
                      f"(contains_point=False); routing to review as ambiguous_footprint")
             notes = _build_notes({'verdict': 'ambiguous_footprint'})
@@ -649,8 +654,8 @@ def process_address_list(
                 write_partial_result({"web_results": web_results})
             continue
 
-        footprint_area = _footprint_area_m2(footprint)
-        if footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
+        footprint_area = _footprint_area_m2(footprint) if AREA_GATE_ENABLED else 0.0
+        if AREA_GATE_ENABLED and footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
             log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
                      f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
             notes = _build_notes({'verdict': 'likely_residential'})
