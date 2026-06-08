@@ -15,12 +15,18 @@ MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
 # YOLO model path (can override with env)
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("models", "rooftop_model.pt"))
 
+# Ensemble paths: comma-separated. Falls back to single MODEL_PATH when unset.
+# Each model produces detections, filtered to cooling-tower class names only, then
+# IoU-deduped across models in geometry.ensemble_dedupe_detections.
+MODEL_PATHS = os.getenv("MODEL_PATHS", MODEL_PATH)
+
 # YOLO inference confidence threshold (0.0-1.0). Lower = more detections, more false positives.
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.18"))
 
 # Mapbox static image settings
 MAPBOX_STYLE = "mapbox/satellite-v9"  # satellite basemap
-MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "19"))  # 18–20 are usually good for roofs; 19 is optimal
+MAPBOX_ZOOM = int(os.getenv("MAPBOX_ZOOM", "19"))  # detail tile; 18–20 good for roofs, 19 optimal
+MAPBOX_ZOOM_WIDE = int(os.getenv("MAPBOX_ZOOM_WIDE", "18"))  # wide tile for ground-mounted CTs / parcel context
 MAPBOX_SIZE = os.getenv("MAPBOX_SIZE", "768x768")   # WxH; <= 1280x1280
 MAPBOX_HIGH_DPI = os.getenv("MAPBOX_DPI", "false").lower() == "true"  # @2x images
 # Optional bottom crop in pixels to remove API watermarks/logos; set via env
@@ -254,14 +260,17 @@ def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
 # -------------------------------------------------------------------------
 # Satellite image fetch (Mapbox Static Images)
 # -------------------------------------------------------------------------
-def get_satellite_image_mapbox(lat: float, lon: float, out_path: str) -> bool:
+def get_satellite_image_mapbox(lat: float, lon: float, out_path: str, zoom: int = None) -> bool:
     """
     Downloads a satellite image centered at (lat, lon) using Mapbox Static Images API.
     Saves to out_path (JPEG/PNG depending on API response content-type).
+    zoom defaults to MAPBOX_ZOOM (the detail tile); pass MAPBOX_ZOOM_WIDE for the
+    wider parcel/ground-equipment tile.
     Returns True on success, False otherwise.
     """
     try:
-        coords = f"{lon:.7f},{lat:.7f},{MAPBOX_ZOOM}"
+        z = MAPBOX_ZOOM if zoom is None else zoom
+        coords = f"{lon:.7f},{lat:.7f},{z}"
         size = MAPBOX_SIZE
         dpi_suffix = "@2x" if MAPBOX_HIGH_DPI else ""
         url = (
@@ -316,3 +325,37 @@ def _get_model():
         )
     log.info("Loading YOLO model from %s", MODEL_PATH)
     return YOLO(MODEL_PATH)
+
+
+@lru_cache(maxsize=1)
+def _get_models():
+    """Load all ensemble models per MODEL_PATHS env (comma-separated paths).
+
+    Returns a tuple of (label, YOLO_model) pairs. label is the file basename,
+    useful for provenance tagging on detections downstream. Falls back to a
+    single-entry tuple when MODEL_PATHS is unset (= MODEL_PATH).
+    """
+    from ultralytics import YOLO
+    paths = [p.strip() for p in MODEL_PATHS.split(",") if p.strip()]
+    if not paths:
+        paths = [MODEL_PATH]
+    loaded = []
+    for path in paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"YOLO model not found at {path}. "
+                f"Set MODEL_PATHS to a comma-separated list of existing weights."
+            )
+        log.info("Loading YOLO model from %s", path)
+        loaded.append((os.path.basename(path), YOLO(path)))
+    return tuple(loaded)
+
+
+def ct_class_indices(model) -> set:
+    """Return the set of class indices whose class name contains 'cooling'.
+
+    Handles the new single-class model (returns {0}) and the prior 2-class model
+    (returns {1}, filtering out the junk class 0 named '0'). Robust to future
+    class-name additions.
+    """
+    return {idx for idx, name in model.names.items() if "cooling" in str(name).lower()}

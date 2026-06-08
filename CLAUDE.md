@@ -164,11 +164,14 @@ def _get_model():
 **VLM tuning:**
 - `GEMINI_MODEL` — Gemini model ID (default: `gemini-3.1-pro-preview`)
 - `GROK_MODEL` — Grok model ID (default: `grok-4.3`)
+- `GROK_REASONING_EFFORT` — Grok reasoning depth: `none`/`low`/`medium`/`high` (default: `high`). xAI's own default is `low`; raised here for accuracy. Note: the `grok-*-fast` model variants reject this param (HTTP 400).
+- `GEMINI_THINKING_LEVEL` — Gemini thinking depth: `minimal`/`low`/`medium`/`high` (default: `high`). Google's own default is `medium`. Replaces the deprecated `thinking_budget`; Gemini 3.x only.
 - `VLM_TIMEOUT_SECONDS` — Per-VLM wall-clock timeout in seconds (default: 120)
 - `VLM_CONSENSUS_THRESHOLD` — Minimum confidence both models must clear for consensus (default: 0.7). Below this → `needs_review`.
 
 **Imagery:**
-- `MAPBOX_ZOOM` — Satellite zoom level (default: 19, range: 18-20). 20+ may produce blurry tiles.
+- `MAPBOX_ZOOM` — Detail-tile zoom level (default: 19, range: 18-20). 20+ may produce blurry tiles.
+- `MAPBOX_ZOOM_WIDE` — Wide-tile zoom level (default: 17). Each address fetches **two** centroid-centered tiles: the detail tile (`MAPBOX_ZOOM`) and a wider tile (`MAPBOX_ZOOM_WIDE`, ~920 m across) so YOLO can catch ground-mounted cooling equipment that sits in adjacent yards/pads outside the z19 frame. Both YOLO models run on both tiles; detections are merged across zooms by `geometry.geo_dedupe_detections` (geo-space, ~10 m threshold — pixel IoU is invalid across zoom levels). Each VLM verification also receives the opposite-zoom tile as cross-zoom context.
 - `MAPBOX_SIZE` — Tile dimensions (default: `768x768`)
 - `MAPBOX_DPI` — @2x retina tiles (default: false). Note: env var name is `MAPBOX_DPI`; the Python variable in utils.py is `MAPBOX_HIGH_DPI`.
 - `MAPBOX_CROP_BOTTOM_PX` — Trim N pixels from bottom of fetched tile (default: 0). Obsolete since `logo=false` / `attribution=false` params disable Mapbox overlays.

@@ -173,6 +173,17 @@
     .download-button.secondary:hover { background-color: #2980b9; }
     .cancel-button { display: inline-block; margin-left: 1rem; background-color: #e74c3c; color: white; padding: 8px 15px; text-decoration: none; border-radius: 5px; font-size: 0.9rem; font-weight: bold; transition: background-color 0.3s ease; cursor: pointer; border: none; }
     .cancel-button:hover { background-color: #c0392b; }
+
+    /* Result thumbnail + click-to-expand lightbox (manual analysis) */
+    .thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 4px; cursor: zoom-in; border: 1px solid #ddd; display: block; margin-bottom: 4px; transition: transform .12s ease, box-shadow .12s ease; }
+    .thumb:hover { transform: scale(1.05); box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+    .img-links { font-size: .85rem; }
+    .img-links a { cursor: zoom-in; }
+    .lightbox-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none; align-items: center; justify-content: center; z-index: 1000; }
+    .lightbox-overlay.open { display: flex; }
+    .lightbox-overlay img { max-width: 70vw; max-height: 70vh; border-radius: 4px; box-shadow: 0 0 40px rgba(0,0,0,.6); }
+    .lightbox-close { position: absolute; top: 16px; right: 28px; background: none; border: none; color: #fff; font-size: 2.6rem; line-height: 1; font-weight: bold; cursor: pointer; }
+    .lightbox-close:hover { color: #ff6b6b; }
 </style>
 {% endblock %}
 
@@ -256,6 +267,12 @@
         </table>
     </div>
 </div>
+
+<!-- Click-to-expand image overlay: close via X, backdrop click, or Esc -->
+<div id="lightbox" class="lightbox-overlay" role="dialog" aria-modal="true">
+    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
+    <img id="lightbox-img" src="" alt="expanded satellite view">
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -289,6 +306,36 @@
     let startTime = Date.now();
     let lastProgress = 0;
     let displayedResultsCount = 0;  // Track how many results we've already displayed
+
+    // --- Image lightbox: click a thumbnail/link to expand; X / backdrop / Esc to close ---
+    const lightbox = document.getElementById('lightbox');
+    const lightboxImg = document.getElementById('lightbox-img');
+    const lightboxClose = document.getElementById('lightbox-close');
+    function openLightbox(url) {
+        if (!url) return;
+        lightboxImg.src = url;
+        lightbox.classList.add('open');
+    }
+    function closeLightbox() {
+        lightbox.classList.remove('open');
+        lightboxImg.src = '';
+    }
+    lightboxClose.addEventListener('click', closeLightbox);
+    lightbox.addEventListener('click', function (e) { if (e.target === lightbox) closeLightbox(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeLightbox(); });
+
+    // Build an Images cell: thumbnail of the most relevant image + expand links.
+    function imgCell(resultUrl, originalUrl) {
+        const thumbUrl = resultUrl || originalUrl;
+        if (!thumbUrl) return 'N/A';
+        const esc = (u) => (u || '').replace(/'/g, "\\'");
+        let links = '';
+        if (originalUrl) links += `<a href="#" onclick="openLightbox('${esc(originalUrl)}');return false;">Original</a>`;
+        if (resultUrl) links += `${originalUrl ? ' | ' : ''}<a href="#" onclick="openLightbox('${esc(resultUrl)}');return false;">Result</a>`;
+        return `<img class="thumb" src="${thumbUrl}" alt="view" loading="lazy" onclick="openLightbox('${esc(thumbUrl)}')">`
+             + `<div class="img-links">${links}</div>`;
+    }
+    window.openLightbox = openLightbox;
 
     if (initialTotal > 0) {
         statusElement.textContent = `Processing... (0 of ${initialTotal} complete)`;
@@ -349,6 +396,10 @@
 
         const staticBase = `{{ url_for('static', filename='') }}`;
         const isAbs = (u) => typeof u === 'string' && (/^https?:\/\//.test(u) || u.startsWith('/'));
+        // Google Maps deep-link keyed off the ADDRESS (not our centroid) so an analyst
+        // can reach the correct building even if we targeted/showed the wrong one.
+        const mapsLink = (addr) =>
+            `<a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}" target="_blank" rel="noopener" title="Open address in Google Maps">${addr}</a>`;
 
         // Process only new results
         for (let i = displayedResultsCount; i < web_results.length; i++) {
@@ -358,7 +409,7 @@
             // Handle errors (geocoding/image download failures)
             if (item.error) {
                 lowConfidenceCount++;
-                row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>${item.error}</td><td>N/A</td>`;
+                row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${item.error}</td><td>N/A</td>`;
                 lowConfidenceTableBody.appendChild(row);
             } else {
                 const originalImgUrl = item.original_image_url && isAbs(item.original_image_url)
@@ -377,25 +428,25 @@
                         // High Confidence (70%+)
                         highConfidenceCount++;
                         const badge = `<span class="confidence-badge confidence-high">${percentage}%</span>`;
-                        row.innerHTML = `<td>${highConfidenceCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        row.innerHTML = `<td>${highConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
                         highConfidenceTableBody.appendChild(row);
                     } else if (confidenceValue >= 40) {
                         // Needs Review (40-69%)
                         needsReviewCount++;
                         const badge = `<span class="confidence-badge confidence-medium">${percentage}%</span>`;
-                        row.innerHTML = `<td>${needsReviewCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        row.innerHTML = `<td>${needsReviewCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
                         needsReviewTableBody.appendChild(row);
                     } else {
                         // Low Confidence (<40%)
                         lowConfidenceCount++;
                         const badge = `<span class="confidence-badge confidence-low">${percentage}%</span>`;
-                        row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>${badge}</td><td><a href="${originalImgUrl}" target="_blank">Original</a> | <a href="${resultImgUrl}" target="_blank">Result</a></td>`;
+                        row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
                         lowConfidenceTableBody.appendChild(row);
                     }
                 } else {
                     // No detection
                     lowConfidenceCount++;
-                    row.innerHTML = `<td>${lowConfidenceCount}</td><td>${item.address}</td><td>No system detected</td><td><a href="${originalImgUrl}" target="_blank">View</a></td>`;
+                    row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>No system detected</td><td>${imgCell(null, originalImgUrl)}</td>`;
                     lowConfidenceTableBody.appendChild(row);
                 }
             }
