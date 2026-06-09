@@ -3,6 +3,7 @@ import io
 import time
 import re
 import logging
+import threading
 from typing import Optional, Tuple, List
 
 import requests
@@ -53,6 +54,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # Nominatim client (lazy-initialized with rate limiting)
 _nominatim_client = None
 _last_nominatim_call = 0.0
+# Serializes Nominatim calls: the public endpoint requires a hard 1 req/s, and
+# the _last_nominatim_call timestamp is otherwise racy under concurrent geocodes.
+_nominatim_lock = threading.Lock()
 
 def _get_nominatim_client():
     """Lazy-initialize Nominatim geocoder."""
@@ -170,24 +174,25 @@ def _geocode_nominatim(address: str) -> Optional[Tuple[float, float]]:
     """
     global _last_nominatim_call
 
-    try:
-        # Rate limiting: enforce 1 second between calls
-        elapsed = time.time() - _last_nominatim_call
-        if elapsed < NOMINATIM_RATE_LIMIT:
-            time.sleep(NOMINATIM_RATE_LIMIT - elapsed)
+    with _nominatim_lock:
+        try:
+            # Rate limiting: enforce 1 second between calls
+            elapsed = time.time() - _last_nominatim_call
+            if elapsed < NOMINATIM_RATE_LIMIT:
+                time.sleep(NOMINATIM_RATE_LIMIT - elapsed)
 
-        geolocator = _get_nominatim_client()
+            geolocator = _get_nominatim_client()
 
-        location = geolocator.geocode(address, timeout=HTTP_TIMEOUT)
-        _last_nominatim_call = time.time()
+            location = geolocator.geocode(address, timeout=HTTP_TIMEOUT)
+            _last_nominatim_call = time.time()
 
-        if location:
-            return (location.latitude, location.longitude)
-    except Exception as e:
-        log.warning("Nominatim geocoding error for '%s': %s", address, e)
-        _last_nominatim_call = time.time()  # Update even on error to maintain rate limit
+            if location:
+                return (location.latitude, location.longitude)
+        except Exception as e:
+            log.warning("Nominatim geocoding error for '%s': %s", address, e)
+            _last_nominatim_call = time.time()  # Update even on error to maintain rate limit
 
-    return None
+        return None
 
 
 def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
