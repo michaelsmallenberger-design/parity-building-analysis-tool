@@ -39,6 +39,13 @@ OVERPASS_TRANSIENT_CODES = {429, 500, 502, 503, 504}
 OVERPASS_MAX_ATTEMPTS = 4
 
 
+class TransientFootprintError(Exception):
+    """Raised when footprint lookup gives up after exhausting retries on
+    transient Overpass failures (429/5xx/timeout/connection). Signals the
+    caller that the miss is throttle-induced and retryable — distinct from a
+    genuine 'no building at this address' result, which still returns None."""
+
+
 # -------------------------------------------------------------------------
 # Web Mercator math: convert between pixel coordinates and lat/lon
 # -------------------------------------------------------------------------
@@ -214,7 +221,9 @@ def get_building_footprint(
             return None
     else:
         log.warning(f"Overpass API failed after {OVERPASS_MAX_ATTEMPTS} attempts for ({lat:.6f}, {lon:.6f})")
-        return None
+        raise TransientFootprintError(
+            f"Overpass unavailable after {OVERPASS_MAX_ATTEMPTS} attempts for ({lat:.6f}, {lon:.6f})"
+        )
 
     data = response.json()
     elements = data.get("elements", [])
