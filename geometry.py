@@ -22,8 +22,17 @@ from shapely.ops import nearest_points
 
 log = logging.getLogger(__name__)
 
-# Overpass API endpoint (public, no API key needed)
+# Overpass API endpoints (public, no API key needed). The primary is tried
+# first; fallback mirrors are used only when the primary is unreachable (the
+# whole overpass-api.de cluster went down 2026-06-09). Override the primary with
+# OVERPASS_URL, or the entire comma-separated list with OVERPASS_URLS.
 OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+_OVERPASS_FALLBACKS = ["https://overpass.openstreetmap.fr/api/interpreter"]
+OVERPASS_URLS = [u.strip() for u in os.getenv("OVERPASS_URLS", "").split(",") if u.strip()] \
+    or list(dict.fromkeys([OVERPASS_URL, *_OVERPASS_FALLBACKS]))
+# Sticky pointer to the last-known-good endpoint so a downed primary isn't
+# re-timed-out on every address (the cause of the hour-long grind during an outage).
+_overpass_active = 0
 OVERPASS_TIMEOUT = int(os.getenv("OVERPASS_TIMEOUT", "15"))
 
 # Search radius in meters for building footprint lookup
@@ -44,6 +53,38 @@ class TransientFootprintError(Exception):
     transient Overpass failures (429/5xx/timeout/connection). Signals the
     caller that the miss is throttle-induced and retryable — distinct from a
     genuine 'no building at this address' result, which still returns None."""
+
+
+def _query_overpass(url, query):
+    """Query one Overpass endpoint with retries. Returns the HTTP-200 Response,
+    or None if the endpoint is unusable (transient codes exhausted / non-200 /
+    network error) so the caller can fall back to the next mirror."""
+    for attempt in range(OVERPASS_MAX_ATTEMPTS):
+        try:
+            resp = requests.post(
+                url,
+                data={"data": query},
+                headers={"User-Agent": "parity-building-analysis-tool/1.0"},
+                timeout=OVERPASS_TIMEOUT + 15,
+            )
+            if resp.status_code in OVERPASS_TRANSIENT_CODES:
+                log.warning(f"Overpass {url} returned {resp.status_code} (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS})")
+                if attempt < OVERPASS_MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                continue
+            if resp.status_code != 200:
+                log.warning(f"Overpass {url} returned {resp.status_code}: {resp.text[:200]}")
+                return None
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            log.warning(f"Overpass {url} transient error (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS}): {e}")
+            if attempt < OVERPASS_MAX_ATTEMPTS - 1:
+                time.sleep(2 ** attempt)
+            continue
+        except Exception as e:
+            log.error(f"Overpass {url} error: {e}", exc_info=True)
+            return None
+    return None
 
 
 # -------------------------------------------------------------------------
@@ -189,40 +230,22 @@ def get_building_footprint(
     out body geom;
     """
 
+    global _overpass_active
     response = None
-    for attempt in range(OVERPASS_MAX_ATTEMPTS):
-        try:
-            response = requests.post(
-                OVERPASS_URL,
-                data={"data": query},
-                headers={"User-Agent": "parity-building-analysis-tool/1.0"},
-                timeout=OVERPASS_TIMEOUT + 15
-            )
-
-            if response.status_code in OVERPASS_TRANSIENT_CODES:
-                log.warning(f"Overpass API returned {response.status_code} (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS})")
-                if attempt < OVERPASS_MAX_ATTEMPTS - 1:
-                    time.sleep(2 ** attempt)
-                continue
-
-            if response.status_code != 200:
-                log.warning(f"Overpass API returned {response.status_code}: {response.text[:200]}")
-                return None
-
-            break  # success
-
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            log.warning(f"Overpass API transient error (attempt {attempt+1}/{OVERPASS_MAX_ATTEMPTS}): {e}")
-            if attempt < OVERPASS_MAX_ATTEMPTS - 1:
-                time.sleep(2 ** attempt)
-            continue
-        except Exception as e:
-            log.error(f"Overpass API error: {e}", exc_info=True)
-            return None
+    n = len(OVERPASS_URLS)
+    for offset in range(n):
+        idx = (_overpass_active + offset) % n
+        url = OVERPASS_URLS[idx]
+        response = _query_overpass(url, query)
+        if response is not None:
+            if idx != _overpass_active:
+                log.warning(f"Overpass: endpoint switched to {url}")
+                _overpass_active = idx  # stick to the working endpoint for later calls
+            break
+        log.warning(f"Overpass endpoint unavailable: {url}")
     else:
-        log.warning(f"Overpass API failed after {OVERPASS_MAX_ATTEMPTS} attempts for ({lat:.6f}, {lon:.6f})")
         raise TransientFootprintError(
-            f"Overpass unavailable after {OVERPASS_MAX_ATTEMPTS} attempts for ({lat:.6f}, {lon:.6f})"
+            f"All {n} Overpass endpoint(s) unavailable for ({lat:.6f}, {lon:.6f})"
         )
 
     data = response.json()
