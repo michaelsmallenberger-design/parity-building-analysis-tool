@@ -7,6 +7,9 @@ import re
 import math
 import tempfile
 import logging
+import threading
+import time
+import concurrent.futures
 import pandas as pd
 from typing import Callable, Dict, Any, List, Optional, Tuple
 from shapely.geometry import MultiPolygon
@@ -19,6 +22,7 @@ from utils import (
 from geometry import (
     get_building_footprint, classify_detections, filter_detections,
     extract_detections_from_yolo, ensemble_dedupe_detections, geo_dedupe_detections,
+    TransientFootprintError,
 )
 from nyc_opendata import lookup_nyc_registry
 from vlm import verify_detection, verify_rooftop
@@ -51,6 +55,28 @@ MIN_COMMERCIAL_FOOTPRINT_SQM = 200
 # exclusion) -- safer recall at higher VLM cost.
 AREA_GATE_ENABLED = os.environ.get("AREA_GATE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# YOLO ensemble models are @lru_cache-shared singletons; ultralytics .predict()
+# is not thread-safe. Serialize inference so concurrent addresses can't corrupt
+# each other's detections. YOLO is CPU-bound (effectively serial anyway); the
+# overlapped VLM wait is what the concurrency actually buys.
+_yolo_lock = threading.Lock()
+
+# Address-level concurrency: how many addresses' pipelines run at once. The win
+# is overlapping the dual-VLM wait (YOLO and Overpass are lock-serialized). The
+# web worker uses this default; the audit harness overrides per-run to diff 1 vs 5.
+DEFAULT_VLM_ADDRESS_CONCURRENCY = 5
+# Transient failures (throttled Overpass, transient VLM verdict) are re-queued and
+# retried this many extra rounds before being emitted as unverified.
+MAX_RETRY_ROUNDS = int(os.environ.get("VLM_RETRY_ROUNDS", "2"))
+RETRY_BACKOFF_SECONDS = float(os.environ.get("VLM_RETRY_BACKOFF", "5"))
+# Markers vlm.py stamps into reasoning on transient failures (timeout / server
+# error / throttle). Present in consensus reasoning → retryable; a genuine
+# low-confidence/disagreement/construction needs_review has none of these.
+_VLM_TRANSIENT_MARKERS = (
+    "network timeout", "network connection error",
+    "server error (http", "throttled", "after 4 attempts",
+)
+
 
 def _detect_on_tile(
     tile_path: str,
@@ -68,17 +94,18 @@ def _detect_on_tile(
     YOLO_KEEP_OUTSIDE so off-building (ground) candidates pass through to the VLM.
     """
     ensemble_dets: List[Dict[str, Any]] = []
-    for label, model in _get_models():
-        ct_idx = ct_class_indices(model)
-        if not ct_idx:
-            log.warning(f"  [z{tile_zoom}] {label}: no cooling_tower class in {model.names}; skipping")
-            continue
-        yolo_result = model.predict(source=tile_path, conf=YOLO_CONF, verbose=False)[0]
-        raw = extract_detections_from_yolo(yolo_result)
-        filtered = [d for d in raw if d.get('class') in ct_idx]
-        for d in filtered:
-            d['source_model'] = label
-        ensemble_dets.extend(filtered)
+    with _yolo_lock:
+        for label, model in _get_models():
+            ct_idx = ct_class_indices(model)
+            if not ct_idx:
+                log.warning(f"  [z{tile_zoom}] {label}: no cooling_tower class in {model.names}; skipping")
+                continue
+            yolo_result = model.predict(source=tile_path, conf=YOLO_CONF, verbose=False)[0]
+            raw = extract_detections_from_yolo(yolo_result)
+            filtered = [d for d in raw if d.get('class') in ct_idx]
+            for d in filtered:
+                d['source_model'] = label
+            ensemble_dets.extend(filtered)
 
     deduped = ensemble_dedupe_detections(ensemble_dets, iou_threshold=0.5)
     classified = classify_detections(
@@ -333,6 +360,472 @@ def _build_csv_row(
     }
 
 
+def _compose_address(row, columns) -> str:
+    """Assemble the full address string from the row (Address + optional
+    Boro_Area + Zip). Shared by _process_one_address and the unresolved-failure
+    emit so they label the same address identically."""
+    parts = [str(row['Address']).strip()]
+    if 'Boro_Area' in columns and pd.notna(row.get('Boro_Area')):
+        parts.append(str(row['Boro_Area']).strip())
+    if 'Zip' in columns and pd.notna(row.get('Zip')):
+        z = row['Zip']
+        parts.append(str(int(z)) if isinstance(z, float) else str(z))
+    return ", ".join(parts)
+
+
+def _is_transient_vlm(entry: Dict[str, Any]) -> bool:
+    """True if a needs_review verdict was caused by a transient VLM failure
+    (timeout / server error / throttle) rather than genuine uncertainty --
+    detected via the marker strings vlm.py puts in the reasoning. Retryable;
+    a real low-confidence/disagreement/construction needs_review is not."""
+    if entry.get('verdict') != 'needs_review':
+        return False
+    reason = (entry.get('reasoning') or '').lower()
+    return any(m in reason for m in _VLM_TRANSIENT_MARKERS)
+
+
+def _process_one_address(
+    row,
+    i: int,
+    columns,
+    total: int,
+    job_id: str,
+    upload_file: Callable[[str, str], str],
+    make_signed_url: Callable[[str], str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Process a single address row and return its (web_entry, csv_row) pair.
+
+    Extracted verbatim from the per-address body of process_address_list so the
+    orchestrator can run addresses concurrently. Owns its own temp-file cleanup
+    and does NOT touch shared accumulators, progress, or partial-result
+    streaming -- those stay in the orchestrator. Lets TransientFootprintError
+    (from get_building_footprint on throttle-exhausted Overpass) propagate so the
+    orchestrator can re-queue; a genuine miss still returns a footprint_missing
+    pair as before.
+    """
+    # Empty-address guard
+    if pd.isna(row['Address']) or str(row['Address']).strip() == '':
+        log.warning(f"Row {i}: Empty address, skipping")
+        return (
+            _build_web_entry(
+                full_address="(Empty)", verdict="", consensus_dict=None,
+                detection_count=0, construction=False,
+                notes="Empty address in CSV",
+                original_url=None, result_url=None,
+                error="Empty Address",
+            ),
+            _build_csv_row(
+                full_address="(Empty)", verdict="", consensus_dict=None,
+                detection_count=0, construction=False,
+                notes="Empty address in CSV",
+                original_url=None, result_url=None,
+            ),
+        )
+
+    # Build address string (no NY append — Step 4 stripped it)
+    full_address = _compose_address(row, columns)
+
+    # Geocode
+    log.info(f"Row {i+1}/{total}: Geocoding '{full_address}'")
+    coords = geocode_address_mapbox(full_address)
+    if not coords:
+        log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
+        notes = _build_notes({'geocode_failed': True})
+        return (
+            _build_web_entry(
+                full_address=full_address, verdict="", consensus_dict=None,
+                detection_count=0, construction=False, notes=notes,
+                original_url=None, result_url=None,
+                error="Geocoding Failed",
+            ),
+            _build_csv_row(
+                full_address=full_address, verdict="", consensus_dict=None,
+                detection_count=0, construction=False, notes=notes,
+                original_url=None, result_url=None,
+            ),
+        )
+    geo_lat, geo_lon = coords
+
+    # Footprint lookup BEFORE any Mapbox tile fetch (one Mapbox call per address)
+    log.info(f"Row {i+1}/{total}: Looking up OSM building footprint")
+    footprint = get_building_footprint(geo_lat, geo_lon)
+
+    clean_addr = re.sub(r'[\\/*?:"<>| ,]', '_', str(row['Address'])[:50])
+    original_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_original.jpg",
+    )
+    annotated_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_annotated.jpg",
+    )
+    annotated_wide_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_annotated_wide.jpg",
+    )
+
+    # ====================================================================
+    # BRANCH A — footprint_missing: fetch geocoded-point tile, no VLM
+    # ====================================================================
+    if footprint is None:
+        log.info(f"Row {i+1}/{total}: No OSM footprint found, recording footprint_missing")
+        ok = get_satellite_image_mapbox(geo_lat, geo_lon, original_local)
+        if not ok:
+            log.warning(f"Row {i+1}/{total}: Footprint missing AND imagery failed")
+            notes = _build_notes({'imagery_failed': True})
+            return (
+                _build_web_entry(
+                    full_address=full_address, verdict="", consensus_dict=None,
+                    detection_count=0, construction=False, notes=notes,
+                    original_url=None, result_url=None,
+                    error="Image Download Failed",
+                ),
+                _build_csv_row(
+                    full_address=full_address, verdict="", consensus_dict=None,
+                    detection_count=0, construction=False, notes=notes,
+                    original_url=None, result_url=None,
+                ),
+            )
+
+        original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
+        upload_file(original_local, original_blob)
+        original_url = make_signed_url(original_blob)
+
+        render_annotated_image(
+            raw_image_path=original_local,
+            output_path=annotated_local,
+            footprint=None,
+            centroid_lat=None,
+            centroid_lon=None,
+            enriched_detections=[],
+            winner=None,
+        )
+        result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
+        upload_file(annotated_local, result_blob)
+        result_url = make_signed_url(result_blob)
+
+        notes = _build_notes({'verdict': 'footprint_missing'})
+        web_entry = _build_web_entry(
+            full_address=full_address,
+            verdict='footprint_missing',
+            consensus_dict=None,
+            detection_count=0,
+            construction=False,
+            notes=notes,
+            original_url=original_url,
+            result_url=result_url,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address,
+            verdict='footprint_missing',
+            consensus_dict=None,
+            detection_count=0,
+            construction=False,
+            notes=notes,
+            original_url=original_url,
+            result_url=result_url,
+        )
+
+        for p in (original_local, annotated_local):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {p}: {e}")
+
+        return web_entry, csv_row
+
+    # ====================================================================
+    # BRANCH B — footprint found: centroid-centered tile + YOLO + VLM
+    # ====================================================================
+    log.info(f"Row {i+1}/{total}: Footprint found (OSM ID {footprint.get('osm_id')})")
+    centroid_lat, centroid_lon = _centroid_latlon(footprint)
+
+    # ====================================================================
+    # AREA GATE -- cheapest exit, BEFORE any Mapbox tile fetch / YOLO / VLM.
+    # ====================================================================
+    if AREA_GATE_ENABLED and not footprint.get('contains_point'):
+        log.info(f"Row {i+1}/{total}: Footprint is a nearest-building fallback "
+                 f"(contains_point=False); routing to review as ambiguous_footprint")
+        notes = _build_notes({'verdict': 'ambiguous_footprint'})
+        return (
+            _build_web_entry(
+                full_address=full_address, verdict='ambiguous_footprint',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ),
+            _build_csv_row(
+                full_address=full_address, verdict='ambiguous_footprint',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ),
+        )
+
+    footprint_area = _footprint_area_m2(footprint) if AREA_GATE_ENABLED else 0.0
+    if AREA_GATE_ENABLED and footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
+        log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
+                 f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
+        notes = _build_notes({'verdict': 'likely_residential'})
+        return (
+            _build_web_entry(
+                full_address=full_address, verdict='likely_residential',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ),
+            _build_csv_row(
+                full_address=full_address, verdict='likely_residential',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ),
+        )
+
+    log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image")
+    ok = get_satellite_image_mapbox(centroid_lat, centroid_lon, original_local)
+    if not ok:
+        log.warning(f"Row {i+1}/{total}: Image download failed")
+        notes = _build_notes({'imagery_failed': True})
+        return (
+            _build_web_entry(
+                full_address=full_address, verdict="", consensus_dict=None,
+                detection_count=0, construction=False, notes=notes,
+                original_url=None, result_url=None,
+                error="Image Download Failed",
+            ),
+            _build_csv_row(
+                full_address=full_address, verdict="", consensus_dict=None,
+                detection_count=0, construction=False, notes=notes,
+                original_url=None, result_url=None,
+            ),
+        )
+
+    original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
+    upload_file(original_local, original_blob)
+    original_url = make_signed_url(original_blob)
+
+    # ====================================================================
+    # Registry-first: BIN-matched NYC OpenData hit → confirm, skip YOLO+VLM
+    # ====================================================================
+    registry = {'confirmed': False}
+    if is_fully_qualified_address(full_address):
+        registry = lookup_nyc_registry(geo_lat, geo_lon, footprint)
+    else:
+        log.info(
+            f"Row {i+1}/{total}: Address not fully-qualified (no ZIP); "
+            f"registry skip ineligible, running full pipeline"
+        )
+    if registry['confirmed']:
+        log.info(
+            f"Row {i+1}/{total}: Registry-confirmed "
+            f"({registry['source']}, BIN {registry['bin']}); skipping YOLO+VLM"
+        )
+        render_annotated_image(
+            raw_image_path=original_local,
+            output_path=annotated_local,
+            footprint=footprint,
+            centroid_lat=centroid_lat,
+            centroid_lon=centroid_lon,
+            enriched_detections=[],
+            winner=None,
+        )
+        result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
+        upload_file(annotated_local, result_blob)
+        result_url = make_signed_url(result_blob)
+
+        notes = _build_notes({
+            'verdict': 'registry_confirmed',
+            'registry_citation': registry['citation'],
+        })
+        web_entry = _build_web_entry(
+            full_address=full_address,
+            verdict='registry_confirmed',
+            consensus_dict=None,
+            detection_count=0,
+            construction=False,
+            notes=notes,
+            original_url=original_url,
+            result_url=result_url,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address,
+            verdict='registry_confirmed',
+            consensus_dict=None,
+            detection_count=0,
+            construction=False,
+            notes=notes,
+            original_url=original_url,
+            result_url=result_url,
+        )
+
+        for p in (original_local, annotated_local):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {p}: {e}")
+
+        return web_entry, csv_row
+
+    # Fetch the wider tile (ground-mounted CTs / parcel context).
+    wide_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_wide.jpg",
+    )
+    log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
+    if not get_satellite_image_mapbox(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
+        log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
+        wide_local = None
+
+    log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF} on both zooms")
+    detail_kept = _detect_on_tile(original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon)
+    wide_kept = (
+        _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon)
+        if wide_local else []
+    )
+    merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
+    log.info(
+        f"  Cross-zoom: detail {len(detail_kept)} + wide {len(wide_kept)} "
+        f"→ {len(merged)} after geo dedupe"
+    )
+
+    base_ctx = {
+        "address": full_address,
+        "lat": centroid_lat,
+        "lon": centroid_lon,
+        "footprint_metadata": {
+            "osm_id": footprint.get('osm_id'),
+            "tags": footprint.get('tags', {}),
+            "contains_point": footprint.get('contains_point'),
+        },
+    }
+
+    enriched: List[Dict[str, Any]] = []
+    winner: Optional[Dict[str, Any]] = None
+    if merged:
+        log.info(
+            f"Row {i+1}/{total}: {len(merged)} kept detection(s) across zooms; "
+            f"running verify_detection per candidate"
+        )
+        for det in merged:
+            det_tile = det['tile_path']
+            det_zoom = det['tile_zoom']
+            # Context = the opposite-zoom tile of the same target (if available).
+            if det_tile == original_local and wide_local:
+                context_path, context_zoom = wide_local, MAPBOX_ZOOM_WIDE
+            elif det_tile == wide_local:
+                context_path, context_zoom = original_local, MAPBOX_ZOOM
+            else:
+                context_path, context_zoom = None, None
+            det_ctx = {
+                **base_ctx,
+                "detection_location": det.get('location', 'unknown'),
+                "tile_zoom": det_zoom,
+                "context_zoom": context_zoom,
+            }
+            vlm_result = verify_detection(
+                det_tile, det['bbox'], det_ctx, context_image_path=context_path
+            )
+            enriched.append({**det, 'vlm_result': vlm_result})
+        winner = _pick_winner(enriched)
+        consensus_dict = winner['vlm_result']
+        rooftop_path = False
+        detection_count = len(merged)
+        winner_is_boundary = (winner.get('location') == 'boundary')
+        render_tile, render_zoom = winner['tile_path'], winner['tile_zoom']
+    else:
+        # Rooftop scan: lead with the wide tile (ground CTs are the concern),
+        # passing the detail tile as cross-zoom context.
+        log.info(f"Row {i+1}/{total}: No kept detections; running verify_rooftop")
+        scan_path = wide_local or original_local
+        scan_zoom = MAPBOX_ZOOM_WIDE if wide_local else MAPBOX_ZOOM
+        context_path = original_local if wide_local else None
+        rooftop_ctx = {
+            **base_ctx,
+            "tile_zoom": scan_zoom,
+            "context_zoom": MAPBOX_ZOOM if wide_local else None,
+        }
+        consensus_dict = verify_rooftop(scan_path, rooftop_ctx, context_image_path=context_path)
+        rooftop_path = True
+        detection_count = 0
+        winner_is_boundary = False
+        render_tile, render_zoom = scan_path, scan_zoom
+
+    # Render BOTH tiles so manual review always has a clear close-up plus context.
+    def _render_tile(tile_path, tile_zoom, out_path):
+        if not tile_path:
+            return None
+        dets = [e for e in enriched if e.get('tile_path') == tile_path]
+        win = winner if (winner and winner.get('tile_path') == tile_path) else None
+        render_annotated_image(
+            raw_image_path=tile_path,
+            output_path=out_path,
+            footprint=footprint,
+            centroid_lat=centroid_lat,
+            centroid_lon=centroid_lon,
+            enriched_detections=dets,
+            winner=win,
+            zoom=tile_zoom,
+        )
+        blob = f"results/{job_id}/{os.path.basename(out_path)}"
+        upload_file(out_path, blob)
+        return make_signed_url(blob)
+
+    result_url = _render_tile(original_local, MAPBOX_ZOOM, annotated_local)
+    result_url_wide = _render_tile(wide_local, MAPBOX_ZOOM_WIDE, annotated_wide_local)
+
+    # Construction → needs_review: active construction means the Mapbox tile may
+    # predate the current building state, so the cooling-tower call isn't reliable.
+    construction = consensus_dict.get('construction', False)
+    effective_verdict = consensus_dict['verdict']
+    construction_review = construction and effective_verdict != 'needs_review'
+    if construction_review:
+        log.info(
+            f"Row {i+1}/{total}: construction flagged (VLM verdict "
+            f"'{effective_verdict}') → routing to needs_review for manual lookup"
+        )
+        effective_verdict = 'needs_review'
+
+    row_state = {
+        'verdict': effective_verdict,
+        'detection_count': detection_count,
+        'rooftop_path': rooftop_path,
+        'construction': construction,
+        'winner_is_boundary': winner_is_boundary,
+        'construction_review': construction_review,
+    }
+    notes = _build_notes(row_state)
+
+    web_entry = _build_web_entry(
+        full_address=full_address,
+        verdict=effective_verdict,
+        consensus_dict=consensus_dict,
+        detection_count=detection_count,
+        construction=construction,
+        notes=notes,
+        original_url=original_url,
+        result_url=result_url,
+        result_url_wide=result_url_wide,
+    )
+    csv_row = _build_csv_row(
+        full_address=full_address,
+        verdict=effective_verdict,
+        consensus_dict=consensus_dict,
+        detection_count=detection_count,
+        construction=construction,
+        notes=notes,
+        original_url=original_url,
+        result_url=result_url,
+    )
+
+    for p in (original_local, wide_local, annotated_local, annotated_wide_local):
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            log.warning(f"Could not clean up temp file {p}: {e}")
+
+    return web_entry, csv_row
+
+
 def process_address_list(
     uploaded_filepath: str,
     job_id: str,
@@ -341,6 +834,7 @@ def process_address_list(
     upload_file: Callable[[str, str], str],       # (local_path, dest_blob) -> blob_path
     make_signed_url: Callable[[str], str],        # (blob_path) -> url
     write_partial_result: Callable[[Dict[str, Any]], None] = None,  # Optional callback for streaming results
+    concurrency: int = None,  # addresses processed at once; None → VLM_ADDRESS_CONCURRENCY env (default 5)
 ) -> Dict[str, Any]:
     """
     Process a CSV of addresses through the geometry + dual-VLM pipeline.
@@ -465,477 +959,110 @@ def process_address_list(
         log.error(error_msg)
         return {"error": error_msg}
 
-    log.info(f"Starting processing loop for {total} addresses")
+    # ------------------------------------------------------------------
+    # Concurrent orchestrator: run up to `concurrency` addresses at once to
+    # overlap the dual-VLM wait. Per-address work is isolated in
+    # _process_one_address; shared state (progress, partial-result streaming,
+    # ordering) is handled here under one lock. Transient failures (throttled
+    # Overpass → TransientFootprintError, transient VLM verdict) are re-queued
+    # and retried in later rounds; nothing is silently dropped.
+    # ------------------------------------------------------------------
+    if concurrency is None:
+        concurrency = int(os.environ.get("VLM_ADDRESS_CONCURRENCY", str(DEFAULT_VLM_ADDRESS_CONCURRENCY)))
+    concurrency = max(1, concurrency)
+    log.info(f"Starting processing loop for {total} addresses ({concurrency}-way concurrent)")
+
+    columns = df.columns
+    results_by_index = {}   # i -> (web_entry, csv_row)
+    last_seen = {}          # i -> last (web_entry, csv_row) for transient-VLM rows
+    commit_lock = threading.Lock()
     done = 0
-    for i, row in df.iterrows():
-        if should_cancel():
-            raise Exception("Job cancelled by user.")
 
-        done += 1
-        progress_cb(done, total, None)
-
-        # Empty-address guard
-        if pd.isna(row['Address']) or str(row['Address']).strip() == '':
-            log.warning(f"Row {i}: Empty address, skipping")
-            web_results.append(_build_web_entry(
-                full_address="(Empty)", verdict="", consensus_dict=None,
-                detection_count=0, construction=False,
-                notes="Empty address in CSV",
-                original_url=None, result_url=None,
-                error="Empty Address",
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address="(Empty)", verdict="", consensus_dict=None,
-                detection_count=0, construction=False,
-                notes="Empty address in CSV",
-                original_url=None, result_url=None,
-            ))
+    def _commit(i, web_entry, csv_row):
+        nonlocal done
+        with commit_lock:
+            results_by_index[i] = (web_entry, csv_row)
+            done += 1
+            progress_cb(done, total, None)
             if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
+                snapshot = [results_by_index[k][0] for k in sorted(results_by_index)]
+                write_partial_result({"web_results": snapshot})
+            if done % 50 == 0 and total > 100:
+                import gc
+                gc.collect()
+                log.info(f"Memory cleanup at {done}/{total} addresses")
 
-        # Build address string (no NY append — Step 4 stripped it)
-        parts = [str(row['Address']).strip()]
-        if 'Boro_Area' in df.columns and pd.notna(row.get('Boro_Area')):
-            parts.append(str(row['Boro_Area']).strip())
-        if 'Zip' in df.columns and pd.notna(row.get('Zip')):
-            z = row['Zip']
-            parts.append(str(int(z)) if isinstance(z, float) else str(z))
-        full_address = ", ".join(parts)
-
-        # Geocode
-        log.info(f"Row {i+1}/{total}: Geocoding '{full_address}'")
-        coords = geocode_address_mapbox(full_address)
-        if not coords:
-            log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
-            notes = _build_notes({'geocode_failed': True})
-            web_results.append(_build_web_entry(
-                full_address=full_address, verdict="", consensus_dict=None,
-                detection_count=0, construction=False, notes=notes,
-                original_url=None, result_url=None,
-                error="Geocoding Failed",
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address, verdict="", consensus_dict=None,
-                detection_count=0, construction=False, notes=notes,
-                original_url=None, result_url=None,
-            ))
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-        geo_lat, geo_lon = coords
-
-        # Footprint lookup BEFORE any Mapbox tile fetch (one Mapbox call per address)
-        log.info(f"Row {i+1}/{total}: Looking up OSM building footprint")
-        footprint = get_building_footprint(geo_lat, geo_lon)
-
-        clean_addr = re.sub(r'[\\/*?:"<>| ,]', '_', str(row['Address'])[:50])
-        original_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_original.jpg",
-        )
-        annotated_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_annotated.jpg",
-        )
-        annotated_wide_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_annotated_wide.jpg",
-        )
-
-        # ====================================================================
-        # BRANCH A — footprint_missing: fetch geocoded-point tile, no VLM
-        # ====================================================================
-        if footprint is None:
-            log.info(f"Row {i+1}/{total}: No OSM footprint found, recording footprint_missing")
-            ok = get_satellite_image_mapbox(geo_lat, geo_lon, original_local)
-            if not ok:
-                log.warning(f"Row {i+1}/{total}: Footprint missing AND imagery failed")
-                notes = _build_notes({'imagery_failed': True})
-                web_results.append(_build_web_entry(
-                    full_address=full_address, verdict="", consensus_dict=None,
-                    detection_count=0, construction=False, notes=notes,
-                    original_url=None, result_url=None,
-                    error="Image Download Failed",
-                ))
-                csv_rows.append(_build_csv_row(
-                    full_address=full_address, verdict="", consensus_dict=None,
-                    detection_count=0, construction=False, notes=notes,
-                    original_url=None, result_url=None,
-                ))
-                if write_partial_result:
-                    write_partial_result({"web_results": web_results})
-                continue
-
-            original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
-            upload_file(original_local, original_blob)
-            original_url = make_signed_url(original_blob)
-
-            render_annotated_image(
-                raw_image_path=original_local,
-                output_path=annotated_local,
-                footprint=None,
-                centroid_lat=None,
-                centroid_lon=None,
-                enriched_detections=[],
-                winner=None,
-            )
-            result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
-            upload_file(annotated_local, result_blob)
-            result_url = make_signed_url(result_blob)
-
-            notes = _build_notes({'verdict': 'footprint_missing'})
-            web_results.append(_build_web_entry(
-                full_address=full_address,
-                verdict='footprint_missing',
-                consensus_dict=None,
-                detection_count=0,
-                construction=False,
-                notes=notes,
-                original_url=original_url,
-                result_url=result_url,
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address,
-                verdict='footprint_missing',
-                consensus_dict=None,
-                detection_count=0,
-                construction=False,
-                notes=notes,
-                original_url=original_url,
-                result_url=result_url,
-            ))
-
-            for p in (original_local, annotated_local):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    log.warning(f"Could not clean up temp file {p}: {e}")
-
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-
-        # ====================================================================
-        # BRANCH B — footprint found: centroid-centered tile + YOLO + VLM
-        # ====================================================================
-        log.info(f"Row {i+1}/{total}: Footprint found (OSM ID {footprint.get('osm_id')})")
-        centroid_lat, centroid_lon = _centroid_latlon(footprint)
-
-        # ====================================================================
-        # AREA GATE -- cheapest exit, BEFORE any Mapbox tile fetch / YOLO / VLM.
-        # Mirrors the footprint_missing branch: emit a verdict, no rendered
-        # tile, route to manual review.
-        #   - contains_point False (nearest-building fallback): the area is
-        #     untrustworthy -- a real tower building can match a tiny adjacent
-        #     polygon (e.g. 530 East 76 -> 159 sq m wrong polygon) -- so do NOT
-        #     gate on area; route to review as ambiguous_footprint.
-        #   - contains_point True AND area < floor: gate as likely_residential.
-        # OPEN: this sits before the registry-first check below; whether an
-        # ambiguous_footprint should still get a registry shot is flagged for
-        # review (a BIN match off a wrong footprint is itself unreliable).
-        # ====================================================================
-        if AREA_GATE_ENABLED and not footprint.get('contains_point'):
-            log.info(f"Row {i+1}/{total}: Footprint is a nearest-building fallback "
-                     f"(contains_point=False); routing to review as ambiguous_footprint")
-            notes = _build_notes({'verdict': 'ambiguous_footprint'})
-            web_results.append(_build_web_entry(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ))
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-
-        footprint_area = _footprint_area_m2(footprint) if AREA_GATE_ENABLED else 0.0
-        if AREA_GATE_ENABLED and footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
-            log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
-                     f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
-            notes = _build_notes({'verdict': 'likely_residential'})
-            web_results.append(_build_web_entry(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ))
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-
-        log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image")
-        ok = get_satellite_image_mapbox(centroid_lat, centroid_lon, original_local)
-        if not ok:
-            log.warning(f"Row {i+1}/{total}: Image download failed")
-            notes = _build_notes({'imagery_failed': True})
-            web_results.append(_build_web_entry(
-                full_address=full_address, verdict="", consensus_dict=None,
-                detection_count=0, construction=False, notes=notes,
-                original_url=None, result_url=None,
-                error="Image Download Failed",
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address, verdict="", consensus_dict=None,
-                detection_count=0, construction=False, notes=notes,
-                original_url=None, result_url=None,
-            ))
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-
-        original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
-        upload_file(original_local, original_blob)
-        original_url = make_signed_url(original_blob)
-
-        # ====================================================================
-        # Registry-first: BIN-matched NYC OpenData hit → confirm, skip YOLO+VLM
-        # The skip has no VLM safety net, so require a fully-qualified (ZIP-bearing)
-        # address — a misgeocode would otherwise confirm the wrong building.
-        # Under-qualified addresses fall through to the full pipeline.
-        # ====================================================================
-        registry = {'confirmed': False}
-        if is_fully_qualified_address(full_address):
-            registry = lookup_nyc_registry(geo_lat, geo_lon, footprint)
-        else:
-            log.info(
-                f"Row {i+1}/{total}: Address not fully-qualified (no ZIP); "
-                f"registry skip ineligible, running full pipeline"
-            )
-        if registry['confirmed']:
-            log.info(
-                f"Row {i+1}/{total}: Registry-confirmed "
-                f"({registry['source']}, BIN {registry['bin']}); skipping YOLO+VLM"
-            )
-            render_annotated_image(
-                raw_image_path=original_local,
-                output_path=annotated_local,
-                footprint=footprint,
-                centroid_lat=centroid_lat,
-                centroid_lon=centroid_lon,
-                enriched_detections=[],
-                winner=None,
-            )
-            result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
-            upload_file(annotated_local, result_blob)
-            result_url = make_signed_url(result_blob)
-
-            notes = _build_notes({
-                'verdict': 'registry_confirmed',
-                'registry_citation': registry['citation'],
-            })
-            web_results.append(_build_web_entry(
-                full_address=full_address,
-                verdict='registry_confirmed',
-                consensus_dict=None,
-                detection_count=0,
-                construction=False,
-                notes=notes,
-                original_url=original_url,
-                result_url=result_url,
-            ))
-            csv_rows.append(_build_csv_row(
-                full_address=full_address,
-                verdict='registry_confirmed',
-                consensus_dict=None,
-                detection_count=0,
-                construction=False,
-                notes=notes,
-                original_url=original_url,
-                result_url=result_url,
-            ))
-
-            for p in (original_local, annotated_local):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    log.warning(f"Could not clean up temp file {p}: {e}")
-
-            if write_partial_result:
-                write_partial_result({"web_results": web_results})
-            continue
-
-        # Fetch the wider tile (ground-mounted CTs / parcel context). original_local is
-        # the detail tile (z19); wide_local is z17. Both centered on the same centroid.
-        wide_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_wide.jpg",
-        )
-        log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
-        if not get_satellite_image_mapbox(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
-            log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
-            wide_local = None
-
-        log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF} on both zooms")
-        detail_kept = _detect_on_tile(original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon)
-        wide_kept = (
-            _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon)
-            if wide_local else []
-        )
-        merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
-        log.info(
-            f"  Cross-zoom: detail {len(detail_kept)} + wide {len(wide_kept)} "
-            f"→ {len(merged)} after geo dedupe"
-        )
-
-        base_ctx = {
-            "address": full_address,
-            "lat": centroid_lat,
-            "lon": centroid_lon,
-            "footprint_metadata": {
-                "osm_id": footprint.get('osm_id'),
-                "tags": footprint.get('tags', {}),
-                "contains_point": footprint.get('contains_point'),
-            },
-        }
-
-        enriched: List[Dict[str, Any]] = []
-        winner: Optional[Dict[str, Any]] = None
-        if merged:
-            log.info(
-                f"Row {i+1}/{total}: {len(merged)} kept detection(s) across zooms; "
-                f"running verify_detection per candidate"
-            )
-            for det in merged:
-                det_tile = det['tile_path']
-                det_zoom = det['tile_zoom']
-                # Context = the opposite-zoom tile of the same target (if available).
-                if det_tile == original_local and wide_local:
-                    context_path, context_zoom = wide_local, MAPBOX_ZOOM_WIDE
-                elif det_tile == wide_local:
-                    context_path, context_zoom = original_local, MAPBOX_ZOOM
-                else:
-                    context_path, context_zoom = None, None
-                det_ctx = {
-                    **base_ctx,
-                    "detection_location": det.get('location', 'unknown'),
-                    "tile_zoom": det_zoom,
-                    "context_zoom": context_zoom,
-                }
-                vlm_result = verify_detection(
-                    det_tile, det['bbox'], det_ctx, context_image_path=context_path
-                )
-                enriched.append({**det, 'vlm_result': vlm_result})
-            winner = _pick_winner(enriched)
-            consensus_dict = winner['vlm_result']
-            rooftop_path = False
-            detection_count = len(merged)
-            winner_is_boundary = (winner.get('location') == 'boundary')
-            render_tile, render_zoom = winner['tile_path'], winner['tile_zoom']
-        else:
-            # Rooftop scan: lead with the wide tile (ground CTs are the concern),
-            # passing the detail tile as cross-zoom context.
-            log.info(f"Row {i+1}/{total}: No kept detections; running verify_rooftop")
-            scan_path = wide_local or original_local
-            scan_zoom = MAPBOX_ZOOM_WIDE if wide_local else MAPBOX_ZOOM
-            context_path = original_local if wide_local else None
-            rooftop_ctx = {
-                **base_ctx,
-                "tile_zoom": scan_zoom,
-                "context_zoom": MAPBOX_ZOOM if wide_local else None,
+    def _run_round(batch):
+        """Process a batch concurrently; return the rows that need retry."""
+        retry = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = {
+                ex.submit(_process_one_address, row, i, columns, total,
+                          job_id, upload_file, make_signed_url): (i, row)
+                for (i, row) in batch
             }
-            consensus_dict = verify_rooftop(scan_path, rooftop_ctx, context_image_path=context_path)
-            rooftop_path = True
-            detection_count = 0
-            winner_is_boundary = False
-            render_tile, render_zoom = scan_path, scan_zoom
+            for fut in concurrent.futures.as_completed(futs):
+                i, row = futs[fut]
+                if should_cancel():
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    raise Exception("Job cancelled by user.")
+                try:
+                    web_entry, csv_row = fut.result()
+                except TransientFootprintError:
+                    log.warning(f"Row {i+1}/{total}: Overpass throttled (transient); queued for retry")
+                    retry.append((i, row))
+                    continue
+                except Exception as e:
+                    log.warning(f"Row {i+1}/{total}: unexpected error ({type(e).__name__}: {e}); queued for retry")
+                    retry.append((i, row))
+                    continue
+                if _is_transient_vlm(web_entry):
+                    last_seen[i] = (web_entry, csv_row)  # keep as fallback if retries don't clear it
+                    log.info(f"Row {i+1}/{total}: transient VLM verdict; queued for retry")
+                    retry.append((i, row))
+                    continue
+                _commit(i, web_entry, csv_row)
+        return retry
 
-        # Render BOTH tiles so manual review always has a clear close-up (z19
-        # detail, primary) plus the wider context (secondary). Each tile is
-        # annotated only with its own detections — cross-zoom pixel coords don't
-        # transfer — and the winner is highlighted on whichever tile it came from.
-        def _render_tile(tile_path, tile_zoom, out_path):
-            if not tile_path:
-                return None
-            dets = [e for e in enriched if e.get('tile_path') == tile_path]
-            win = winner if (winner and winner.get('tile_path') == tile_path) else None
-            render_annotated_image(
-                raw_image_path=tile_path,
-                output_path=out_path,
-                footprint=footprint,
-                centroid_lat=centroid_lat,
-                centroid_lon=centroid_lon,
-                enriched_detections=dets,
-                winner=win,
-                zoom=tile_zoom,
-            )
-            blob = f"results/{job_id}/{os.path.basename(out_path)}"
-            upload_file(out_path, blob)
-            return make_signed_url(blob)
+    pending = list(df.iterrows())
+    for round_num in range(MAX_RETRY_ROUNDS + 1):
+        if not pending:
+            break
+        if round_num > 0:
+            log.info(f"Retry round {round_num}/{MAX_RETRY_ROUNDS}: {len(pending)} address(es) after backoff")
+            time.sleep(RETRY_BACKOFF_SECONDS * round_num)
+        pending = _run_round(pending)
 
-        result_url = _render_tile(original_local, MAPBOX_ZOOM, annotated_local)
-        result_url_wide = _render_tile(wide_local, MAPBOX_ZOOM_WIDE, annotated_wide_local)
+    # No silent drops. If a transient VLM result was seen, keep it (a legitimate
+    # needs_review row); if the footprint never resolved, emit footprint_missing
+    # tagged unverified so a throttle-induced miss is never logged as a clean
+    # genuine negative.
+    for i, row in pending:
+        if i in last_seen:
+            _commit(i, *last_seen[i])
+            continue
+        full_address = _compose_address(row, columns)
+        log.warning(f"Row {i+1}/{total}: still failing after {MAX_RETRY_ROUNDS} retries; emitting unverified")
+        notes = "Transient failure (Overpass/VLM) unresolved after retries; manual verification needed"
+        _commit(
+            i,
+            _build_web_entry(
+                full_address=full_address, verdict='footprint_missing',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+                error="Unresolved transient failure",
+            ),
+            _build_csv_row(
+                full_address=full_address, verdict='footprint_missing',
+                consensus_dict=None, detection_count=0, construction=False,
+                notes=notes, original_url=None, result_url=None,
+            ),
+        )
 
-        # Construction → needs_review: active construction means the Mapbox tile may
-        # predate the current building state, so the cooling-tower call isn't reliable.
-        # Route to manual review (operator verifies against fresher sources). The
-        # underlying per-VLM verdicts/reasoning are preserved in consensus_dict.
-        construction = consensus_dict.get('construction', False)
-        effective_verdict = consensus_dict['verdict']
-        construction_review = construction and effective_verdict != 'needs_review'
-        if construction_review:
-            log.info(
-                f"Row {i+1}/{total}: construction flagged (VLM verdict "
-                f"'{effective_verdict}') → routing to needs_review for manual lookup"
-            )
-            effective_verdict = 'needs_review'
-
-        row_state = {
-            'verdict': effective_verdict,
-            'detection_count': detection_count,
-            'rooftop_path': rooftop_path,
-            'construction': construction,
-            'winner_is_boundary': winner_is_boundary,
-            'construction_review': construction_review,
-        }
-        notes = _build_notes(row_state)
-
-        web_results.append(_build_web_entry(
-            full_address=full_address,
-            verdict=effective_verdict,
-            consensus_dict=consensus_dict,
-            detection_count=detection_count,
-            construction=construction,
-            notes=notes,
-            original_url=original_url,
-            result_url=result_url,
-            result_url_wide=result_url_wide,
-        ))
-        csv_rows.append(_build_csv_row(
-            full_address=full_address,
-            verdict=effective_verdict,
-            consensus_dict=consensus_dict,
-            detection_count=detection_count,
-            construction=construction,
-            notes=notes,
-            original_url=original_url,
-            result_url=result_url,
-        ))
-
-        for p in (original_local, wide_local, annotated_local, annotated_wide_local):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception as e:
-                log.warning(f"Could not clean up temp file {p}: {e}")
-
-        if done % 50 == 0 and total > 100:
-            import gc
-            gc.collect()
-            log.info(f"Memory cleanup at {done}/{total} addresses")
-
-        if write_partial_result:
-            write_partial_result({"web_results": web_results})
+    # Assemble the final accumulators in input order.
+    for k in sorted(results_by_index):
+        web_results.append(results_by_index[k][0])
+        csv_rows.append(results_by_index[k][1])
 
     # Log summary statistics
     successful = sum(1 for r in web_results if not r.get('error'))
