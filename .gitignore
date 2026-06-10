@@ -45,6 +45,8 @@ scratch_*.csv
 scratch_*.html
 scratch_*.md
 scratch_*.log
+scratch_*.json
+scratch_*.jsonl
 scratch_results.json
 scratch_*/
 smoke_*.py
