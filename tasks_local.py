@@ -16,7 +16,8 @@ from shapely.geometry import MultiPolygon
 from shapely.ops import transform
 
 from utils import (
-    geocode_address_mapbox, get_satellite_image_mapbox, is_fully_qualified_address,
+    geocode_address_mapbox, geocode_with_confidence, get_satellite_image_mapbox,
+    is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
 from geometry import (
@@ -393,6 +394,29 @@ def _process_one_address(
     upload_file: Callable[[str, str], str],
     make_signed_url: Callable[[str], str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Thin wrapper around the per-address pipeline that injects the geocoder
+    agreement flag (geocode_confidence / geocode_divergence_m) at a single point,
+    so the core's many return branches don't each have to thread it through."""
+    geo: Dict[str, Any] = {}
+    web_entry, csv_row = _process_one_address_core(
+        row, i, columns, total, job_id, upload_file, make_signed_url, geo
+    )
+    web_entry["geocode_confidence"] = geo.get("confidence")
+    web_entry["geocode_divergence_m"] = geo.get("divergence_m")
+    csv_row["geocode_confidence"] = geo.get("confidence")
+    return web_entry, csv_row
+
+
+def _process_one_address_core(
+    row,
+    i: int,
+    columns,
+    total: int,
+    job_id: str,
+    upload_file: Callable[[str, str], str],
+    make_signed_url: Callable[[str], str],
+    geo: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Process a single address row and return its (web_entry, csv_row) pair.
 
     Extracted verbatim from the per-address body of process_address_list so the
@@ -425,10 +449,10 @@ def _process_one_address(
     # Build address string (no NY append — Step 4 stripped it)
     full_address = _compose_address(row, columns)
 
-    # Geocode
+    # Geocode (+ free geocoder-agreement confidence flag, stashed into `geo`)
     log.info(f"Row {i+1}/{total}: Geocoding '{full_address}'")
-    coords = geocode_address_mapbox(full_address)
-    if not coords:
+    geo_lat, geo_lon, geo["confidence"], geo["divergence_m"] = geocode_with_confidence(full_address)
+    if geo_lat is None:
         log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
         notes = _build_notes({'geocode_failed': True})
         return (
@@ -444,7 +468,6 @@ def _process_one_address(
                 original_url=None, result_url=None,
             ),
         )
-    geo_lat, geo_lon = coords
 
     # Footprint lookup BEFORE any Mapbox tile fetch (one Mapbox call per address)
     log.info(f"Row {i+1}/{total}: Looking up OSM building footprint")

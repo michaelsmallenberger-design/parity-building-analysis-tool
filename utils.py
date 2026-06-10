@@ -4,6 +4,7 @@ import time
 import re
 import logging
 import threading
+import math
 from typing import Optional, Tuple, List
 
 import requests
@@ -42,6 +43,13 @@ RETRY_BACKOFF = 0.7
 GEOCODE_CONFIDENCE_THRESHOLD = float(os.getenv("GEOCODE_CONFIDENCE_THRESHOLD", "0.70"))
 NOMINATIM_USER_AGENT = "ParityBuildingAnalysisTool/1.0"
 NOMINATIM_RATE_LIMIT = 1.0  # seconds between requests
+
+# Geocoder-agreement trust flag: corroborate the Mapbox point against an
+# independent Nominatim geocode. Agreement within the threshold -> 'high';
+# divergence (or no Nominatim match) -> 'low' = the location is worth a manual
+# look (not necessarily wrong). Set GEOCODE_CONFIDENCE=0 to skip the extra call.
+GEOCODE_CONFIDENCE_ENABLED = os.environ.get("GEOCODE_CONFIDENCE", "1").strip().lower() not in ("0", "false", "no", "off")
+GEOCODE_DIVERGENCE_THRESHOLD_M = float(os.getenv("GEOCODE_DIVERGENCE_THRESHOLD_M", "60"))
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -193,6 +201,35 @@ def _geocode_nominatim(address: str) -> Optional[Tuple[float, float]]:
             _last_nominatim_call = time.time()  # Update even on error to maintain rate limit
 
         return None
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    r1, n1, r2, n2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlat, dlon = r2 - r1, n2 - n1
+    h = math.sin(dlat / 2) ** 2 + math.cos(r1) * math.cos(r2) * math.sin(dlon / 2) ** 2
+    return 6371000 * 2 * math.asin(math.sqrt(h))
+
+
+def geocode_with_confidence(query: str):
+    """Geocode + a free agreement-based trust flag.
+
+    Returns (lat, lon, confidence, divergence_m). lat/lon are the pipeline's
+    existing Mapbox-tiered point -- UNCHANGED, so tile centering is identical.
+    An independent Nominatim geocode corroborates it: agreement within
+    GEOCODE_DIVERGENCE_THRESHOLD_M -> 'high'; beyond it (or no Nominatim match)
+    -> 'low'. confidence is None when geocoding fails or the check is disabled.
+    """
+    coords = geocode_address_mapbox(query)
+    if not coords:
+        return None, None, None, None
+    lat, lon = coords
+    if not GEOCODE_CONFIDENCE_ENABLED:
+        return lat, lon, None, None
+    nm = _geocode_nominatim(query)
+    if not nm:
+        return lat, lon, "low", None
+    d = _haversine_m(lat, lon, nm[0], nm[1])
+    return lat, lon, ("high" if d <= GEOCODE_DIVERGENCE_THRESHOLD_M else "low"), round(d, 1)
 
 
 def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
