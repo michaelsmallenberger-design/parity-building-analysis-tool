@@ -21,9 +21,11 @@ _COLOR_POSITIVE_NONWINNER = (0, 200, 0)  # green (thin)
 _COLOR_NEGATIVE = (128, 128, 128)        # gray
 _COLOR_AMBIGUOUS = (0, 165, 255)         # orange
 _COLOR_BOUNDARY = (0, 255, 255)          # yellow
+_COLOR_DETECTION = (0, 255, 0)           # brightest green — all YOLO boxes (1-call design)
 
 _THICKNESS_WINNER = 4
 _THICKNESS_NONWINNER = 2
+_THICKNESS_DETECTION = 3
 _POLYGON_THICKNESS = 2
 
 
@@ -85,6 +87,42 @@ def render_annotated_image(
     cv2.imwrite(output_path, img)
 
 
+def render_marked_tile(
+    raw_image_path: str,
+    output_path: str,
+    footprint: Optional[Dict[str, Any]],
+    centroid_lat: Optional[float],
+    centroid_lon: Optional[float],
+    detections: List[Dict[str, Any]],
+    zoom: int = 19,
+    img_width: int = 768,
+    img_height: int = 768,
+) -> None:
+    """Render the VLM-input tile: red footprint outline + a numbered box around each
+    YOLO candidate (single colour, no verdict yet). Used by the one-call verify_address
+    path so the VLM sees every candidate from both models marked on a single tile."""
+    img = cv2.imread(raw_image_path)
+    if img is None:
+        with open(raw_image_path, 'rb') as src, open(output_path, 'wb') as dst:
+            dst.write(src.read())
+        return
+    if footprint is not None:
+        _draw_footprint(
+            img, footprint['polygon'], centroid_lat, centroid_lon,
+            zoom, img_width, img_height,
+        )
+    mark = (255, 255, 0)  # cyan (BGR)
+    for idx, det in enumerate(detections, 1):
+        try:
+            x1, y1, x2, y2 = (int(round(v)) for v in det['bbox'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        cv2.rectangle(img, (x1, y1), (x2, y2), mark, 2)
+        label_y = y1 - 6 if y1 - 6 > 12 else y2 + 18
+        cv2.putText(img, str(idx), (x1 + 2, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mark, 2)
+    cv2.imwrite(output_path, img)
+
+
 def _draw_footprint(
     img: np.ndarray,
     polygon: Any,
@@ -118,30 +156,14 @@ def _draw_detections_color_coded(
     enriched_detections: List[Dict[str, Any]],
     winner: Optional[Dict[str, Any]],
 ) -> None:
-    """Draw color-coded bboxes per Fork 1 rules.
+    """Draw every YOLO detection box in the brightest green.
 
-    Precedence for each detection:
-      1. winner             → GREEN THICK (always, overrides verdict/location)
-      2. boundary location  → YELLOW (geometric ambiguity overrides verdict)
-      3. POSITIVE verdict   → GREEN THIN
-      4. NEGATIVE verdict   → GRAY THIN
-      5. AMBIGUOUS verdict  → ORANGE THIN
+    The old per-box verdict/location colour-coding (winner=thick-green, boundary=yellow,
+    positive=green, negative=gray, ambiguous=orange) is obsolete under the single-call
+    verify_address design: there is one verdict per address and no per-box winner, so a
+    box simply marks where YOLO fired. `winner` is accepted for signature compatibility
+    and ignored.
     """
     for det in enriched_detections:
         x1, y1, x2, y2 = (int(round(v)) for v in det['bbox'])
-        is_winner = (winner is not None and det is winner)
-        location = det.get('location', '')
-        verdict = det['vlm_result'].get('verdict', '')
-
-        if is_winner:
-            color, thickness = _COLOR_WINNER, _THICKNESS_WINNER
-        elif location == 'boundary':
-            color, thickness = _COLOR_BOUNDARY, _THICKNESS_NONWINNER
-        elif verdict in _POSITIVE_VERDICTS:
-            color, thickness = _COLOR_POSITIVE_NONWINNER, _THICKNESS_NONWINNER
-        elif verdict in _NEGATIVE_VERDICTS:
-            color, thickness = _COLOR_NEGATIVE, _THICKNESS_NONWINNER
-        else:
-            color, thickness = _COLOR_AMBIGUOUS, _THICKNESS_NONWINNER
-
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        cv2.rectangle(img, (x1, y1), (x2, y2), _COLOR_DETECTION, _THICKNESS_DETECTION)

@@ -17,6 +17,7 @@ from shapely.ops import transform
 
 from utils import (
     geocode_address_mapbox, geocode_with_confidence, get_satellite_image_mapbox,
+    get_satellite_image,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
@@ -25,9 +26,9 @@ from geometry import (
     extract_detections_from_yolo, ensemble_dedupe_detections, geo_dedupe_detections,
     TransientFootprintError,
 )
-from nyc_opendata import lookup_nyc_registry
-from vlm import verify_detection, verify_rooftop
-from pipeline_render import render_annotated_image
+from nyc_opendata import lookup_nyc_registry, _in_nyc
+from vlm import verify_detection, verify_rooftop, verify_address
+from pipeline_render import render_annotated_image, render_marked_tile
 from html_report import generate_html_report
 
 log = logging.getLogger("tasks")
@@ -56,6 +57,21 @@ MIN_COMMERCIAL_FOOTPRINT_SQM = 200
 # exclusion) -- safer recall at higher VLM cost.
 AREA_GATE_ENABLED = os.environ.get("AREA_GATE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# Self-correcting imagery retry: when the VLM flags the target roof as not visible
+# (image_unusable) and the verdict isn't a clear positive, re-pull the detail tile from
+# Mapbox (a different satellite capture, often more top-down on tall buildings) and re-run.
+IMAGERY_RETRY_ENABLED = os.environ.get("IMAGERY_RETRY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Zoom for the high-zoom equipment close-up fed to verify_address (the detail tile is
+# MAPBOX_ZOOM=19, too coarse to count fan blades — the close-up lets the VLM separate a
+# cooling tower from a water tank).
+CLOSEUP_ZOOM = int(os.getenv("CLOSEUP_ZOOM", "20"))
+
+# Geocoder fallback: when the primary (Google) geocode yields no footprint or an
+# ambiguous (non-containing) one, retry with the Mapbox geocode of the same address and
+# adopt it if it lands inside a building.
+GEOCODER_FALLBACK_ENABLED = os.environ.get("GEOCODER_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # YOLO ensemble models are @lru_cache-shared singletons; ultralytics .predict()
 # is not thread-safe. Serialize inference so concurrent addresses can't corrupt
 # each other's detections. YOLO is CPU-bound (effectively serial anyway); the
@@ -79,12 +95,33 @@ _VLM_TRANSIENT_MARKERS = (
 )
 
 
+# Dense urban cores where cooling towers are roof-only and off-building detections
+# are neighbor false positives. NYC is handled via nyc_opendata._in_nyc; these are
+# downtown bounding boxes (lat_min, lat_max, lon_min, lon_max) seeded from the cities
+# Mike named (Boston, SF, Chicago) and extended per-city when neighbor FPs show up.
+# Everywhere else defaults to ground-check ON (suburban DC/VA office parks etc., where
+# ground-mounted units are real). Tune boxes against the 53-row set.
+DENSE_CORE_BBOXES = [
+    ("boston",  42.340, 42.366, -71.110, -71.045),
+    ("chicago", 41.855, 41.910, -87.660, -87.605),
+    ("sf",      37.765, 37.815, -122.435, -122.390),
+]
+
+
+def _in_dense_core(lat: float, lon: float) -> bool:
+    """True if the point is in a curated dense downtown core (suppress ground/neighbor
+    detection). NYC is checked separately via nyc_opendata._in_nyc."""
+    return any(la0 <= lat <= la1 and lo0 <= lon <= lo1
+               for _, la0, la1, lo0, lo1 in DENSE_CORE_BBOXES)
+
+
 def _detect_on_tile(
     tile_path: str,
     tile_zoom: int,
     footprint: Dict[str, Any],
     centroid_lat: float,
     centroid_lon: float,
+    keep_outside: bool = None,
 ) -> List[Dict[str, Any]]:
     """Run the YOLO ensemble on one tile, classify against the footprint, and
     return kept detections tagged with tile provenance.
@@ -112,7 +149,7 @@ def _detect_on_tile(
     classified = classify_detections(
         deduped, footprint, centroid_lat, centroid_lon, tile_zoom, 768, 768
     )
-    kept, _rejected = filter_detections(classified)
+    kept, _rejected = filter_detections(classified, keep_outside=keep_outside)
     for d in kept:
         d['tile_zoom'] = tile_zoom
         d['tile_path'] = tile_path
@@ -173,13 +210,22 @@ def _build_notes(row_state: Dict[str, Any]) -> str:
     if verdict == 'registry_confirmed':
         return row_state.get('registry_citation', 'Confirmed via NYC OpenData registry')
     if verdict == 'footprint_missing':
-        return "No OSM footprint found, manual verification needed"
+        both = " (Google + Mapbox geocoders both tried)" if row_state.get('geocoder_retried') else ""
+        return f"No OSM footprint found, manual verification needed{both}"
     if verdict == 'likely_residential':
         return (f"Footprint below commercial size floor ({MIN_COMMERCIAL_FOOTPRINT_SQM} sq m) "
                 "- likely residential; manual verification recommended")
     if verdict == 'ambiguous_footprint':
+        edge = row_state.get('edge_distance_m')
+        src = row_state.get('footprint_source')
+        both = " Google + Mapbox geocoders both tried." if row_state.get('geocoder_retried') else ""
+        if edge is not None:
+            return (f"Geocoded point falls {edge:.0f} m outside the nearest building footprint "
+                    f"(source: {src}; OSM + planimetric/Microsoft fallback checked).{both} No dataset "
+                    f"places the address inside a building - likely an UPSTREAM geocode/footprint "
+                    f"alignment issue rather than a missing rooftop. Manual verification recommended.")
         return ("Geocoded point falls outside any building footprint "
-                "(nearest-match area unreliable); manual verification recommended")
+                f"(nearest-match area unreliable); manual verification recommended.{both}")
     if row_state.get('geocode_failed'):
         return "Address could not be geocoded"
     if row_state.get('imagery_failed'):
@@ -224,6 +270,15 @@ def _centroid_latlon(footprint: Dict[str, Any]) -> Tuple[float, float]:
         polygon = max(polygon.geoms, key=lambda p: p.area)
     centroid = polygon.centroid
     return (centroid.y, centroid.x)
+
+
+def _closeup_center(dets, fallback_lat, fallback_lon):
+    """Center for the high-zoom equipment close-up: the strongest YOLO detection's
+    location, else the footprint centroid (when YOLO found nothing)."""
+    cands = [d for d in dets if d.get('det_latlon')]
+    if cands:
+        return max(cands, key=lambda d: d.get('confidence', 0.0))['det_latlon']
+    return fallback_lat, fallback_lon
 
 
 def _footprint_area_m2(footprint: Dict[str, Any]) -> float:
@@ -473,6 +528,27 @@ def _process_one_address_core(
     log.info(f"Row {i+1}/{total}: Looking up OSM building footprint")
     footprint = get_building_footprint(geo_lat, geo_lon)
 
+    # Geocoder fallback: if the Google geocode led to NO footprint or a non-containing
+    # (ambiguous) one, try the Mapbox geocode of the same address — it often resolves to
+    # a different point that DOES sit inside a building. Adopt it only when it lands
+    # inside a footprint. geocoder_retried records that both geocoders were tried (for
+    # the reviewer-facing notes). TransientFootprintError still propagates for re-queue.
+    geocoder_retried = False
+    if GEOCODER_FALLBACK_ENABLED and (footprint is None or not footprint.get('contains_point')):
+        try:
+            mb_point = geocode_address_mapbox(full_address)
+        except Exception:
+            mb_point = None
+        if mb_point and (abs(mb_point[0] - geo_lat) > 1e-6 or abs(mb_point[1] - geo_lon) > 1e-6):
+            geocoder_retried = True
+            mb_fp = get_building_footprint(mb_point[0], mb_point[1])
+            if mb_fp is not None and mb_fp.get('contains_point'):
+                log.info(f"Row {i+1}/{total}: Google geocode gave "
+                         f"{'no footprint' if footprint is None else 'an ambiguous footprint'}; "
+                         f"Mapbox geocode lands inside a building — adopting it")
+                geo_lat, geo_lon = mb_point
+                footprint = mb_fp
+
     clean_addr = re.sub(r'[\\/*?:"<>| ,]', '_', str(row['Address'])[:50])
     original_local = os.path.join(
         tempfile.gettempdir(),
@@ -492,7 +568,7 @@ def _process_one_address_core(
     # ====================================================================
     if footprint is None:
         log.info(f"Row {i+1}/{total}: No OSM footprint found, recording footprint_missing")
-        ok = get_satellite_image_mapbox(geo_lat, geo_lon, original_local)
+        ok = get_satellite_image(geo_lat, geo_lon, original_local)
         if not ok:
             log.warning(f"Row {i+1}/{total}: Footprint missing AND imagery failed")
             notes = _build_notes({'imagery_failed': True})
@@ -527,7 +603,7 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
-        notes = _build_notes({'verdict': 'footprint_missing'})
+        notes = _build_notes({'verdict': 'footprint_missing', 'geocoder_retried': geocoder_retried})
         web_entry = _build_web_entry(
             full_address=full_address,
             verdict='footprint_missing',
@@ -570,7 +646,12 @@ def _process_one_address_core(
     if AREA_GATE_ENABLED and not footprint.get('contains_point'):
         log.info(f"Row {i+1}/{total}: Footprint is a nearest-building fallback "
                  f"(contains_point=False); routing to review as ambiguous_footprint")
-        notes = _build_notes({'verdict': 'ambiguous_footprint'})
+        notes = _build_notes({
+            'verdict': 'ambiguous_footprint',
+            'edge_distance_m': footprint.get('edge_distance_m'),
+            'footprint_source': footprint.get('source'),
+            'geocoder_retried': geocoder_retried,
+        })
         return (
             _build_web_entry(
                 full_address=full_address, verdict='ambiguous_footprint',
@@ -603,7 +684,7 @@ def _process_one_address_core(
         )
 
     log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image")
-    ok = get_satellite_image_mapbox(centroid_lat, centroid_lon, original_local)
+    ok = get_satellite_image(centroid_lat, centroid_lon, original_local)
     if not ok:
         log.warning(f"Row {i+1}/{total}: Image download failed")
         notes = _build_notes({'imagery_failed': True})
@@ -688,20 +769,33 @@ def _process_one_address_core(
 
         return web_entry, csv_row
 
-    # Fetch the wider tile (ground-mounted CTs / parcel context).
-    wide_local = os.path.join(
-        tempfile.gettempdir(),
-        f"{job_id}_{i}_{clean_addr}_wide.jpg",
-    )
-    log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
-    if not get_satellite_image_mapbox(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
-        log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
-        wide_local = None
+    # Dense-urban gate: in dense cores (NYC + curated downtowns) cooling towers are
+    # roof-only and off-building detections are neighbor false positives — suppress the
+    # wide (ground) tile and the outside-footprint passthrough. Everywhere else (suburban
+    # DC/VA office parks etc.) keep both: ground-mounted units are real there.
+    dense = _in_nyc(centroid_lat, centroid_lon) or _in_dense_core(centroid_lat, centroid_lon)
+    keep_outside = False if dense else None  # None = honor YOLO_KEEP_OUTSIDE env
 
-    log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF} on both zooms")
-    detail_kept = _detect_on_tile(original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon)
+    if dense:
+        log.info(f"Row {i+1}/{total}: dense urban core — roof-only scan (no wide tile, drop off-building detections)")
+        wide_local = None
+    else:
+        # Fetch the wider tile (ground-mounted CTs / parcel context).
+        wide_local = os.path.join(
+            tempfile.gettempdir(),
+            f"{job_id}_{i}_{clean_addr}_wide.jpg",
+        )
+        log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
+        if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
+            log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
+            wide_local = None
+
+    log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF}"
+             + (" (dense: roof-only)" if dense else " on both zooms"))
+    detail_kept = _detect_on_tile(
+        original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
     wide_kept = (
-        _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon)
+        _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
         if wide_local else []
     )
     merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
@@ -721,56 +815,84 @@ def _process_one_address_core(
         },
     }
 
-    enriched: List[Dict[str, Any]] = []
-    winner: Optional[Dict[str, Any]] = None
-    if merged:
-        log.info(
-            f"Row {i+1}/{total}: {len(merged)} kept detection(s) across zooms; "
-            f"running verify_detection per candidate"
-        )
-        for det in merged:
-            det_tile = det['tile_path']
-            det_zoom = det['tile_zoom']
-            # Context = the opposite-zoom tile of the same target (if available).
-            if det_tile == original_local and wide_local:
-                context_path, context_zoom = wide_local, MAPBOX_ZOOM_WIDE
-            elif det_tile == wide_local:
-                context_path, context_zoom = original_local, MAPBOX_ZOOM
-            else:
-                context_path, context_zoom = None, None
-            det_ctx = {
-                **base_ctx,
-                "detection_location": det.get('location', 'unknown'),
-                "tile_zoom": det_zoom,
-                "context_zoom": context_zoom,
-            }
-            vlm_result = verify_detection(
-                det_tile, det['bbox'], det_ctx, context_image_path=context_path
-            )
-            enriched.append({**det, 'vlm_result': vlm_result})
-        winner = _pick_winner(enriched)
-        consensus_dict = winner['vlm_result']
-        rooftop_path = False
-        detection_count = len(merged)
-        winner_is_boundary = (winner.get('location') == 'boundary')
-        render_tile, render_zoom = winner['tile_path'], winner['tile_zoom']
-    else:
-        # Rooftop scan: lead with the wide tile (ground CTs are the concern),
-        # passing the detail tile as cross-zoom context.
-        log.info(f"Row {i+1}/{total}: No kept detections; running verify_rooftop")
-        scan_path = wide_local or original_local
-        scan_zoom = MAPBOX_ZOOM_WIDE if wide_local else MAPBOX_ZOOM
-        context_path = original_local if wide_local else None
-        rooftop_ctx = {
-            **base_ctx,
-            "tile_zoom": scan_zoom,
-            "context_zoom": MAPBOX_ZOOM if wide_local else None,
-        }
-        consensus_dict = verify_rooftop(scan_path, rooftop_ctx, context_image_path=context_path)
-        rooftop_path = True
-        detection_count = 0
-        winner_is_boundary = False
-        render_tile, render_zoom = scan_path, scan_zoom
+    # Single VLM pass per address (was: one dual-VLM call per box). Mark the tile(s)
+    # with the red footprint + numbered YOLO boxes from both models and ask ONE
+    # consensus question — verify the boxes AND scan for anything YOLO missed. The
+    # detail tile is always sent; the wide tile only when one was fetched (sparse rows).
+    detail_dets = [d for d in merged if d.get('tile_path') == original_local]
+    wide_dets = [d for d in merged if d.get('tile_path') == wide_local] if wide_local else []
+    detection_count = len(merged)
+
+    marked_detail = os.path.join(
+        tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked.jpg")
+    render_marked_tile(original_local, marked_detail, footprint,
+                       centroid_lat, centroid_lon, detail_dets, zoom=MAPBOX_ZOOM)
+    marked_wide = None
+    if wide_local:
+        marked_wide = os.path.join(
+            tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked_wide.jpg")
+        render_marked_tile(wide_local, marked_wide, footprint,
+                           centroid_lat, centroid_lon, wide_dets, zoom=MAPBOX_ZOOM_WIDE)
+
+    addr_ctx = {
+        **base_ctx,
+        "tile_zoom": MAPBOX_ZOOM,
+        "context_zoom": MAPBOX_ZOOM_WIDE if marked_wide else None,
+    }
+    # High-zoom close-up of the strongest candidate (or roof center) so the VLM can make
+    # the fan-blade / water-tank identity call it can't make at the coarse detail zoom.
+    cu_lat, cu_lon = _closeup_center(merged, centroid_lat, centroid_lon)
+    closeup_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_closeup.jpg")
+    if not get_satellite_image(cu_lat, cu_lon, closeup_local, zoom=CLOSEUP_ZOOM):
+        closeup_local = None
+    log.info(
+        f"Row {i+1}/{total}: {detection_count} candidate box(es); "
+        f"running single verify_address pass"
+    )
+    consensus_dict = verify_address(
+        marked_detail, addr_ctx, n_boxes=detection_count,
+        context_image_path=marked_wide, closeup_image_path=closeup_local,
+    )
+    rooftop_path = (detection_count == 0)
+    winner_is_boundary = False
+    # For the audit render, tag every box with the single consensus verdict so the
+    # output tiles colour-code consistently (no per-box winner in the 1-call design).
+    enriched = [{**det, 'vlm_result': consensus_dict} for det in merged]
+    winner = None
+
+    # Self-correcting imagery retry: if the VLM couldn't see the target's roof (e.g. a
+    # supertall leaning in Google's oblique capture) and the verdict isn't a clear
+    # positive, re-fetch the detail tile from Mapbox (a different satellite capture,
+    # often more top-down) and re-run YOLO + verify_address once. Adopt if it resolves.
+    render_src, render_wide = original_local, wide_local
+    retry_detail = retry_marked = retry_closeup = None
+    imagery_retried = False
+    if (IMAGERY_RETRY_ENABLED and consensus_dict.get('image_unusable')
+            and consensus_dict.get('verdict') not in _POSITIVE_VERDICTS):
+        log.info(f"Row {i+1}/{total}: VLM flagged image unusable; retrying with Mapbox imagery")
+        retry_detail = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry.jpg")
+        if get_satellite_image_mapbox(centroid_lat, centroid_lon, retry_detail, zoom=MAPBOX_ZOOM):
+            retry_dets = _detect_on_tile(retry_detail, MAPBOX_ZOOM, footprint,
+                                         centroid_lat, centroid_lon, keep_outside=keep_outside)
+            retry_marked = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry_marked.jpg")
+            render_marked_tile(retry_detail, retry_marked, footprint,
+                               centroid_lat, centroid_lon, retry_dets, zoom=MAPBOX_ZOOM)
+            retry_ctx = {**base_ctx, "tile_zoom": MAPBOX_ZOOM, "context_zoom": None}
+            rcu_lat, rcu_lon = _closeup_center(retry_dets, centroid_lat, centroid_lon)
+            retry_closeup = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry_closeup.jpg")
+            if not get_satellite_image_mapbox(rcu_lat, rcu_lon, retry_closeup, zoom=CLOSEUP_ZOOM):
+                retry_closeup = None
+            retry_result = verify_address(
+                retry_marked, retry_ctx, n_boxes=len(retry_dets),
+                context_image_path=None, closeup_image_path=retry_closeup)
+            if not retry_result.get('image_unusable'):
+                log.info(f"Row {i+1}/{total}: Mapbox retry usable (verdict={retry_result.get('verdict')})")
+                consensus_dict = retry_result
+                detection_count = len(retry_dets)
+                rooftop_path = (detection_count == 0)
+                enriched = [{**d, 'vlm_result': consensus_dict} for d in retry_dets]
+                render_src, render_wide = retry_detail, None
+                imagery_retried = True
 
     # Render BOTH tiles so manual review always has a clear close-up plus context.
     def _render_tile(tile_path, tile_zoom, out_path):
@@ -792,8 +914,8 @@ def _process_one_address_core(
         upload_file(out_path, blob)
         return make_signed_url(blob)
 
-    result_url = _render_tile(original_local, MAPBOX_ZOOM, annotated_local)
-    result_url_wide = _render_tile(wide_local, MAPBOX_ZOOM_WIDE, annotated_wide_local)
+    result_url = _render_tile(render_src, MAPBOX_ZOOM, annotated_local)
+    result_url_wide = _render_tile(render_wide, MAPBOX_ZOOM_WIDE, annotated_wide_local)
 
     # Construction → needs_review: active construction means the Mapbox tile may
     # predate the current building state, so the cooling-tower call isn't reliable.
@@ -816,6 +938,14 @@ def _process_one_address_core(
         'construction_review': construction_review,
     }
     notes = _build_notes(row_state)
+    if geocoder_retried:
+        notes = (f"[GEOCODER FALLBACK: Google geocode was missing/ambiguous; re-geocoded with "
+                 f"Mapbox, which landed inside a building] {notes}").strip()
+    if imagery_retried:
+        # Surface model-triggered fallbacks for the reviewer: the VLM flagged the primary
+        # (Google) tile as unusable, so this address was re-analyzed on Mapbox imagery.
+        notes = (f"[IMAGERY RETRY: VLM flagged the Google tile unusable (e.g. tall building "
+                 f"shown at an oblique angle); re-analyzed on Mapbox imagery] {notes}").strip()
 
     web_entry = _build_web_entry(
         full_address=full_address,
@@ -839,7 +969,9 @@ def _process_one_address_core(
         result_url=result_url,
     )
 
-    for p in (original_local, wide_local, annotated_local, annotated_wide_local):
+    for p in (original_local, wide_local, annotated_local, annotated_wide_local,
+              marked_detail, marked_wide, retry_detail, retry_marked,
+              closeup_local, retry_closeup):
         try:
             if p and os.path.exists(p):
                 os.remove(p)

@@ -22,6 +22,18 @@ from shapely.ops import nearest_points
 
 log = logging.getLogger(__name__)
 
+# Optional secondary footprint sources (Phase 2 fallback chain). Guarded so a missing
+# module can never break the OSM-only path.
+try:
+    from nyc_opendata import _in_nyc, planimetric_footprint
+except Exception:  # pragma: no cover
+    _in_nyc = None
+    planimetric_footprint = None
+try:
+    from ms_footprints import ms_building_footprint
+except Exception:  # pragma: no cover
+    ms_building_footprint = None
+
 # Overpass API endpoints (public, no API key needed). The primary is tried
 # first; fallback mirrors are used only when the primary is unreachable (the
 # whole overpass-api.de cluster went down 2026-06-09). Override the primary with
@@ -37,6 +49,19 @@ OVERPASS_TIMEOUT = int(os.getenv("OVERPASS_TIMEOUT", "15"))
 
 # Search radius in meters for building footprint lookup
 FOOTPRINT_SEARCH_RADIUS = int(os.getenv("FOOTPRINT_SEARCH_RADIUS", "50"))
+
+# Tolerance for the contains-point test. A geocoded point this many metres or less
+# OUTSIDE a building's footprint edge is treated as inside that building. Geocoders,
+# OSM polygons, and imagery each carry several metres of independent error, so a hard
+# in/out line at this scale randomly flips correct points (a ROOFTOP geocode landing
+# 1-3 m past the right building's edge was bouncing confirmed towers to the area gate).
+# Genuine nearest-fallbacks to the WRONG building sit ~14-34 m away and stay flagged.
+GATE_TOLERANCE_M = float(os.getenv("GATE_TOLERANCE_M", "6.0"))
+
+# Footprint fallback chain (Phase 2): when OSM has no polygon at the point (or only a
+# far nearest-fallback), try NYC planimetric (NYC) / Microsoft footprints (elsewhere).
+FOOTPRINT_FALLBACK_ENABLED = os.getenv(
+    "FOOTPRINT_FALLBACK_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 
 # Rate limiting for Overpass (be respectful to public API)
 _overpass_lock = threading.Lock()
@@ -182,6 +207,61 @@ def latlon_to_pixel(
 # Building footprint lookup via Overpass API
 # -------------------------------------------------------------------------
 
+def _classify_containment(polygon, lat, lon):
+    """Classify a candidate footprint relative to the geocoded point. Returns
+    (contains_point, containment, edge_distance_m). A point within GATE_TOLERANCE_M of
+    the polygon edge is treated as contained (geocoders + footprints carry a few metres
+    of independent error; a hard in/out line at that scale randomly flips correct
+    points). Shared by the OSM nearest path and the secondary-source builder."""
+    target = Point(lon, lat)
+    if polygon.contains(target):
+        return True, 'strict', 0.0
+    edge_pt = nearest_points(polygon, target)[0]
+    edge_m = _haversine_m(lat, lon, edge_pt.y, edge_pt.x)
+    edge_r = round(edge_m, 1)
+    if edge_m <= GATE_TOLERANCE_M:
+        return True, 'within_tolerance', edge_r
+    return False, 'nearest_fallback', edge_r
+
+
+def _secondary_footprint(lat, lon):
+    """Footprint fallback when OSM has no usable polygon: NYC planimetric inside the
+    NYC bbox, Microsoft Building Footprints elsewhere (or on a planimetric miss).
+    Returns an OSM-shaped 9-key footprint dict or None. Best-effort — the underlying
+    source functions swallow their own errors. A planimetric footprint carries its BIN
+    in tags so registry-first can confirm a gap building OSM never had."""
+    poly = None
+    source = osm_type = osm_id = None
+    tags = {}
+    if _in_nyc and planimetric_footprint and _in_nyc(lat, lon):
+        res = planimetric_footprint(lat, lon)
+        if res:
+            poly, bin_, _status = res
+            source, osm_type = 'nyc_planimetric', 'planimetric'
+            tags = {'nycdoitt:bin': bin_} if bin_ else {}
+            osm_id = bin_ or None
+    if poly is None and ms_building_footprint:
+        ms_poly = ms_building_footprint(lat, lon)
+        if ms_poly is not None:
+            poly, source, osm_type = ms_poly, 'ms_buildings', 'ms'
+            tags = {}
+            osm_id = f"ms_{lat:.6f}_{lon:.6f}"
+    if poly is None:
+        return None
+    contains_point, containment, edge_m = _classify_containment(poly, lat, lon)
+    return {
+        'polygon': poly,
+        'source': source,
+        'osm_id': osm_id,
+        'osm_type': osm_type,
+        'tags': tags,
+        'contains_point': contains_point,
+        'containment': containment,
+        'edge_distance_m': edge_m,
+        'nearby_building_count': 1,
+    }
+
+
 def get_building_footprint(
     lat: float, lon: float,
     search_radius: int = None
@@ -277,6 +357,9 @@ def get_building_footprint(
                 'osm_type': element.get('type'),
                 'tags': element.get('tags', {}),
                 'contains_point': True,
+                'containment': 'strict',
+                'edge_distance_m': 0.0,
+                'nearby_building_count': len(elements),
             }
             log.info(f"Building {element.get('id')} contains target point")
             break  # Exact match, no need to keep looking
@@ -292,17 +375,50 @@ def get_building_footprint(
                 'osm_type': element.get('type'),
                 'tags': element.get('tags', {}),
                 'contains_point': False,
+                'nearby_building_count': len(elements),
             }
 
+    osm_result = None
     if contains_match:
-        return contains_match
+        osm_result = contains_match
+    elif best_building:
+        # Binary contains() is too brittle at a 1-3 m scale; classify by true metric
+        # edge distance and treat a near-miss as contained (within GATE_TOLERANCE_M).
+        contains_point, containment, edge_m = _classify_containment(
+            best_building['polygon'], lat, lon)
+        best_building['contains_point'] = contains_point
+        best_building['containment'] = containment
+        best_building['edge_distance_m'] = edge_m
+        if containment == 'within_tolerance':
+            log.info(f"Point {edge_m:.1f}m outside OSM {best_building['osm_id']} "
+                     f"(<= {GATE_TOLERANCE_M}m tolerance); treating as contained")
+        else:
+            log.info(f"No building contains point; using nearest "
+                     f"(OSM ID {best_building['osm_id']}, {edge_m:.1f}m away)")
+        osm_result = best_building
 
-    if best_building:
-        log.info(f"No building contains point; using nearest "
-                 f"(OSM ID {best_building['osm_id']}, distance: {best_distance:.6f}°)")
-        return best_building
+    # Footprint fallback chain: when OSM has no polygon, or only a far nearest-fallback,
+    # try the secondary sources (NYC planimetric / Microsoft). Best-effort; never raises
+    # out, never overrides a usable OSM hit. (TransientFootprintError already propagated
+    # above — this is only reached after a successful OSM response was parsed.)
+    need_secondary = FOOTPRINT_FALLBACK_ENABLED and (
+        osm_result is None or osm_result.get('containment') == 'nearest_fallback'
+    )
+    if need_secondary:
+        try:
+            sec = _secondary_footprint(lat, lon)
+        except Exception as e:
+            log.warning(f"Secondary footprint chain failed at ({lat:.6f},{lon:.6f}): {e}")
+            sec = None
+        # When OSM found nothing, accept even a secondary nearest-fallback (beats
+        # footprint_missing). When OSM had a nearest-fallback, only override if the
+        # secondary actually contains the point (don't swap one far building for another).
+        if sec is not None and (osm_result is None or sec.get('contains_point')):
+            log.info(f"Footprint fallback: using {sec['source']} "
+                     f"(containment={sec['containment']}) at ({lat:.6f},{lon:.6f})")
+            return sec
 
-    return None
+    return osm_result
 
 
 def _osm_element_to_polygon(element: Dict) -> Optional[Polygon]:
@@ -495,7 +611,8 @@ def classify_detections(
 
 def filter_detections(
     classified: List[Dict[str, Any]],
-    keep_boundary: bool = True
+    keep_boundary: bool = True,
+    keep_outside: bool = None
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Split classified detections into kept (on-building) and rejected (off-building).
@@ -514,7 +631,10 @@ def filter_detections(
     """
     kept = []
     rejected = []
-    keep_outside = os.getenv("YOLO_KEEP_OUTSIDE", "true").lower() == "true"
+    # None = honor the global env default; an explicit bool (e.g. dense-urban roof-only
+    # mode passing False) overrides per-address.
+    if keep_outside is None:
+        keep_outside = os.getenv("YOLO_KEEP_OUTSIDE", "true").lower() == "true"
 
     for det in classified:
         loc = det['location']
