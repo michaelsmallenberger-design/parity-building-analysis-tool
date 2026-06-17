@@ -95,16 +95,34 @@ _VLM_TRANSIENT_MARKERS = (
 )
 
 
-# Dense urban cores where cooling towers are roof-only and off-building detections
-# are neighbor false positives. NYC is handled via nyc_opendata._in_nyc; these are
-# downtown bounding boxes (lat_min, lat_max, lon_min, lon_max) seeded from the cities
-# Mike named (Boston, SF, Chicago) and extended per-city when neighbor FPs show up.
-# Everywhere else defaults to ground-check ON (suburban DC/VA office parks etc., where
-# ground-mounted units are real). Tune boxes against the 53-row set.
+# Dense urban cores where cooling towers are roof-only and off-building detections are
+# neighbor false positives. NYC is handled via nyc_opendata._in_nyc; these are TIGHT
+# high-rise CBD boxes (name, lat_min, lat_max, lon_min, lon_max). Kept tight on purpose:
+# outside the downtown core ground-mounted units are real, so a too-wide box would wrongly
+# suppress the ground scan. An automatic OSM density signal was tested and rejected —
+# suburban office parks (Herndon, Santa Clara) overlap downtowns in built-up ratio, and
+# height-limited downtowns (DC) score low — so this stays a hand-maintained list of
+# genuinely dense high-rise downtowns. Extend per city; everywhere else = ground-check ON.
 DENSE_CORE_BBOXES = [
-    ("boston",  42.340, 42.366, -71.110, -71.045),
-    ("chicago", 41.855, 41.910, -87.660, -87.605),
-    ("sf",      37.765, 37.815, -122.435, -122.390),
+    ("boston",        42.340, 42.366, -71.110, -71.045),
+    ("chicago",       41.855, 41.910, -87.660, -87.605),
+    ("sf",            37.765, 37.815, -122.435, -122.390),
+    ("los_angeles",   34.036, 34.064, -118.272, -118.232),
+    ("washington_dc", 38.888, 38.912, -77.052, -77.012),
+    ("philadelphia",  39.942, 39.964, -75.176, -75.148),
+    ("seattle",       47.594, 47.622, -122.348, -122.318),
+    ("houston",       29.745, 29.770, -95.382, -95.352),
+    ("miami",         25.758, 25.798, -80.205, -80.178),
+    ("atlanta",       33.746, 33.792, -84.398, -84.376),
+    ("dallas",        32.770, 32.794, -96.812, -96.785),
+    ("denver",        39.733, 39.758, -105.005, -104.975),
+    ("minneapolis",   44.963, 44.990, -93.285, -93.255),
+    ("pittsburgh",    40.432, 40.452, -80.010, -79.986),
+    ("baltimore",     39.280, 39.300, -76.628, -76.600),
+    ("detroit",       42.320, 42.340, -83.060, -83.035),
+    ("portland_or",   45.505, 45.530, -122.690, -122.665),
+    ("austin",        30.258, 30.280, -97.750, -97.728),
+    ("charlotte",     35.216, 35.238, -80.855, -80.832),
 ]
 
 

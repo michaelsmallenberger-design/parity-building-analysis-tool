@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A building analysis tool that uses YOLO computer vision plus dual-VLM verification to detect cooling towers on rooftops from satellite imagery. Users upload a CSV of addresses; the system geocodes them, fetches centroid-centered satellite tiles via Mapbox, runs YOLO inference, filters detections against OSM building footprints, and verifies surviving candidates with Gemini 3.1 Pro + Grok 4.3 in parallel.
+A building analysis tool that uses YOLO computer vision plus dual-VLM verification to detect cooling towers on rooftops from satellite imagery. Users upload a CSV of addresses; the system geocodes them (Google Maps, Mapbox fallback), fetches centroid-centered satellite tiles (Google Static Maps; Mapbox in dense urban cores), runs a YOLO ensemble, filters detections against OSM building footprints (with NYC-planimetric / Microsoft fallbacks), and verifies each address with one dual-VLM pass (Gemini + Grok) in parallel.
 
 **Deployment:** Railway.app (migrated from Google Cloud Run)
 **Usage:** Low-traffic internal tool (~1000 requests/month)
-**Phase:** Phase 3 shipped 2026-05-21 (commit 75af037); Phase 4 doc/UX backlog pending.
+**Phase:** Phase 3 shipped 2026-05-21 (commit 75af037). Phase 4 (branch `piece4-concurrency`, pending merge to main): Google geocoding + imagery (dense cores use Mapbox via the `DENSE_CORE_BBOXES`/`_in_nyc` gate), one-call dual-VLM `verify_address` (replaces per-box `verify_detection`/`verify_rooftop`), OSM→NYC-planimetric→Microsoft footprint fallback chain, and a dense-urban roof-only gate. **New required env var: `GOOGLE_MAPS_API_KEY`.**
 
 ## Development Commands
 
@@ -146,9 +146,10 @@ def _get_model():
 ## Critical Configuration
 
 ### Environment Variables (Required)
-- `MAPBOX_API_KEY` — Mapbox geocoding + Static Images API token
-- `GEMINI_API_KEY` — Google AI Studio API key for Gemini 3.1 Pro verification
-- `XAI_API_KEY` — xAI API key for Grok 4.3 verification
+- `GOOGLE_MAPS_API_KEY` — Google geocoding + Static Maps imagery + Address Validation. Required by default since `GEOCODER_PROVIDER` and `IMAGERY_PROVIDER` default to `google`. (Set both to `mapbox` to run the legacy path without this key.)
+- `MAPBOX_API_KEY` — Mapbox geocoding (fallback) + Static Images (used for dense-urban-core imagery and the image_unusable retry)
+- `GEMINI_API_KEY` — Google AI Studio API key for Gemini verification (model via `GEMINI_MODEL`, default `gemini-3.5-flash`)
+- `XAI_API_KEY` — xAI API key for Grok verification (model via `GROK_MODEL`, default `grok-4.3`)
 
 ### Environment Variables (Optional)
 
