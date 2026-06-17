@@ -29,7 +29,7 @@ from typing import Any, Dict
 
 import requests
 from geopy.distance import distance as geopy_distance
-from shapely.geometry import shape
+from shapely.geometry import Point, shape
 
 log = logging.getLogger("nyc_opendata")
 
@@ -119,6 +119,59 @@ def _query_planimetric(lat: float, lon: float) -> list:
             row["_distance_m"] = d_m
             out.append(row)
     return out
+
+
+def planimetric_footprint(lat, lon):
+    """Building-footprint fallback from the NYC planimetric building layer (x748-37q7).
+
+    Used by geometry.get_building_footprint when OSM has no polygon at the point.
+    Returns (shapely_polygon, bin, status) for the building whose footprint CONTAINS
+    the point (else the nearest within the query radius), or None. The bin is
+    canonicalized so the caller can place it in footprint tags and let registry-first
+    confirm the building. Keyless/best-effort: any failure degrades to None.
+
+    Queries the_geom directly with real point-in-polygon. It does NOT reuse
+    _query_planimetric, whose centroid-distance post-filter (built for cooling-tower
+    point matching) wrongly drops a large building whose centroid is >50 m from the
+    point even though the point is inside the footprint.
+    """
+    try:
+        resp = requests.get(
+            PLANIMETRIC_ENDPOINT,
+            params={"$where": f"within_circle(the_geom, {lat}, {lon}, 100)", "$limit": 50},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as e:
+        log.warning(f"Planimetric footprint query failed at ({lat:.6f},{lon:.6f}): {e}")
+        return None
+    if not rows:
+        return None
+
+    pt = Point(lon, lat)
+    contains = nearest = None
+    nearest_d = float("inf")
+    for row in rows:
+        geom = row.get("the_geom")
+        if not geom:
+            continue
+        try:
+            poly = shape(geom)
+        except Exception:
+            continue
+        if poly.contains(pt):
+            contains = (poly, row)
+            break
+        d = poly.distance(pt)
+        if d < nearest_d:
+            nearest_d, nearest = d, (poly, row)
+
+    pick = contains or nearest
+    if pick is None:
+        return None
+    poly, row = pick
+    return poly, _canonical_bin(row.get("bin")), (row.get("status") or "unknown")
 
 
 def lookup_nyc_registry(lat: float, lon: float, footprint: Dict[str, Any]) -> Dict[str, Any]:

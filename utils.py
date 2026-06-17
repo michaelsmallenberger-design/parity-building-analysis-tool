@@ -8,11 +8,15 @@ import math
 from typing import Optional, Tuple, List
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 from functools import lru_cache
 from geopy.geocoders import Nominatim
 
 MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")  # geocoding + Static Maps imagery
+# Google bakes a logo (bottom-left) + "©... Maxar" credit (bottom-right) into Static Maps
+# tiles; YOLO detects that text as equipment. Mask the bottom strip this many px (0=off).
+GOOGLE_WATERMARK_PX = int(os.getenv("GOOGLE_WATERMARK_PX", "40"))
 
 # YOLO model path (can override with env)
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("models", "rooftop_model.pt"))
@@ -210,16 +214,28 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 6371000 * 2 * math.asin(math.sqrt(h))
 
 
+def _active_geocode(query: str) -> Optional[Tuple[float, float]]:
+    """Return (lat, lon) from the geocoder selected by GEOCODER_PROVIDER.
+    Default 'mapbox' = the existing production path (unchanged). Set
+    GEOCODER_PROVIDER=google to feed Google's point into the pipeline instead;
+    everything downstream (tiles, YOLO, VLM) is identical either way."""
+    provider = os.getenv("GEOCODER_PROVIDER", "google").strip().lower()
+    if provider == "mapbox":
+        return geocode_address_mapbox(query)
+    return geocode_address_google(query)
+
+
 def geocode_with_confidence(query: str):
     """Geocode + a free agreement-based trust flag.
 
-    Returns (lat, lon, confidence, divergence_m). lat/lon are the pipeline's
-    existing Mapbox-tiered point -- UNCHANGED, so tile centering is identical.
+    Returns (lat, lon, confidence, divergence_m). lat/lon come from the geocoder
+    selected by GEOCODER_PROVIDER (default Mapbox; 'google' to A/B the geocoder),
+    so tile centering and everything downstream are identical regardless.
     An independent Nominatim geocode corroborates it: agreement within
     GEOCODE_DIVERGENCE_THRESHOLD_M -> 'high'; beyond it (or no Nominatim match)
     -> 'low'. confidence is None when geocoding fails or the check is disabled.
     """
-    coords = geocode_address_mapbox(query)
+    coords = _active_geocode(query)
     if not coords:
         return None, None, None, None
     lat, lon = coords
@@ -299,6 +315,29 @@ def geocode_address_mapbox(query: str) -> Optional[Tuple[float, float]]:
     return None
 
 
+def geocode_address_google(query: str) -> Optional[Tuple[float, float]]:
+    """Geocode via the Google Maps Geocoding API. Drop-in for
+    geocode_address_mapbox: returns (lat, lon) or None. Selected by
+    GEOCODER_PROVIDER=google. Requires GOOGLE_MAPS_API_KEY in env."""
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot geocode via Google")
+        return None
+    data = _http_get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        {"address": query, "key": GOOGLE_MAPS_API_KEY},
+    )
+    if data and data.get("status") == "OK" and data.get("results"):
+        g = data["results"][0]
+        loc = g["geometry"]["location"]
+        lat, lon = loc["lat"], loc["lng"]
+        log.info("Google geocoded '%s' -> (%.6f, %.6f) [location_type=%s]",
+                 query, lat, lon, g["geometry"].get("location_type"))
+        return (lat, lon)
+    status = (data or {}).get("status", "no-response")
+    log.warning("Google geocode returned no usable result for '%s' (status=%s)", query, status)
+    return None
+
+
 # -------------------------------------------------------------------------
 # Satellite image fetch (Mapbox Static Images)
 # -------------------------------------------------------------------------
@@ -348,6 +387,59 @@ def get_satellite_image_mapbox(lat: float, lon: float, out_path: str, zoom: int 
     except Exception as e:
         log.error("Satellite image fetch failed: %s", e)
         return False
+
+
+def get_satellite_image_google(lat: float, lon: float, out_path: str, zoom: int = None) -> bool:
+    """Google Static Maps satellite tile — drop-in for get_satellite_image_mapbox.
+    size=(MAPBOX_SIZE/2) scale=2 zoom=(zoom-1) reproduces the Mapbox 768@zoom tile's
+    exact ground coverage + metres/pixel, so the hardcoded 768px geometry math and
+    tile_zoom downstream stay valid. Selected by IMAGERY_PROVIDER=google.
+    Note: Google bakes a small attribution/logo watermark into the bottom corners
+    (TOS-required; cannot be disabled like Mapbox logo=false)."""
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot use Google imagery")
+        return False
+    try:
+        mz = MAPBOX_ZOOM if zoom is None else zoom
+        w, h = MAPBOX_SIZE.lower().split("x")
+        logical = f"{int(w) // 2}x{int(h) // 2}"  # 768 -> 384; scale=2 doubles back to 768
+        url = "https://maps.googleapis.com/maps/api/staticmap"
+        params = {
+            "center": f"{lat:.7f},{lon:.7f}",
+            # size=(MAPBOX_SIZE/2) scale=2 renders MAPBOX_SIZE device px; Google's coverage
+            # scales by DEVICE px, so zoom=mz matches Mapbox MAPBOX_SIZE@mz coverage+resolution.
+            # (zoom=mz-1 rendered ~2x too wide -> rooftop equipment too small for the VLMs.)
+            "zoom": mz,
+            "size": logical,
+            "scale": 2,
+            "maptype": "satellite",
+            "format": "jpg",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        with requests.get(url, params=params, timeout=HTTP_TIMEOUT, stream=True) as r:
+            if r.status_code != 200:
+                log.warning("Google Static error %s: %s", r.status_code, r.text[:200])
+                return False
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            # Paint over the bottom watermark strip so YOLO can't detect the logo/credit
+            # text as cooling-tower equipment (the cause of the full-Google false positives).
+            if GOOGLE_WATERMARK_PX > 0:
+                ImageDraw.Draw(img).rectangle(
+                    [0, img.height - GOOGLE_WATERMARK_PX, img.width, img.height], fill=(0, 0, 0))
+            img.save(out_path, format="JPEG", quality=92)
+        return True
+    except Exception as e:
+        log.error("Google satellite fetch failed: %s", e)
+        return False
+
+
+def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None) -> bool:
+    """Dispatch to the imagery provider selected by IMAGERY_PROVIDER (default
+    'mapbox' = unchanged prod path; 'google' = Google Static Maps)."""
+    if os.getenv("IMAGERY_PROVIDER", "google").strip().lower() == "mapbox":
+        return get_satellite_image_mapbox(lat, lon, out_path, zoom=zoom)
+    return get_satellite_image_google(lat, lon, out_path, zoom=zoom)
 
 
 # -------------------------------------------------------------------------

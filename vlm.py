@@ -81,7 +81,7 @@ If you cannot count individual fan blades and identify a central hub, it is not 
 
 You will receive a tight crop of the candidate plus a wider satellite tile that shows the entire target building and its neighbors, and you may also receive a second tile of the same target at a different zoom level for added context. Use the tight crop for fine detail of the candidate object. Use the wider/second tiles to confirm whether the candidate sits on (or, if ground-mounted, immediately beside and serving) the TARGET building rather than an adjacent one.
 
-Return a structured JSON response with five fields: verdict, confidence, reasoning, construction, is_house. Be calibrated and honest about uncertainty."""
+Return a structured JSON response with six fields: verdict, confidence, reasoning, construction, is_house, image_unusable. Be calibrated and honest about uncertainty."""
 
 _USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -156,7 +156,7 @@ You will receive ONE satellite tile that shows the target building and its neigh
 
 You also need to flag visible active construction (cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone) on the target rooftop or the surrounding area — this is a separate signal the sales team uses to prioritize follow-up, distinct from whether a cooling tower is present.
 
-Return a structured JSON response with five fields: verdict, confidence, reasoning, construction, is_house. Be calibrated and honest about uncertainty."""
+Return a structured JSON response with six fields: verdict, confidence, reasoning, construction, is_house, image_unusable. Be calibrated and honest about uncertainty."""
 
 _ROOFTOP_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -209,6 +209,7 @@ class _VerificationResponse(BaseModel):
     reasoning: str = Field(min_length=1)
     construction: bool
     is_house: bool
+    image_unusable: bool = False
 
 
 class _RooftopResponse(BaseModel):
@@ -232,6 +233,7 @@ def _needs_review(reasoning: str) -> dict:
         "reasoning": reasoning,
         "construction": False,
         "is_house": False,
+        "image_unusable": False,
     }
 
 
@@ -452,6 +454,139 @@ def _build_rooftop_prompt(
     )
 
 
+_ADDRESS_SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
+
+Your task is to determine whether a real cooling tower is present on — or, if ground-mounted, immediately beside and serving — a specific TARGET building in a satellite image. An automated YOLO computer-vision model has already run and drawn numbered candidate boxes on the image; you are the expert reviewer who decides the truth. Your verdict drives a B2B sales pipeline; accuracy matters, and ambiguous cases should be flagged honestly rather than guessed.
+
+A cooling tower in this domain is a rooftop heat-rejection unit, typically rectangular or cylindrical, with louvered air intakes on the sides, fan housings or fan stacks on top, and visible piping or condenser coils. Older or open-design cooling towers may instead appear as a square or rectangular enclosure with a visible centrifugal or radial fan blade pattern inside, viewed from directly above. They sit on the rooftops of commercial, multifamily, or institutional buildings.
+
+GROUND-MOUNTED COOLING EQUIPMENT — a first-line consideration, not an edge case: outside dense urban cores (most of the U.S. except cities like New York, Chicago, Boston, and San Francisco), cooling equipment serving a building is frequently ground-mounted rather than on the roof — on a concrete pad next to the building, inside a fenced enclosure, or in a mechanical yard adjacent to the structure. A ground-mounted cooling tower shows the SAME visual signatures (louvers, fan stacks, fan-blade pattern from above, coil banks) as a rooftop unit, just at ground level beside the building. Treat ground-mounted cooling equipment serving the target building the same as a rooftop cooling tower for the verdict.
+
+They are NOT:
+- Rooftop air handler units (AHUs) — flat boxes without prominent fan stacks
+- Solar panels (rectangular, dark, flush with the roof)
+- Skylights or roof hatches
+- Rooftop water tanks (cylindrical wooden, or stainless-steel domed)
+- Elevator penthouses or stairwell bulkheads (windowless rooms on the roof)
+- Roof-mounted satellite dishes, antennas, or signage
+
+WATER TANK / WATER TOWER vs COOLING TOWER — the most common error in this domain:
+
+A NYC-style rooftop wooden water tank, viewed from directly above, appears as a DARK CIRCLE inside a square wooden cradle. The dark circle is the open or covered top of the tank — it is NOT a fan blade pattern, NOT a cooling tower, and NOT mechanical equipment. Stainless-steel water tanks appear as a bright domed or conical shape, also NOT a cooling tower.
+
+A cooling tower's circular top, when present, shows DISCRETE FAN BLADES that you can count (typically 4-8), a hub at the center, and protective metal grating. A water tank top shows none of these — just a uniform dark or reflective surface.
+
+If you cannot count individual fan blades and identify a central hub, it is not a cooling tower fan. Default to "not_detected" rather than guessing on a borderline circular feature.
+
+=== HOW TO READ THIS IMAGE ===
+The TARGET building's footprint is outlined in RED. The red outline is the building at the address. A cooling tower counts for the target ONLY if it sits on the red building's roof, or is ground-mounted immediately beside the red building. Equipment on a neighboring building — anything outside the red outline, on a different roof — does NOT count for the target.
+
+The numbered boxes can land on DIFFERENT buildings — some on the target (red), some on neighbors. Judge each box on its own building. A real cooling tower on a neighbor does NOT cancel one on the target: if even a single box (or anything you spot yourself) is a real cooling tower on the target, the verdict is "confirmed", no matter how many other towers sit on neighboring roofs. Treat it as a neighbor case ONLY when EVERY real cooling tower in view is on a neighbor and the target itself has none.
+
+YOLO has drawn one or more NUMBERED boxes around things it guessed might be cooling towers. Treat each numbered box as nothing more than a suggestion from an automated model that is frequently wrong. A box may contain an air handler, a skylight, a water tank, a shadow, or nothing at all. Do NOT assume a numbered box contains a cooling tower — check each one against the definition above and reject the ones that fail it.
+
+Two jobs, equally important:
+1. VERIFY the numbered boxes — decide which, if any, contain a real cooling tower serving the target building.
+2. FIND what YOLO MISSED — scan the rest of the target's roof and its immediate surroundings for any cooling tower with NO box around it. A real cooling tower that YOLO failed to box still counts — report it.
+
+Return a structured JSON response with six fields: verdict, confidence, reasoning, construction, is_house, image_unusable. Be calibrated and honest about uncertainty."""
+
+_ADDRESS_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
+Address: {address}
+Geocoded coordinates: ({lat}, {lon})
+OSM building id: {osm_id}
+OSM tags: {osm_tags}
+Geocoded centroid is inside building footprint: {contains_point}
+
+=== WHAT IS IN THE IMAGE ===
+The satellite tile is 768x768 pixels at zoom {tile_zoom}, centered on the target building. Pixel (0,0) is the top-left. The TARGET building's footprint is outlined in RED. {boxes_clause}
+
+Use judgment on the red outline — minor misalignment is expected, not a problem. The red footprint comes from map data and is frequently imperfect: it may sit a few metres off, only partially overlap the real structure, or trace the building's shape loosely. If the red outline is roughly on the building and at least approximates the shape of what you are looking at — even with a weird or partial overlap — treat that building as the target and proceed with your verdict normally. Only when the red outline clearly traces a COMPLETELY DIFFERENT building — a distinctly different footprint shape, a structure across the street, an obviously unrelated building — treat it as a wrong-building case: if a cooling tower sits on that different building, call it "neighbor_only" (and name the direction); if you genuinely cannot tell which building the address refers to, use "needs_review".{context_block}{closeup_block}{reference_block}
+
+=== YOUR TASK ===
+Considering BOTH the numbered boxes AND your own scan of the target roof and its immediate surroundings, pick the single verdict that best describes the TARGET building:
+
+- "confirmed"      — at least one real cooling tower is clearly present and clearly serving the target building (on the red building's rooftop, OR ground-mounted on a pad / in an enclosure / in a mechanical yard immediately beside it). It does not matter whether YOLO boxed it or you found it yourself, and it does not matter if OTHER cooling towers also sit on neighboring buildings — one real tower on the target is enough. Use confidence > 0.8.
+- "likely"         — a cooling tower probably serves the target with minor ambiguity (partial occlusion, marginal image quality, similar but not certain). Use confidence 0.5-0.8.
+- "neighbor_only"  — you can see real cooling tower(s), but EVERY one of them is on or beside an ADJACENT building and the target itself has none. If even one real tower is on the target, use "confirmed" instead, not "neighbor_only". Specify the direction of the neighbor tower(s) relative to the target.
+- "not_detected"   — no cooling tower serves the target building. Every numbered box, if any, is a false positive (AHU, skylight, water tank, shadow artifact, generic mechanical box), and your own scan of the target roof and surroundings finds none.
+- "needs_review"   — you cannot decide with reasonable confidence. The reasoning field MUST explain what is preventing a decision.
+
+Set "construction": true ONLY if you can see active construction — cranes, exposed rebar, partial framing, scaffolding, or an obvious construction zone on the roof or adjacent area. Do NOT set true just because the building looks modern, recently built, or well-maintained. Completed buildings = false.
+
+Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
+
+Set "image_unusable": true ONLY if you cannot properly judge the target building because its roof is not clearly visible from directly above in THIS image — for example a tall tower shown leaning at a steep oblique angle so you see its glass facade instead of its roof, or the target's roof is cut off at the edge of the frame. This tells the system to retry with a different satellite source. If you can see the target's roof clearly (even if it simply has no cooling tower on it), set it false.
+
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
+
+
+_ADDRESS_CLOSEUP_BLOCK = """
+
+You are also given a separate HIGH-ZOOM CLOSE-UP of the main candidate equipment. Use it for the fine IDENTITY call: count discrete fan blades and look for a central hub and louvered enclosure (cooling tower) versus a uniform dark or domed circular top with no countable blades (water tank). When the close-up and the wide tile seem to disagree, trust the CLOSE-UP for what the equipment IS, and the wide tile for which building it sits ON. (The close-up is zoomed in on one spot, so it does not show neighbors — do not use it to decide target-vs-neighbor.)"""
+
+
+def _build_address_prompt(
+    building_context: dict,
+    n_boxes: int,
+    n_pos: int,
+    n_neg: int,
+    has_closeup: bool = False,
+) -> str:
+    fm = building_context.get("footprint_metadata")
+    if not isinstance(fm, dict):
+        fm = {}
+
+    address = building_context.get("address") or "(not provided)"
+    lat = building_context.get("lat")
+    lon = building_context.get("lon")
+    lat_s = "?" if lat is None else lat
+    lon_s = "?" if lon is None else lon
+
+    osm_id = fm.get("osm_id")
+    osm_id_s = "?" if osm_id is None else osm_id
+
+    tags = fm.get("tags")
+    tags_s = "(not provided)" if not tags else tags
+
+    contains = fm.get("contains_point")
+    contains_s = "unknown" if contains is None else str(bool(contains)).lower()
+
+    tile_zoom = building_context.get("tile_zoom", 19)
+    context_zoom = building_context.get("context_zoom")
+
+    if n_boxes > 0:
+        boxes_clause = (
+            f"YOLO has drawn {n_boxes} numbered candidate box(es) on the tile — "
+            "each marks something it guessed might be a cooling tower."
+        )
+    else:
+        boxes_clause = (
+            "YOLO drew no candidate boxes on this tile — rely entirely on your own "
+            "scan of the target roof and its immediate surroundings."
+        )
+
+    reference_block = ""
+    if n_pos > 0:
+        reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
+        if n_neg > 0:
+            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+
+    return _ADDRESS_USER_PROMPT_TEMPLATE.format(
+        address=address,
+        lat=lat_s,
+        lon=lon_s,
+        osm_id=osm_id_s,
+        osm_tags=tags_s,
+        contains_point=contains_s,
+        tile_zoom=tile_zoom,
+        boxes_clause=boxes_clause,
+        context_block=_context_block(tile_zoom, context_zoom),
+        closeup_block=(_ADDRESS_CLOSEUP_BLOCK if has_closeup else ""),
+        reference_block=reference_block,
+    )
+
+
 def _result_from_validated(parsed: _VerificationResponse) -> dict:
     return {
         "verdict": parsed.verdict,
@@ -459,6 +594,8 @@ def _result_from_validated(parsed: _VerificationResponse) -> dict:
         "reasoning": parsed.reasoning,
         "construction": parsed.construction,
         "is_house": parsed.is_house,
+        # Only the address schema carries image_unusable; rooftop schema lacks it.
+        "image_unusable": bool(getattr(parsed, "image_unusable", False)),
     }
 
 
@@ -934,6 +1071,300 @@ def _verify_grok_rooftop(
     )
 
 
+def _verify_gemini_address(
+    image_path: str,
+    building_context: dict,
+    n_boxes: int,
+    timeout_s: int,
+    context_image_path: str = None,
+    closeup_image_path: str = None,
+) -> dict:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise KeyError("GEMINI_API_KEY")
+    model_id = os.environ.get("GEMINI_MODEL") or _DEFAULT_GEMINI_MODEL
+
+    try:
+        tile_bytes = _read_full_tile_bytes(image_path)
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    context_bytes = _maybe_read_context_tile(context_image_path)
+    closeup_bytes = _maybe_read_context_tile(closeup_image_path)
+
+    pos_imgs, neg_imgs = _load_reference_images()
+    prompt = _build_address_prompt(building_context, n_boxes, len(pos_imgs), len(neg_imgs),
+                                   has_closeup=closeup_bytes is not None)
+
+    contents: list = [prompt]
+    for img_bytes in pos_imgs:
+        contents.append("--- Reference: positive example ---")
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    for img_bytes in neg_imgs:
+        contents.append("--- Reference: negative example ---")
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    contents.append("--- Satellite tile (target footprint in red, YOLO candidates numbered) ---")
+    contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
+    if context_bytes is not None:
+        contents.append(f"--- Context tile (same target, zoom {building_context.get('context_zoom')}) ---")
+        contents.append(types.Part.from_bytes(data=context_bytes, mime_type="image/jpeg"))
+    if closeup_bytes is not None:
+        contents.append("--- High-zoom close-up of the main candidate equipment (identify fan blades vs water tank) ---")
+        contents.append(types.Part.from_bytes(data=closeup_bytes, mime_type="image/jpeg"))
+
+    client = _get_gemini_client(api_key)
+    config = types.GenerateContentConfig(
+        system_instruction=_ADDRESS_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=_VerificationResponse,
+        thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
+        http_options=types.HttpOptions(timeout=timeout_s * 1000),
+    )
+
+    last_transient_result: dict | None = None
+
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            response = client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=config,
+            )
+        except httpx.TimeoutException as e:
+            _LOGGER.debug("Address attempt %d timeout: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            continue
+        except httpx.ConnectError as e:
+            _LOGGER.debug("Address attempt %d connect error: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+            )
+            continue
+        except genai_errors.ServerError as e:
+            code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
+            _LOGGER.debug("Address attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
+            last_transient_result = _needs_review(
+                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+            )
+            continue
+        except genai_errors.ClientError as e:
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            if code in (408, 429):
+                name = "Request Timeout" if code == 408 else "Too Many Requests"
+                _LOGGER.debug("Address attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
+                last_transient_result = _needs_review(
+                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                )
+                continue
+            if code == 401:
+                return _needs_review(
+                    "API authentication error (HTTP 401): GEMINI_API_KEY may be invalid or revoked."
+                )
+            if code == 403:
+                return _needs_review(f"API authorization error (HTTP 403): {_truncate(e)}")
+            if code == 400:
+                return _needs_review(
+                    f"API rejected the request (HTTP 400): {_truncate(e)}. This usually indicates a malformed prompt or unsupported schema."
+                )
+            return _needs_review(f"API client error (HTTP {code}): {_truncate(e)}")
+        except genai_errors.APIError as e:
+            return _needs_review(f"VLM API error: {type(e).__name__}: {_truncate(e)}")
+
+        return _parse_response(response, _VerificationResponse)
+
+    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+
+
+def _verify_grok_address(
+    image_path: str,
+    building_context: dict,
+    n_boxes: int,
+    timeout_s: int,
+    context_image_path: str = None,
+    closeup_image_path: str = None,
+) -> dict:
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        raise KeyError("XAI_API_KEY")
+    model_id = os.environ.get("GROK_MODEL") or _DEFAULT_GROK_MODEL
+
+    try:
+        tile_bytes = _read_full_tile_bytes(image_path)
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    context_bytes = _maybe_read_context_tile(context_image_path)
+    closeup_bytes = _maybe_read_context_tile(closeup_image_path)
+
+    pos_imgs, neg_imgs = _load_reference_images()
+    prompt = _build_address_prompt(building_context, n_boxes, len(pos_imgs), len(neg_imgs),
+                                   has_closeup=closeup_bytes is not None)
+
+    content_parts: list = [{"type": "text", "text": prompt}]
+    for img_bytes in pos_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    for img_bytes in neg_imgs:
+        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
+        content_parts.append(_to_image_url_part(img_bytes))
+    content_parts.append({"type": "text", "text": "--- Satellite tile (target footprint in red, YOLO candidates numbered) ---"})
+    content_parts.append(_to_image_url_part(tile_bytes))
+    if context_bytes is not None:
+        content_parts.append({"type": "text", "text": f"--- Context tile (same target, zoom {building_context.get('context_zoom')}) ---"})
+        content_parts.append(_to_image_url_part(context_bytes))
+    if closeup_bytes is not None:
+        content_parts.append({"type": "text", "text": "--- High-zoom close-up of the main candidate equipment (identify fan blades vs water tank) ---"})
+        content_parts.append(_to_image_url_part(closeup_bytes))
+
+    messages = [
+        {"role": "system", "content": _ADDRESS_SYSTEM_PROMPT},
+        {"role": "user", "content": content_parts},
+    ]
+
+    client = _get_grok_client(api_key)
+    last_transient_result: dict | None = None
+
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                response_format={"type": "json_object"},
+                reasoning_effort=_GROK_REASONING_EFFORT,
+                timeout=timeout_s,
+            )
+        except openai.APITimeoutError as e:
+            _LOGGER.debug("Grok address attempt %d timeout: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review("Grok network timeout after 4 attempts.")
+            continue
+        except openai.RateLimitError as e:
+            _LOGGER.debug("Grok address attempt %d rate-limited: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+            )
+            continue
+        except openai.AuthenticationError:
+            return _needs_review(
+                "Grok API authentication error (HTTP 401): XAI_API_KEY may be invalid or revoked."
+            )
+        except openai.APIConnectionError as e:
+            _LOGGER.debug("Grok address attempt %d connect error: %s", attempt + 1, _truncate(e))
+            last_transient_result = _needs_review(
+                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+            )
+            continue
+        except openai.APIStatusError as e:
+            code = getattr(e, "status_code", None) or 0
+            if code in (408, 429) or 500 <= code < 600:
+                _LOGGER.debug("Grok address attempt %d transient (HTTP %s): %s", attempt + 1, code, _truncate(e))
+                last_transient_result = _needs_review(
+                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                )
+                continue
+            if code == 403:
+                return _needs_review(f"Grok API authorization error (HTTP 403): {_truncate(e)}")
+            if code == 400:
+                return _needs_review(
+                    f"Grok API rejected the request (HTTP 400): {_truncate(e)}. "
+                    f"This usually indicates a malformed prompt or unsupported format."
+                )
+            return _needs_review(f"Grok API client error (HTTP {code}): {_truncate(e)}")
+        except openai.APIError as e:
+            return _needs_review(f"Grok VLM API error: {type(e).__name__}: {_truncate(e)}")
+
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as e:
+            return _needs_review(f"Grok response shape unexpected: {_truncate(e)}")
+
+        if not content:
+            return _needs_review("Grok returned an empty response (no content).")
+
+        shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
+        return _parse_response(shim, _VerificationResponse)
+
+    return last_transient_result or _needs_review("Grok network timeout after 4 attempts.")
+
+
+def verify_address(
+    image_path: str,
+    building_context: dict,
+    n_boxes: int = 0,
+    context_image_path: str = None,
+    closeup_image_path: str = None,
+) -> dict:
+    """One dual-VLM pass per address. The VLM sees a single marked-up tile (target
+    footprint in red, YOLO candidate boxes numbered) plus reference images, and
+    returns one consensus verdict — verifying the boxes AND scanning for anything
+    YOLO missed. Replaces the per-box verify_detection loop + the verify_rooftop
+    scan. Same output shape as verify_detection (the 7-key consensus dict)."""
+    if not isinstance(building_context, dict):
+        return _needs_review(
+            f"building_context must be a dict, got {type(building_context).__name__}."
+        )
+
+    has_address = bool(building_context.get("address"))
+    lat = building_context.get("lat")
+    lon = building_context.get("lon")
+    has_valid_coords = isinstance(lat, (int, float)) and not isinstance(lat, bool) \
+        and isinstance(lon, (int, float)) and not isinstance(lon, bool)
+    if not has_address and not has_valid_coords:
+        return _needs_review(
+            "building_context provided no identifying information (no address, no coordinates)."
+        )
+
+    if not os.path.isfile(image_path):
+        return _needs_review(f"Image file not found: {image_path}")
+
+    try:
+        with Image.open(image_path) as img:
+            _ = img.size
+    except (UnidentifiedImageError, OSError) as e:
+        return _needs_review(
+            f"Image file unreadable: {os.path.basename(image_path)}: {_truncate(e)}"
+        )
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise KeyError("GEMINI_API_KEY")
+    if not os.environ.get("XAI_API_KEY"):
+        raise KeyError("XAI_API_KEY")
+
+    timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
+    threshold = float(
+        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        gemini_future = ex.submit(
+            _verify_gemini_address, image_path, building_context, n_boxes, timeout_s,
+            context_image_path, closeup_image_path,
+        )
+        grok_future = ex.submit(
+            _verify_grok_address, image_path, building_context, n_boxes, timeout_s,
+            context_image_path, closeup_image_path,
+        )
+
+        try:
+            gemini_result = gemini_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            gemini_result = _needs_review(f"Gemini exceeded {timeout_s}s wall-clock timeout.")
+
+        try:
+            grok_result = grok_future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            grok_result = _needs_review(f"Grok exceeded {timeout_s}s wall-clock timeout.")
+
+    return _combine_verdicts(gemini_result, grok_result, threshold)
+
+
 def _combine_verdicts(
     gemini_result: dict, grok_result: dict, threshold: float
 ) -> dict:
@@ -1002,6 +1433,8 @@ def _combine_verdicts(
         "reasoning": final_reasoning,
         "construction": final_construction,
         "is_house": final_is_house,
+        # If EITHER model couldn't see the target roof, flag for an imagery retry.
+        "image_unusable": bool(gemini_result.get("image_unusable") or grok_result.get("image_unusable")),
         "gemini": gemini_result,
         "grok": grok_result,
         "agreement": agree and confident,
