@@ -24,6 +24,7 @@ geopy==2.4.1
 shapely
 google-genai
 openai
+httpx  # used directly in vlm.py (timeouts/errors); also a transitive dep of google-genai/openai
 python-dotenv
 
 # Utilities

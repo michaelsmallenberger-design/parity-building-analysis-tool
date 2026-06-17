@@ -30,9 +30,15 @@ COPY storage_helpers.py .
 COPY worker.py .
 COPY tasks_local.py .
 COPY utils.py .
+COPY geometry.py .
+COPY vlm.py .
+COPY pipeline_render.py .
+COPY nyc_opendata.py .
+COPY ms_footprints.py .
 COPY html_report.py .
 COPY zip_bundler.py .
 COPY models/ models/
+COPY reference_images/ reference_images/
 COPY static/ static/
 COPY templates/ templates/
 
