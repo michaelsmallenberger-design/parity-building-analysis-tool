@@ -16,7 +16,7 @@ from shapely.geometry import MultiPolygon
 from shapely.ops import transform
 
 from utils import (
-    geocode_address_mapbox, geocode_with_confidence, get_satellite_image_mapbox,
+    geocode_address_mapbox, geocode_with_confidence,
     get_satellite_image,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
@@ -683,8 +683,21 @@ def _process_one_address_core(
             ),
         )
 
-    log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image")
-    ok = get_satellite_image(centroid_lat, centroid_lon, original_local)
+    # Per-address routing off the dense-urban gate (NYC cores + curated downtowns):
+    #  - imagery: dense → Mapbox (true nadir; Google's 3D photogrammetry distorts dense
+    #    rooftops → false negatives, +7 net on last session's 85-address A/B). Suburban
+    #    stays Google (IMAGERY_PROVIDER env default).
+    #  - detection: dense → roof-only (skip wide ground tile, drop off-building boxes as
+    #    neighbor FPs). Suburban keeps both (ground-mounted units are real there).
+    # alt_provider = the opposite, used as the image_unusable retry's alternate capture.
+    dense = _in_nyc(centroid_lat, centroid_lon) or _in_dense_core(centroid_lat, centroid_lon)
+    keep_outside = False if dense else None  # None = honor YOLO_KEEP_OUTSIDE env
+    img_provider = "mapbox" if dense else None  # None = IMAGERY_PROVIDER env default (Google)
+    alt_provider = "google" if dense else "mapbox"
+
+    log.info(f"Row {i+1}/{total}: Downloading centroid-centered satellite image"
+             + (" (dense → Mapbox)" if dense else ""))
+    ok = get_satellite_image(centroid_lat, centroid_lon, original_local, provider=img_provider)
     if not ok:
         log.warning(f"Row {i+1}/{total}: Image download failed")
         notes = _build_notes({'imagery_failed': True})
@@ -769,13 +782,9 @@ def _process_one_address_core(
 
         return web_entry, csv_row
 
-    # Dense-urban gate: in dense cores (NYC + curated downtowns) cooling towers are
-    # roof-only and off-building detections are neighbor false positives — suppress the
-    # wide (ground) tile and the outside-footprint passthrough. Everywhere else (suburban
-    # DC/VA office parks etc.) keep both: ground-mounted units are real there.
-    dense = _in_nyc(centroid_lat, centroid_lon) or _in_dense_core(centroid_lat, centroid_lon)
-    keep_outside = False if dense else None  # None = honor YOLO_KEEP_OUTSIDE env
-
+    # Dense-urban roof-only scan (gate computed above with the imagery provider): in dense
+    # cores cooling towers are roof-only and off-building detections are neighbor false
+    # positives — suppress the wide (ground) tile and the outside-footprint passthrough.
     if dense:
         log.info(f"Row {i+1}/{total}: dense urban core — roof-only scan (no wide tile, drop off-building detections)")
         wide_local = None
@@ -786,7 +795,7 @@ def _process_one_address_core(
             f"{job_id}_{i}_{clean_addr}_wide.jpg",
         )
         log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
-        if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE):
+        if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
             log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
             wide_local = None
 
@@ -843,7 +852,7 @@ def _process_one_address_core(
     # the fan-blade / water-tank identity call it can't make at the coarse detail zoom.
     cu_lat, cu_lon = _closeup_center(merged, centroid_lat, centroid_lon)
     closeup_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_closeup.jpg")
-    if not get_satellite_image(cu_lat, cu_lon, closeup_local, zoom=CLOSEUP_ZOOM):
+    if not get_satellite_image(cu_lat, cu_lon, closeup_local, zoom=CLOSEUP_ZOOM, provider=img_provider):
         closeup_local = None
     log.info(
         f"Row {i+1}/{total}: {detection_count} candidate box(es); "
@@ -869,9 +878,9 @@ def _process_one_address_core(
     imagery_retried = False
     if (IMAGERY_RETRY_ENABLED and consensus_dict.get('image_unusable')
             and consensus_dict.get('verdict') not in _POSITIVE_VERDICTS):
-        log.info(f"Row {i+1}/{total}: VLM flagged image unusable; retrying with Mapbox imagery")
+        log.info(f"Row {i+1}/{total}: VLM flagged image unusable; retrying with {alt_provider} imagery")
         retry_detail = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry.jpg")
-        if get_satellite_image_mapbox(centroid_lat, centroid_lon, retry_detail, zoom=MAPBOX_ZOOM):
+        if get_satellite_image(centroid_lat, centroid_lon, retry_detail, zoom=MAPBOX_ZOOM, provider=alt_provider):
             retry_dets = _detect_on_tile(retry_detail, MAPBOX_ZOOM, footprint,
                                          centroid_lat, centroid_lon, keep_outside=keep_outside)
             retry_marked = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry_marked.jpg")
@@ -880,7 +889,7 @@ def _process_one_address_core(
             retry_ctx = {**base_ctx, "tile_zoom": MAPBOX_ZOOM, "context_zoom": None}
             rcu_lat, rcu_lon = _closeup_center(retry_dets, centroid_lat, centroid_lon)
             retry_closeup = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_retry_closeup.jpg")
-            if not get_satellite_image_mapbox(rcu_lat, rcu_lon, retry_closeup, zoom=CLOSEUP_ZOOM):
+            if not get_satellite_image(rcu_lat, rcu_lon, retry_closeup, zoom=CLOSEUP_ZOOM, provider=alt_provider):
                 retry_closeup = None
             retry_result = verify_address(
                 retry_marked, retry_ctx, n_boxes=len(retry_dets),
@@ -943,9 +952,11 @@ def _process_one_address_core(
                  f"Mapbox, which landed inside a building] {notes}").strip()
     if imagery_retried:
         # Surface model-triggered fallbacks for the reviewer: the VLM flagged the primary
-        # (Google) tile as unusable, so this address was re-analyzed on Mapbox imagery.
-        notes = (f"[IMAGERY RETRY: VLM flagged the Google tile unusable (e.g. tall building "
-                 f"shown at an oblique angle); re-analyzed on Mapbox imagery] {notes}").strip()
+        # tile (Mapbox in dense cores, else Google) as unusable, so this address was
+        # re-analyzed on the alternate provider's imagery.
+        _prim = "Mapbox" if dense else "Google"
+        notes = (f"[IMAGERY RETRY: VLM flagged the {_prim} tile unusable (e.g. tall building "
+                 f"shown at an oblique angle); re-analyzed on {alt_provider.capitalize()} imagery] {notes}").strip()
 
     web_entry = _build_web_entry(
         full_address=full_address,
