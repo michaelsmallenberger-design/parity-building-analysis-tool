@@ -434,10 +434,13 @@ def get_satellite_image_google(lat: float, lon: float, out_path: str, zoom: int 
         return False
 
 
-def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None) -> bool:
-    """Dispatch to the imagery provider selected by IMAGERY_PROVIDER (default
-    'mapbox' = unchanged prod path; 'google' = Google Static Maps)."""
-    if os.getenv("IMAGERY_PROVIDER", "google").strip().lower() == "mapbox":
+def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None,
+                        provider: str = None) -> bool:
+    """Dispatch to the imagery provider. An explicit `provider` (per-address override,
+    e.g. dense urban → 'mapbox') wins; otherwise fall back to the IMAGERY_PROVIDER env
+    (default 'google' = Google Static Maps; 'mapbox' = legacy path)."""
+    prov = (provider or os.getenv("IMAGERY_PROVIDER", "google")).strip().lower()
+    if prov == "mapbox":
         return get_satellite_image_mapbox(lat, lon, out_path, zoom=zoom)
     return get_satellite_image_google(lat, lon, out_path, zoom=zoom)
 
