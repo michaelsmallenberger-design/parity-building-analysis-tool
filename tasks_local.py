@@ -1063,6 +1063,8 @@ def process_address_list(
         encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
         delimiters = [',', ';', '\t']
 
+        saw_multiindex = False  # delimiter split a single-column row into extra fields
+
         for encoding in encodings:
             if df is not None:
                 break
@@ -1080,6 +1082,21 @@ def process_address_list(
                         engine='python'          # More flexible parser for edge cases
                     )
 
+                    # A MultiIndex means this delimiter found MORE fields than there are
+                    # header columns (e.g. unquoted commas in an Address field split it
+                    # into extra columns that pandas folds into the row index). The read
+                    # "succeeds" but the data is mis-aligned — only the trailing field
+                    # lands in the real column. Reject so we keep trying other delimiters
+                    # instead of locking in garbage; if nothing else parses, surface a
+                    # clear error below rather than crashing downstream on a tuple label.
+                    if isinstance(test_df.index, pd.MultiIndex):
+                        saw_multiindex = True
+                        log.warning(
+                            f"CSV read with encoding='{encoding}', delimiter='{repr(delimiter)}' "
+                            f"produced a MultiIndex (delimiter mismatch / unquoted commas); rejecting"
+                        )
+                        continue
+
                     # Validate: must have at least 1 column and 1 row
                     if len(test_df.columns) >= 1 and len(test_df) > 0:
                         df = test_df
@@ -1092,7 +1109,13 @@ def process_address_list(
 
         # If all attempts failed
         if df is None:
-            error_msg = f"Failed to read CSV file. Tried encodings: {encodings}, delimiters: [comma, semicolon, tab]. Please ensure the file is a valid CSV."
+            if saw_multiindex:
+                error_msg = (
+                    "Address field contains unquoted commas; please double-quote "
+                    "multi-part addresses (e.g. \"140 West End Ave, New York, NY\")."
+                )
+            else:
+                error_msg = f"Failed to read CSV file. Tried encodings: {encodings}, delimiters: [comma, semicolon, tab]. Please ensure the file is a valid CSV."
             log.error(error_msg)
             return {"error": error_msg}
 
