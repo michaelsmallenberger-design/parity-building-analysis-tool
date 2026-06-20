@@ -56,6 +56,13 @@ git push origin main
 
 ## Architecture Overview
 
+### Two front doors
+
+There are two ways to drive the same per-address pipeline:
+
+1. **Browser UI (legacy):** CSV upload → SQLite job queue → background worker → results page + downloadable report. Routes in `app_railway.py`, processing in `worker.py` → `tasks_local.py`.
+2. **Stateless API (n8n path):** `api_analyze.py` (Flask blueprint, registered in `app_railway.py`) exposes `POST /api/analyze` (one address → self-contained `web_entry` JSON with images as `data:` URIs), `POST /api/report` (collected entries → audit-card HTML via `report_audit.py`), and `GET /api/health`. No queue, no worker, no file storage — images are base64 inline. Guarded by the `X-API-Key` header (`ANALYZE_API_KEY`). This is what **n8n Cloud** orchestrates: Google Sheet → optional Gemini normalize → per-address `/api/analyze` → `/api/report` → email. See `n8n/README.md` and `n8n/parity_cooling_tower.workflow.json`. The emailed report uses the **audit-card** format (`report_audit.py`), not the deprecated `html_report.py` (which buckets by confidence not verdict and hides per-VLM detail).
+
 ### System Design
 
 This is a **single-process Flask application** with a background worker thread that processes jobs from a SQLite queue. It uses **local filesystem storage** (ephemeral) instead of object storage. Per-address work fans out across multiple modules: geometry for footprint filtering, vlm for dual-model verification, pipeline_render for annotated images.
@@ -150,6 +157,7 @@ def _get_model():
 - `MAPBOX_API_KEY` — Mapbox geocoding (fallback) + Static Images (used for dense-urban-core imagery and the image_unusable retry)
 - `GEMINI_API_KEY` — Google AI Studio API key for Gemini verification (model via `GEMINI_MODEL`, default `gemini-3.5-flash`)
 - `XAI_API_KEY` — xAI API key for Grok verification (model via `GROK_MODEL`, default `grok-4.3`)
+- `ANALYZE_API_KEY` — shared secret guarding the stateless `/api/analyze` and `/api/report` endpoints (the n8n path). Required for those routes (they incur VLM spend); if unset they return 503. Not needed for the browser-upload UI.
 
 ### Environment Variables (Optional)
 

@@ -14,9 +14,11 @@ from flask import Flask, request, render_template, redirect, url_for, jsonify, a
 from job_queue import init_db, enqueue_job, get_job_status, cancel_job, check_usage_limit
 from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists, read_file
 from worker import start_worker
+from api_analyze import api as api_blueprint
 
 # Initialize Flask app
 app = Flask(__name__)
+app.register_blueprint(api_blueprint)
 
 logging.basicConfig(
     level=logging.INFO,
