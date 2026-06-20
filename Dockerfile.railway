@@ -36,6 +36,8 @@ COPY pipeline_render.py .
 COPY nyc_opendata.py .
 COPY ms_footprints.py .
 COPY html_report.py .
+COPY report_audit.py .
+COPY api_analyze.py .
 COPY zip_bundler.py .
 COPY models/ models/
 COPY reference_images/ reference_images/
