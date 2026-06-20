@@ -17,7 +17,7 @@ from shapely.ops import transform
 
 from utils import (
     geocode_address_mapbox, geocode_with_confidence,
-    get_satellite_image,
+    get_satellite_image, validate_address_google,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
@@ -95,15 +95,20 @@ _VLM_TRANSIENT_MARKERS = (
 )
 
 
-# Dense urban cores where cooling towers are roof-only and off-building detections are
-# neighbor false positives. NYC is handled via nyc_opendata._in_nyc; these are TIGHT
-# high-rise CBD boxes (name, lat_min, lat_max, lon_min, lon_max). Kept tight on purpose:
-# outside the downtown core ground-mounted units are real, so a too-wide box would wrongly
-# suppress the ground scan. An automatic OSM density signal was tested and rejected —
-# suburban office parks (Herndon, Santa Clara) overlap downtowns in built-up ratio, and
-# height-limited downtowns (DC) score low — so this stays a hand-maintained list of
-# genuinely dense high-rise downtowns. Extend per city; everywhere else = ground-check ON.
+# Dense urban cores where cooling towers are roof-only and off-building detections
+# are neighbor false positives. NYC is handled via nyc_opendata._in_nyc; these are
+# downtown bounding boxes (lat_min, lat_max, lon_min, lon_max) seeded from the cities
+# Mike named (Boston, SF, Chicago) and extended per-city when neighbor FPs show up.
+# Everywhere else defaults to ground-check ON (suburban DC/VA office parks etc., where
+# ground-mounted units are real). Tune boxes against the 53-row set.
 DENSE_CORE_BBOXES = [
+    # name, lat_min, lat_max, lon_min, lon_max — TIGHT high-rise CBD boxes only. Kept
+    # tight on purpose: outside the downtown core, ground-mounted units are real, so a
+    # too-wide box would wrongly suppress the ground scan. A curated OSM density signal
+    # was tested and rejected — suburban office parks (Herndon, Santa Clara) overlap
+    # downtowns in built-up ratio, and height-limited downtowns (DC) score low — so this
+    # stays a hand-maintained list of genuinely dense high-rise downtowns. Extend as new
+    # cities appear; everywhere else defaults to ground-check ON.
     ("boston",        42.340, 42.366, -71.110, -71.045),
     ("chicago",       41.855, 41.910, -87.660, -87.605),
     ("sf",            37.765, 37.815, -122.435, -122.390),
@@ -542,30 +547,67 @@ def _process_one_address_core(
             ),
         )
 
+    # Address Validation gate (upstream, before any spend): Google's Address Validation
+    # API flags whether it had to infer/could-not-confirm address components. A non-
+    # "confirmed" verdict correlates with our ambiguous_footprint / neighbor_only failures,
+    # so it (a) gets surfaced in the notes and (b) force-runs the Mapbox geocoder cross-
+    # check below even when Google's point happens to land inside a (possibly wrong)
+    # building. Fail-open: validate_address_google returns None on any API error.
+    addr_val = validate_address_google(full_address)
+    addr_poor = bool(addr_val and addr_val.get("verdict") != "confirmed")
+    if addr_poor:
+        log.info(f"Row {i+1}/{total}: Address Validation verdict "
+                 f"'{addr_val['verdict']}' (granularity={addr_val.get('granularity')})")
+
     # Footprint lookup BEFORE any Mapbox tile fetch (one Mapbox call per address)
     log.info(f"Row {i+1}/{total}: Looking up OSM building footprint")
     footprint = get_building_footprint(geo_lat, geo_lon)
 
     # Geocoder fallback: if the Google geocode led to NO footprint or a non-containing
-    # (ambiguous) one, try the Mapbox geocode of the same address — it often resolves to
-    # a different point that DOES sit inside a building. Adopt it only when it lands
-    # inside a footprint. geocoder_retried records that both geocoders were tried (for
-    # the reviewer-facing notes). TransientFootprintError still propagates for re-queue.
+    # (ambiguous) one — OR Address Validation flagged the address as poor — try the Mapbox
+    # geocode of the same address — it often resolves to a different point that DOES sit
+    # inside a building. Adopt it only when it lands inside a footprint. geocoder_retried
+    # records that both geocoders were tried (for the reviewer-facing notes).
+    # TransientFootprintError still propagates for re-queue.
     geocoder_retried = False
-    if GEOCODER_FALLBACK_ENABLED and (footprint is None or not footprint.get('contains_point')):
+    addr_val_diverged = False
+    google_uncontained = (footprint is None or not footprint.get('contains_point'))
+    if GEOCODER_FALLBACK_ENABLED and (google_uncontained or addr_poor):
         try:
             mb_point = geocode_address_mapbox(full_address)
         except Exception:
             mb_point = None
         if mb_point and (abs(mb_point[0] - geo_lat) > 1e-6 or abs(mb_point[1] - geo_lon) > 1e-6):
-            geocoder_retried = True
             mb_fp = get_building_footprint(mb_point[0], mb_point[1])
-            if mb_fp is not None and mb_fp.get('contains_point'):
-                log.info(f"Row {i+1}/{total}: Google geocode gave "
-                         f"{'no footprint' if footprint is None else 'an ambiguous footprint'}; "
-                         f"Mapbox geocode lands inside a building — adopting it")
-                geo_lat, geo_lon = mb_point
-                footprint = mb_fp
+            mb_inside = mb_fp is not None and mb_fp.get('contains_point')
+            if google_uncontained:
+                # Google missed / sat outside any building: adopt Mapbox only when it lands
+                # inside one (unchanged conservative behavior).
+                geocoder_retried = True
+                if mb_inside:
+                    log.info(f"Row {i+1}/{total}: Google geocode gave "
+                             f"{'no footprint' if footprint is None else 'an ambiguous footprint'}; "
+                             f"Mapbox geocode lands inside a building — adopting it")
+                    geo_lat, geo_lon = mb_point
+                    footprint = mb_fp
+            elif mb_inside and mb_fp.get('osm_id') != footprint.get('osm_id'):
+                # Google IS inside a footprint but Address Validation flagged the address,
+                # and Mapbox lands inside a DIFFERENT building. Don't auto-adopt (Google's
+                # containment may well be correct) — flag the divergence for the human pile.
+                addr_val_diverged = True
+                log.info(f"Row {i+1}/{total}: Address Validation flagged '{addr_val['verdict']}'; "
+                         f"Mapbox geocode lands in a different building "
+                         f"(OSM {mb_fp.get('osm_id')} vs {footprint.get('osm_id')}) — flagging divergence")
+
+    # Reviewer-facing Address Validation note, built once and prepended at every exit below.
+    addr_val_note = ""
+    if addr_poor:
+        addr_val_note = (
+            f"[ADDRESS VALIDATION: {addr_val['verdict']}; inferred={addr_val['has_inferred']} "
+            f"unconfirmed={addr_val['has_unconfirmed']} granularity={addr_val.get('granularity') or 'n/a'}"
+            + ("; Mapbox geocode diverged to a different building" if addr_val_diverged else "")
+            + "]"
+        )
 
     clean_addr = re.sub(r'[\\/*?:"<>| ,]', '_', str(row['Address'])[:50])
     original_local = os.path.join(
@@ -622,6 +664,8 @@ def _process_one_address_core(
         result_url = make_signed_url(result_blob)
 
         notes = _build_notes({'verdict': 'footprint_missing', 'geocoder_retried': geocoder_retried})
+        if addr_val_note:
+            notes = f"{addr_val_note} {notes}".strip()
         web_entry = _build_web_entry(
             full_address=full_address,
             verdict='footprint_missing',
@@ -670,6 +714,8 @@ def _process_one_address_core(
             'footprint_source': footprint.get('source'),
             'geocoder_retried': geocoder_retried,
         })
+        if addr_val_note:
+            notes = f"{addr_val_note} {notes}".strip()
         return (
             _build_web_entry(
                 full_address=full_address, verdict='ambiguous_footprint',
@@ -975,6 +1021,8 @@ def _process_one_address_core(
         _prim = "Mapbox" if dense else "Google"
         notes = (f"[IMAGERY RETRY: VLM flagged the {_prim} tile unusable (e.g. tall building "
                  f"shown at an oblique angle); re-analyzed on {alt_provider.capitalize()} imagery] {notes}").strip()
+    if addr_val_note:
+        notes = f"{addr_val_note} {notes}".strip()
 
     web_entry = _build_web_entry(
         full_address=full_address,
