@@ -1,13 +1,21 @@
 {
-  "name": "Parity Cooling Tower — Sheet → Analyze → Emailed Report",
+  "name": "Parity Cooling Tower — Webhook → Sheet → Grok → Railway → Email → Slack",
   "nodes": [
     {
-      "parameters": {},
-      "id": "node-start",
-      "name": "Start",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [-80, 300]
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cooling-tower-run",
+        "responseMode": "onReceived",
+        "responseData": "={{ { \"status\": \"started\" } }}",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-100, 300],
+      "webhookId": "cooling-tower-run",
+      "notes": "POST to this URL to kick off a run. Responds immediately ('started') so it never times out on a long batch; the rest runs async and confirms via Slack."
     },
     {
       "parameters": {
@@ -28,53 +36,59 @@
       "name": "Read addresses",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.5,
-      "position": [160, 300],
+      "position": [120, 300],
       "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "REPLACE",
-          "name": "Google Sheets account"
-        }
+        "googleSheetsOAuth2Api": { "id": "REPLACE", "name": "Google Sheets account" }
       },
       "notes": "Reads every row. Required column: Address. Optional: Boro_Area, Zip."
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "x-goog-api-key", "value": "REPLACE_WITH_GEMINI_API_KEY" }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { contents: [ { parts: [ { text: \"You normalize US building addresses for geocoding. Output ONLY one clean line as `number street, city, STATE ZIP` with no commentary, no quotes. Input: \" + ([$json.Address, $json.Boro_Area, $json.Zip].filter(Boolean).join(', ')) } ] } ] } }}",
+        "promptType": "define",
+        "text": "=You normalize US building addresses for geocoding. Output ONLY one clean line as `number street, city, STATE ZIP` with no commentary and no quotes. Input: {{ [$json.Address, $json.Boro_Area, $json.Zip].filter(Boolean).join(', ') }}"
+      },
+      "id": "node-llmchain",
+      "name": "Normalize (Grok)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [340, 300],
+      "notes": "Cleans each row's address with Grok before geocoding. Output field: `text`."
+    },
+    {
+      "parameters": {
+        "model": "grok-4.3",
         "options": {}
       },
-      "id": "node-normalize",
-      "name": "Normalize (optional)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [380, 300],
-      "disabled": true,
-      "notes": "DISABLED by default → rows pass through unchanged. Enable to clean messy address formats with Gemini before geocoding. 'Build address' reads both this node's output and the raw row, so enabling/disabling needs no other change."
+      "id": "node-grok",
+      "name": "Grok Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatXAiGrok",
+      "typeVersion": 1,
+      "position": [340, 480],
+      "credentials": {
+        "xAiApi": { "id": "REPLACE", "name": "xAI account" }
+      },
+      "notes": "If your n8n version lacks the xAI Grok node, swap this for any Chat Model sub-node (OpenAI, Gemini, etc.) — the chain is model-agnostic."
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "// Compose the address the analyzer expects. Works whether or not the\n// optional Gemini normalize node above is enabled:\n//  - disabled: $json is the raw sheet row → compose from columns\n//  - enabled:  $json is the Gemini response → use normalized text,\n//              falling back to the raw row referenced by node name.\nconst raw = $('Read addresses').item.json;\nlet normalized = '';\ntry { normalized = $json.candidates[0].content.parts[0].text.trim(); } catch (e) {}\nconst address = normalized || [raw.Address, raw.Boro_Area, raw.Zip].filter(Boolean).join(', ');\nreturn { json: { address, boro_area: raw.Boro_Area || '', zip: raw.Zip || '' } };"
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            { "fieldToAggregate": "text", "renameField": true, "outputFieldName": "addresses" }
+          ]
+        },
+        "options": {}
       },
-      "id": "node-build",
-      "name": "Build address",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [600, 300]
+      "id": "node-aggregate",
+      "name": "Collect addresses",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [560, 300],
+      "notes": "Turns the per-row normalized addresses into one list (`addresses`) for the single batch call to Railway."
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "https://REPLACE-WITH-RAILWAY-APP.up.railway.app/api/analyze",
+        "url": "https://REPLACE-WITH-RAILWAY-APP.up.railway.app/api/run",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -83,53 +97,18 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ { address: $json.address, boro_area: $json.boro_area, zip: $json.zip } }}",
-        "options": { "timeout": 300000 }
+        "jsonBody": "={{ { addresses: $json.addresses, title: 'Cooling Tower Analysis' } }}",
+        "options": {
+          "timeout": 1800000,
+          "response": { "response": { "responseFormat": "text" } }
+        }
       },
-      "id": "node-analyze",
-      "name": "Analyze",
+      "id": "node-railway",
+      "name": "Analyze on Railway",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [820, 300],
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 5000,
-      "alwaysOutputData": true,
-      "onError": "continueRegularOutput",
-      "notes": "Runs once per address (n8n executes HTTP per input item). Retries transient failures; a permanently failing address still flows through (alwaysOutputData) so the batch never aborts."
-    },
-    {
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// Gather every analyzed address into one payload for the report.\nconst results = $input.all().map(i => i.json);\nreturn [{ json: { results, title: 'Cooling Tower Analysis' } }];"
-      },
-      "id": "node-collect",
-      "name": "Collect results",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [1040, 300]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://REPLACE-WITH-RAILWAY-APP.up.railway.app/api/report",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "X-API-Key", "value": "REPLACE_WITH_ANALYZE_API_KEY" }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { results: $json.results, title: $json.title } }}",
-        "options": { "response": { "response": { "responseFormat": "text" } } }
-      },
-      "id": "node-report",
-      "name": "Build report",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [1260, 300],
-      "notes": "Returns the self-contained HTML report as text (in $json.data)."
+      "position": [780, 300],
+      "notes": "One batch call: Railway analyzes every address and returns the finished self-contained HTML report (in $json.data). Long timeout — a big sheet can take many minutes."
     },
     {
       "parameters": {
@@ -140,27 +119,45 @@
         "options": {}
       },
       "id": "node-email",
-      "name": "Send report",
+      "name": "Email report",
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.1,
-      "position": [1480, 300],
+      "position": [1000, 300],
       "credentials": {
-        "gmailOAuth2": {
-          "id": "REPLACE",
-          "name": "Gmail account"
-        }
+        "gmailOAuth2": { "id": "REPLACE", "name": "Gmail account" }
       },
-      "notes": "Inlines the HTML report. Add the same HTML as a .html attachment via Options → Attachments if you prefer."
+      "notes": "Inlines the HTML report. Add it as a .html attachment via Options → Attachments if you prefer."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "=✅ Cooling tower analysis complete — {{ $('Collect addresses').item.json.addresses.length }} addresses analyzed, report emailed.",
+        "otherOptions": {}
+      },
+      "id": "node-slack",
+      "name": "Slack confirmation",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1220, 300],
+      "credentials": {
+        "slackApi": { "id": "REPLACE", "name": "Slack account" }
+      },
+      "notes": "Posts a confirmation with the address count once the report is emailed."
     }
   ],
   "connections": {
-    "Start": { "main": [[{ "node": "Read addresses", "type": "main", "index": 0 }]] },
-    "Read addresses": { "main": [[{ "node": "Normalize (optional)", "type": "main", "index": 0 }]] },
-    "Normalize (optional)": { "main": [[{ "node": "Build address", "type": "main", "index": 0 }]] },
-    "Build address": { "main": [[{ "node": "Analyze", "type": "main", "index": 0 }]] },
-    "Analyze": { "main": [[{ "node": "Collect results", "type": "main", "index": 0 }]] },
-    "Collect results": { "main": [[{ "node": "Build report", "type": "main", "index": 0 }]] },
-    "Build report": { "main": [[{ "node": "Send report", "type": "main", "index": 0 }]] }
+    "Webhook": { "main": [[{ "node": "Read addresses", "type": "main", "index": 0 }]] },
+    "Read addresses": { "main": [[{ "node": "Normalize (Grok)", "type": "main", "index": 0 }]] },
+    "Grok Chat Model": { "ai_languageModel": [[{ "node": "Normalize (Grok)", "type": "ai_languageModel", "index": 0 }]] },
+    "Normalize (Grok)": { "main": [[{ "node": "Collect addresses", "type": "main", "index": 0 }]] },
+    "Collect addresses": { "main": [[{ "node": "Analyze on Railway", "type": "main", "index": 0 }]] },
+    "Analyze on Railway": { "main": [[{ "node": "Email report", "type": "main", "index": 0 }]] },
+    "Email report": { "main": [[{ "node": "Slack confirmation", "type": "main", "index": 0 }]] }
   },
   "settings": { "executionOrder": "v1" }
 }

@@ -80,6 +80,50 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def _analyze_one(address, boro_area=None, zip_code=None, total=1):
+    """Run the per-address pipeline once and return a self-contained web_entry
+    (images as data: URIs). Never raises — pipeline failures are encoded in the
+    entry's error/verdict fields so a batch keeps going on a bad address."""
+    address = (address or "").strip()
+    record = {"Address": address}
+    if boro_area:
+        record["Boro_Area"] = str(boro_area).strip()
+    if zip_code:
+        record["Zip"] = str(zip_code).strip()
+    df = pd.DataFrame([record])
+    row = df.iloc[0]
+    columns = list(df.columns)
+    job_id = f"api-{uuid.uuid4().hex[:8]}"
+    sink = Base64Sink()
+    try:
+        web_entry, _csv_row = _process_one_address(
+            row, 0, columns, total, job_id, sink.upload_file, sink.make_signed_url
+        )
+    except Exception as e:  # transient footprint / unexpected — surface, don't crash
+        log.error("analyze failed for %r: %s", address, e, exc_info=True)
+        web_entry = _build_web_entry(
+            full_address=address, verdict="", consensus_dict=None,
+            detection_count=0, construction=False,
+            notes=f"Analyzer error: {e}",
+            original_url=None, result_url=None,
+            error="Analyzer Error",
+        )
+    return web_entry
+
+
+def _coerce_address_item(item):
+    """Accept either a plain address string or a {address, boro_area, zip} dict."""
+    if isinstance(item, str):
+        return item.strip(), None, None
+    if isinstance(item, dict):
+        return (
+            (item.get("address") or "").strip(),
+            item.get("boro_area"),
+            item.get("zip"),
+        )
+    return "", None, None
+
+
 @api.route("/analyze", methods=["POST"])
 @require_key
 def analyze():
@@ -90,33 +134,33 @@ def analyze():
     address = (body.get("address") or "").strip()
     if not address:
         return jsonify({"error": "missing 'address'"}), 400
+    return jsonify(_analyze_one(address, body.get("boro_area"), body.get("zip")))
 
-    # Build a one-row frame matching the CSV schema the pipeline expects.
-    record = {"Address": address}
-    if body.get("boro_area"):
-        record["Boro_Area"] = str(body["boro_area"]).strip()
-    if body.get("zip"):
-        record["Zip"] = str(body["zip"]).strip()
-    df = pd.DataFrame([record])
-    row = df.iloc[0]
-    columns = list(df.columns)
 
-    job_id = f"api-{uuid.uuid4().hex[:8]}"
-    sink = Base64Sink()
-    try:
-        web_entry, _csv_row = _process_one_address(
-            row, 0, columns, 1, job_id, sink.upload_file, sink.make_signed_url
-        )
-    except Exception as e:  # transient footprint / unexpected — surface, don't 500
-        log.error("analyze failed for %r: %s", address, e, exc_info=True)
-        web_entry = _build_web_entry(
-            full_address=address, verdict="", consensus_dict=None,
-            detection_count=0, construction=False,
-            notes=f"Analyzer error: {e}",
-            original_url=None, result_url=None,
-            error="Analyzer Error",
-        )
-    return jsonify(web_entry)
+@api.route("/run", methods=["POST"])
+@require_key
+def run():
+    """Batch endpoint: analyze a whole list of addresses and return the finished
+    self-contained HTML audit report. This is the single Railway call the n8n
+    workflow makes (Sheet -> normalize -> /api/run -> email), so n8n doesn't have
+    to loop per address. Body: {addresses: [str | {address,boro_area,zip}], title?}.
+    Returns text/html."""
+    body = request.get_json(silent=True) or {}
+    addresses = body.get("addresses")
+    if not isinstance(addresses, list) or not addresses:
+        return jsonify({"error": "'addresses' must be a non-empty list"}), 400
+    title = (body.get("title") or "Cooling Tower Analysis").strip()
+
+    results = []
+    total = len(addresses)
+    for item in addresses:
+        addr, boro, zc = _coerce_address_item(item)
+        if not addr:
+            continue
+        results.append(_analyze_one(addr, boro, zc, total=total))
+
+    html_str = build_audit_report(results, title=title)
+    return Response(html_str, mimetype="text/html")
 
 
 @api.route("/report", methods=["POST"])
