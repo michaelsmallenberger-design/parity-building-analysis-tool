@@ -18,6 +18,12 @@ GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")  # geocoding + Static Map
 # tiles; YOLO detects that text as equipment. Mask the bottom strip this many px (0=off).
 GOOGLE_WATERMARK_PX = int(os.getenv("GOOGLE_WATERMARK_PX", "40"))
 
+# Google Address Validation API — upstream address-quality gate (separate API from
+# Geocoding; must be enabled on the same project/key). Fail-open: any API error returns
+# None so the pipeline behaves exactly as before. NOTE: HELD/unshipped — verdict adds
+# ~nil value on clean address lists (see memory project_parity_google_geocoder_ab).
+ADDRESS_VALIDATION_ENABLED = os.getenv("ADDRESS_VALIDATION_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # YOLO model path (can override with env)
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("models", "rooftop_model.pt"))
 
@@ -92,6 +98,81 @@ def _http_get(url: str, params: dict) -> Optional[dict]:
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_BACKOFF * attempt)
     return None
+
+
+def _http_post(url: str, json_body: dict, params: dict = None) -> Optional[dict]:
+    """POST sibling of _http_get for JSON APIs (e.g. Address Validation, which is POST-only).
+    Same retry/backoff/timeout policy. Returns parsed JSON dict or None on failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, params=params, json=json_body, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                log.warning("HTTP %s from POST %s %s", r.status_code, url, r.text[:200])
+        except requests.RequestException as e:
+            log.warning("HTTP error on POST %s: %s", url, e)
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_BACKOFF * attempt)
+    return None
+
+
+def validate_address_google(query: str) -> Optional[dict]:
+    """Google Address Validation API — upstream address-quality check, BEFORE geocoding.
+    Returns a compact dict or None (None = disabled / API error / no result; fail-open).
+
+    {
+      "verdict": "confirmed" | "coarse" | "unconfirmed",
+      "has_inferred": bool,      # Google had to guess a component (informational only)
+      "has_unconfirmed": bool,   # Google could not confirm a component
+      "granularity": str,        # validationGranularity (e.g. PREMISE, ROUTE, OTHER)
+      "formatted": str,          # standardized address
+    }
+
+    verdict: "unconfirmed" if any component is unconfirmed; else "coarse" if granularity
+    is coarser than PREMISE/SUB_PREMISE; else "confirmed".
+
+    NOTE: hasInferredComponents is deliberately NOT part of the verdict — it is ~always
+    true on well-formed addresses (Google infers ZIP+4 / subpremises on virtually every
+    real address; measured true on 9/9 varied real addresses incl. landmarks), so using
+    it as a trigger would fire on nearly everything. The discriminating signals are
+    unconfirmed components and coarse granularity, which correlate with our
+    ambiguous_footprint / neighbor_only failures; callers use a non-"confirmed" verdict to
+    trigger the geocoder cross-check early."""
+    if not ADDRESS_VALIDATION_ENABLED:
+        return None
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot validate address")
+        return None
+    data = _http_post(
+        "https://addressvalidation.googleapis.com/v1:validateAddress",
+        {"address": {"addressLines": [query]}},
+        params={"key": GOOGLE_MAPS_API_KEY},
+    )
+    if not data or "result" not in data:
+        return None
+    result = data["result"]
+    verdict_obj = result.get("verdict", {})
+    has_inferred = bool(verdict_obj.get("hasInferredComponents"))
+    has_unconfirmed = bool(verdict_obj.get("hasUnconfirmedComponents"))
+    granularity = verdict_obj.get("validationGranularity", "")
+    fine = granularity in ("PREMISE", "SUB_PREMISE")
+    if has_unconfirmed:
+        verdict = "unconfirmed"
+    elif not fine:
+        verdict = "coarse"
+    else:
+        verdict = "confirmed"
+    formatted = result.get("address", {}).get("formattedAddress", "")
+    log.info("Address Validation '%s' -> %s (granularity=%s inferred=%s unconfirmed=%s)",
+             query, verdict, granularity, has_inferred, has_unconfirmed)
+    return {
+        "verdict": verdict,
+        "has_inferred": has_inferred,
+        "has_unconfirmed": has_unconfirmed,
+        "granularity": granularity,
+        "formatted": formatted,
+    }
 
 
 def _clean_address(address: str) -> List[str]:
