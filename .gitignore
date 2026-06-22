@@ -15,8 +15,12 @@ config.py
 # Ignore deployed service manifest (may contain secrets)
 service.yaml
 
-# Ignore trained model weights (too large for git, stored on Google Drive)
+# Ignore trained model weights by default (large; experimental weights stay local)
 models/*.pt
+# ...but the two production ensemble weights (MODEL_PATHS) MUST ship in the image:
+# Railway builds from GitHub, so anything not committed is absent from the container.
+!models/rooftop_model.pt
+!models/rooftop_model_prev.pt
 
 # Secrets and env files
 .env
