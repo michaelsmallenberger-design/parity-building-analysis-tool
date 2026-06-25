@@ -210,6 +210,7 @@ class _VerificationResponse(BaseModel):
     construction: bool
     is_house: bool
     image_unusable: bool = False
+    frame_inadequate: bool = False
 
 
 class _RooftopResponse(BaseModel):
@@ -234,6 +235,7 @@ def _needs_review(reasoning: str) -> dict:
         "construction": False,
         "is_house": False,
         "image_unusable": False,
+        "frame_inadequate": False,
     }
 
 
@@ -489,7 +491,7 @@ Two jobs, equally important:
 1. VERIFY the numbered boxes — decide which, if any, contain a real cooling tower serving the target building.
 2. FIND what YOLO MISSED — scan the rest of the target's roof and its immediate surroundings for any cooling tower with NO box around it. A real cooling tower that YOLO failed to box still counts — report it.
 
-Return a structured JSON response with six fields: verdict, confidence, reasoning, construction, is_house, image_unusable. Be calibrated and honest about uncertainty."""
+Return a structured JSON response with seven fields: verdict, confidence, reasoning, construction, is_house, image_unusable, frame_inadequate. Be calibrated and honest about uncertainty."""
 
 _ADDRESS_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -517,6 +519,8 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
 Set "image_unusable": true ONLY if you cannot properly judge the target building because its roof is not clearly visible from directly above in THIS image — for example a tall tower shown leaning at a steep oblique angle so you see its glass facade instead of its roof, or the target's roof is cut off at the edge of the frame. This tells the system to retry with a different satellite source. If you can see the target's roof clearly (even if it simply has no cooling tower on it), set it false.
+
+Set "frame_inadequate": true ONLY when you are about to call "not_detected" or "neighbor_only" AND the image is zoomed in tightly enough that a GROUND-MOUNTED cooling tower serving the target could be sitting just outside the frame — i.e. the target building fills most of the view and you cannot see the immediately-adjacent ground, pads, yards, alleys, or mechanical enclosures where such a unit would sit. This tells the system to re-pull a WIDER view and look again. Think this through deliberately before setting it: if the surroundings you can ALREADY see are enough to rule out a ground-mounted unit, set false. And if you have ALREADY found a real cooling tower serving the target (a "confirmed" or "likely" verdict), set it false — you already have the information you need, so there is no reason to look elsewhere. This is separate from "image_unusable" (which is about the target's roof not being visible at all).
 
 Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
 
@@ -596,6 +600,8 @@ def _result_from_validated(parsed: _VerificationResponse) -> dict:
         "is_house": parsed.is_house,
         # Only the address schema carries image_unusable; rooftop schema lacks it.
         "image_unusable": bool(getattr(parsed, "image_unusable", False)),
+        # Gemini-only ground-CT "look wider" signal; rooftop schema lacks it.
+        "frame_inadequate": bool(getattr(parsed, "frame_inadequate", False)),
     }
 
 
@@ -1435,6 +1441,9 @@ def _combine_verdicts(
         "is_house": final_is_house,
         # If EITHER model couldn't see the target roof, flag for an imagery retry.
         "image_unusable": bool(gemini_result.get("image_unusable") or grok_result.get("image_unusable")),
+        # Gemini-only: re-pull a wider view to rule out a ground-mounted CT outside a tight
+        # frame. Deliberately NOT ORed with Grok — this judgment is Gemini's job alone.
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
         "gemini": gemini_result,
         "grok": grok_result,
         "agreement": agree and confident,
