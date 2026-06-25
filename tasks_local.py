@@ -29,7 +29,6 @@ from geometry import (
 from nyc_opendata import lookup_nyc_registry, _in_nyc
 from vlm import verify_detection, verify_rooftop, verify_address
 from pipeline_render import render_annotated_image, render_marked_tile
-from html_report import generate_html_report
 
 log = logging.getLogger("tasks")
 
@@ -350,6 +349,8 @@ def _build_web_entry(
         is_house = bool(consensus_dict.get('is_house'))
         gemini_is_house = gemini.get('is_house')
         grok_is_house = grok.get('is_house')
+        gemini_reasoning = gemini.get('reasoning', '')
+        grok_reasoning = grok.get('reasoning', '')
     else:
         confidence_score = None
         reasoning = ''
@@ -361,6 +362,8 @@ def _build_web_entry(
         is_house = None
         gemini_is_house = None
         grok_is_house = None
+        gemini_reasoning = ''
+        grok_reasoning = ''
 
     entry = {
         "address": full_address,
@@ -375,8 +378,10 @@ def _build_web_entry(
         "agreement": agreement,
         "gemini_verdict": gemini_verdict,
         "gemini_confidence": gemini_confidence,
+        "gemini_reasoning": gemini_reasoning,
         "grok_verdict": grok_verdict,
         "grok_confidence": grok_confidence,
+        "grok_reasoning": grok_reasoning,
         "is_house": is_house,
         "gemini_is_house": gemini_is_house,
         "grok_is_house": grok_is_house,
@@ -967,6 +972,38 @@ def _process_one_address_core(
                 render_src, render_wide = retry_detail, None
                 imagery_retried = True
 
+    # Frame-inadequate zoom-out retry (Gemini-only signal): if Gemini judged the detail
+    # frame too tight to rule out a GROUND-MOUNTED cooling tower sitting just outside it,
+    # and we didn't already do the provider-swap retry, re-pull a WIDER tile so the adjacent
+    # ground / pads / yards are in frame and re-run once. Skipped on a positive verdict — we
+    # already have what we need. Adopt the wider-view verdict (resolves, or lands needs_review).
+    wide_retry = wr_marked = None
+    frame_retried = False
+    if (IMAGERY_RETRY_ENABLED and not imagery_retried
+            and consensus_dict.get('frame_inadequate')
+            and consensus_dict.get('verdict') not in _POSITIVE_VERDICTS):
+        log.info(f"Row {i+1}/{total}: Gemini flagged frame too tight for a ground-CT call; "
+                 f"retrying at wider zoom {MAPBOX_ZOOM_WIDE}")
+        wide_retry = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_widefit.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, wide_retry, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+            wr_dets = _detect_on_tile(wide_retry, MAPBOX_ZOOM_WIDE, footprint,
+                                      centroid_lat, centroid_lon, keep_outside=keep_outside)
+            wr_marked = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_widefit_marked.jpg")
+            render_marked_tile(wide_retry, wr_marked, footprint,
+                               centroid_lat, centroid_lon, wr_dets, zoom=MAPBOX_ZOOM_WIDE)
+            # Hand the original tight z19 tile back in as cross-zoom context for fine detail.
+            wr_ctx = {**base_ctx, "tile_zoom": MAPBOX_ZOOM_WIDE, "context_zoom": MAPBOX_ZOOM}
+            wr_result = verify_address(
+                wr_marked, wr_ctx, n_boxes=len(wr_dets),
+                context_image_path=original_local, closeup_image_path=None)
+            log.info(f"Row {i+1}/{total}: wider-view retry verdict={wr_result.get('verdict')}")
+            consensus_dict = wr_result
+            detection_count = len(wr_dets)
+            rooftop_path = (detection_count == 0)
+            enriched = [{**d, 'vlm_result': consensus_dict} for d in wr_dets]
+            render_src, render_wide = wide_retry, None
+            frame_retried = True
+
     # Render BOTH tiles so manual review always has a clear close-up plus context.
     def _render_tile(tile_path, tile_zoom, out_path):
         if not tile_path:
@@ -1021,6 +1058,11 @@ def _process_one_address_core(
         _prim = "Mapbox" if dense else "Google"
         notes = (f"[IMAGERY RETRY: VLM flagged the {_prim} tile unusable (e.g. tall building "
                  f"shown at an oblique angle); re-analyzed on {alt_provider.capitalize()} imagery] {notes}").strip()
+    if frame_retried:
+        # Tell the reviewer why the analysis looks at a wider tile than usual.
+        notes = (f"[WIDER-VIEW RETRY: the close-up was too zoomed in to rule out a ground-mounted "
+                 f"cooling tower next to the building, so it was re-checked on a wider view that "
+                 f"includes the surrounding ground] {notes}").strip()
     if addr_val_note:
         notes = f"{addr_val_note} {notes}".strip()
 
@@ -1048,7 +1090,7 @@ def _process_one_address_core(
 
     for p in (original_local, wide_local, annotated_local, annotated_wide_local,
               marked_detail, marked_wide, retry_detail, retry_marked,
-              closeup_local, retry_closeup):
+              closeup_local, retry_closeup, wide_retry, wr_marked):
         try:
             if p and os.path.exists(p):
                 os.remove(p)
@@ -1347,12 +1389,32 @@ def process_address_list(
             return get_file_path(blob_path)
 
         try:
-            generate_html_report(
-                web_results=web_results,
-                job_id=job_id,
-                output_path=html_local,
-                get_local_path_func=blob_to_local
+            # Default report format: report_audit audit cards (clickable lightbox +
+            # Google Maps/Earth/Bing location links), dark theme. Annotated tiles are
+            # embedded as base64 data URIs so the downloaded HTML works offline.
+            import base64
+            import copy as _copy
+            from report_audit import build_audit_report
+            report_results = _copy.deepcopy(web_results)
+            for _e in report_results:
+                for _k in ("result_image_url", "result_image_url_wide", "original_image_url"):
+                    _u = _e.get(_k)
+                    if not isinstance(_u, str) or not _u:
+                        continue
+                    _bp = _u[len("/files/"):] if _u.startswith("/files/") else _u
+                    try:
+                        _b = blob_to_local(_bp).read_bytes()
+                        _e[_k] = "data:image/jpeg;base64," + base64.b64encode(_b).decode("ascii")
+                    except (OSError, AttributeError):
+                        pass
+            _report_html = build_audit_report(
+                report_results,
+                title=f"Cooling Tower Analysis — {job_id}",
+                email_mode=False,
+                dark=True,
             )
+            with open(html_local, "w", encoding="utf-8") as _f:
+                _f.write(_report_html)
 
             # Upload HTML report
             html_blob = f"results/{job_id}/Report_{job_id}.html"
