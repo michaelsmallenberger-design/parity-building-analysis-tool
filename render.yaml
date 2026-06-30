@@ -19,6 +19,8 @@ services:
         sync: false
       - key: ANALYZE_API_KEY
         sync: false
+      - key: ANALYZE_FILE_MAX_ROWS
+        value: "250"
       - key: GEOCODER_PROVIDER
         value: google
       - key: IMAGERY_PROVIDER

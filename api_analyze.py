@@ -23,8 +23,10 @@ fully self-contained and report_audit embeds it directly. No object storage.
 import base64
 import logging
 import os
+import tempfile
 import uuid
 from functools import wraps
+from pathlib import Path
 
 import pandas as pd
 from flask import Blueprint, jsonify, request, Response
@@ -35,6 +37,21 @@ from report_audit import build_audit_report
 log = logging.getLogger("api")
 
 api = Blueprint("api", __name__, url_prefix="/api")
+
+ADDRESS_COLUMNS = [
+    "Address", "address", "ADDRESS",
+    "Property Address", "property address", "PROPERTY ADDRESS",
+    "PropertyAddress", "propertyaddress", "PROPERTYADDRESS",
+    "Street Address", "street address", "STREET ADDRESS",
+    "StreetAddress", "streetaddress", "STREETADDRESS",
+    "Building Address", "building address", "BUILDING ADDRESS",
+    "BuildingAddress", "buildingaddress", "BUILDINGADDRESS",
+    "Property_Address", "property_address", "PROPERTY_ADDRESS",
+    "Street_Address", "street_address", "STREET_ADDRESS",
+    "Building_Address", "building_address", "BUILDING_ADDRESS",
+]
+BORO_COLUMNS = ["Boro_Area", "boro_area", "Borough", "borough", "City", "city"]
+ZIP_COLUMNS = ["Zip", "ZIP", "zip", "Zip Code", "zip code", "Postal Code", "postal code"]
 
 
 class Base64Sink:
@@ -124,6 +141,98 @@ def _coerce_address_item(item):
     return "", None, None
 
 
+def _norm_column_name(value):
+    return " ".join(str(value).strip().lower().replace("_", " ").split())
+
+
+def _first_present(columns, candidates):
+    lookup = {_norm_column_name(column): column for column in columns}
+    for name in candidates:
+        match = lookup.get(_norm_column_name(name))
+        if match is not None:
+            return match
+    return None
+
+
+def _read_csv_with_fallback(path):
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=encoding, sep=None, engine="python")
+        except Exception as e:
+            last_error = e
+    raise last_error
+
+
+def _read_uploaded_address_file(uploaded_file):
+    """Read uploaded CSV/XLS/XLSX and return /api/run-compatible address items."""
+    filename = uploaded_file.filename or "addresses"
+    suffix = Path(filename).suffix.lower()
+    max_rows = int(os.environ.get("ANALYZE_FILE_MAX_ROWS", "250"))
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".xlsx") as tmp:
+        uploaded_file.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        try:
+            if suffix in {".xlsx", ".xls"}:
+                df = pd.read_excel(tmp_path)
+            elif suffix == ".csv":
+                df = _read_csv_with_fallback(tmp_path)
+            elif not suffix:
+                try:
+                    df = pd.read_excel(tmp_path)
+                except Exception:
+                    df = _read_csv_with_fallback(tmp_path)
+            else:
+                raise ValueError("Upload must be an .xlsx, .xls, or .csv file")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Could not read uploaded file: {e}") from e
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    if df.empty:
+        raise ValueError("Uploaded file has no rows")
+
+    address_col = _first_present(df.columns, ADDRESS_COLUMNS)
+    if not address_col:
+        raise ValueError(
+            "Uploaded file must include an address column. Supported names include "
+            "Address, Property Address, Street Address, and Building Address. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    boro_col = _first_present(df.columns, BORO_COLUMNS)
+    zip_col = _first_present(df.columns, ZIP_COLUMNS)
+
+    items = []
+    for _, row in df.iterrows():
+        address = row.get(address_col)
+        if pd.isna(address) or not str(address).strip():
+            continue
+        item = {"address": str(address).strip()}
+        if boro_col and pd.notna(row.get(boro_col)) and str(row.get(boro_col)).strip():
+            item["boro_area"] = str(row.get(boro_col)).strip()
+        if zip_col and pd.notna(row.get(zip_col)) and str(row.get(zip_col)).strip():
+            item["zip"] = str(row.get(zip_col)).strip()
+        items.append(item)
+
+    if not items:
+        raise ValueError("Uploaded file has no usable address rows")
+    if len(items) > max_rows:
+        raise ValueError(
+            f"Uploaded file has {len(items)} address rows, above the safety limit of "
+            f"{max_rows}. Split the file or raise ANALYZE_FILE_MAX_ROWS on the server."
+        )
+    return items
+
+
 @api.route("/analyze", methods=["POST"])
 @require_key
 def analyze():
@@ -160,7 +269,42 @@ def run():
         results.append(_analyze_one(addr, boro, zc, total=total))
 
     html_str = build_audit_report(results, title=title)
-    return Response(html_str, mimetype="text/html")
+    response = Response(html_str, mimetype="text/html")
+    response.headers["X-Address-Count"] = str(total)
+    return response
+
+
+@api.route("/run-file", methods=["POST"])
+@require_key
+def run_file():
+    """Analyze an uploaded Excel/CSV file and return the finished audit report.
+
+    Intended for n8n Form/Webhook upload flows: n8n receives the file, forwards it
+    as multipart/form-data field `file`, then emails this endpoint's HTML body.
+    """
+    uploaded = request.files.get("file") or request.files.get("data")
+    if not uploaded or uploaded.filename == "":
+        return jsonify({"error": "missing uploaded file field named 'file'"}), 400
+
+    try:
+        addresses = _read_uploaded_address_file(uploaded)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    title = (request.form.get("title") or "Cooling Tower Analysis").strip()
+    results = []
+    total = len(addresses)
+    for item in addresses:
+        addr, boro, zc = _coerce_address_item(item)
+        if not addr:
+            continue
+        results.append(_analyze_one(addr, boro, zc, total=total))
+
+    html_str = build_audit_report(results, title=title)
+    response = Response(html_str, mimetype="text/html")
+    response.headers["X-Address-Count"] = str(total)
+    response.headers["X-Uploaded-Filename"] = uploaded.filename
+    return response
 
 
 @api.route("/report", methods=["POST"])
