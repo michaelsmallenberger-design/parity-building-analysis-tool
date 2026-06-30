@@ -32,6 +32,8 @@ When Render creates the service from the blueprint, it should ask for these secr
 
 Use a long random value for `ANALYZE_API_KEY`; n8n will send it in the `X-API-Key` header.
 
+The blueprint also sets `ANALYZE_FILE_MAX_ROWS=250` for uploaded spreadsheets. Raise it only when you intentionally want larger paid batches.
+
 ## Dashboard Steps
 
 1. Push this branch to GitHub.
@@ -69,9 +71,52 @@ curl -X POST "https://YOUR-SERVICE.onrender.com/api/run" \
 
 ## n8n
 
-After the Render service is live, open `n8n/parity_cooling_tower.workflow.json` in n8n and update the analyzer HTTP node:
+After the Render service is live, import one of these workflows into n8n:
+
+- `n8n/parity_excel_upload.workflow.json`: upload an Excel/CSV file through an n8n form.
+- `n8n/parity_cooling_tower.workflow.json`: read addresses from a Google Sheet.
+
+For the Excel upload workflow, update the analyzer HTTP node:
+
+- URL: `https://YOUR-SERVICE.onrender.com/api/run-file`
+- Header: `X-API-Key: <same ANALYZE_API_KEY from Render>`
+
+For the Google Sheet workflow, update the analyzer HTTP node:
 
 - URL: `https://YOUR-SERVICE.onrender.com/api/run`
 - Header: `X-API-Key: <same ANALYZE_API_KEY from Render>`
 
 The workflow still needs its own Google Sheets, xAI, Gmail, and optional Slack credentials.
+
+## Excel Upload Endpoint
+
+For a simpler n8n workflow where a user uploads an Excel/CSV file instead of maintaining a Google Sheet, call:
+
+```text
+POST https://YOUR-SERVICE.onrender.com/api/run-file
+```
+
+Headers:
+
+```text
+X-API-Key: <same ANALYZE_API_KEY from Render>
+```
+
+Multipart form fields:
+
+- `file`: `.xlsx`, `.xls`, or `.csv`
+- `title`: optional report title
+
+The uploaded file must contain an address column. Supported names include:
+
+- `Address`
+- `Property Address`
+- `Street Address`
+- `Building Address`
+
+Optional context columns:
+
+- `Boro_Area`, `Borough`, or `City`
+- `Zip`, `Zip Code`, or `Postal Code`
+
+The endpoint parses the file, runs the analysis, and returns `text/html` for n8n to email.
