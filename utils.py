@@ -515,6 +515,52 @@ def get_satellite_image_google(lat: float, lon: float, out_path: str, zoom: int 
         return False
 
 
+def get_streetview_image_google(lat: float, lon: float, out_path: str,
+                                fov: int = 100, pitch: int = 15) -> bool:
+    """Google Street View Static API ground-level photo. Heading is intentionally
+    omitted -- Google then auto-aims the camera at (lat, lon) from the nearest
+    panorama, which tracks the existing geocoded point with no extra bearing math.
+    Checks /streetview/metadata first (free) so a location with no coverage costs
+    nothing and returns False instead of saving Google's gray "no imagery" tile.
+    source=outdoor excludes indoor business "Photo Sphere" panoramas (e.g. a shop's
+    interior tour) that the default search will otherwise return as the "nearest"
+    match when they happen to sit closer than any car-mounted street imagery."""
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot use Street View")
+        return False
+    try:
+        meta = requests.get(
+            "https://maps.googleapis.com/maps/api/streetview/metadata",
+            params={"location": f"{lat:.7f},{lon:.7f}", "source": "outdoor",
+                    "key": GOOGLE_MAPS_API_KEY},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+        if meta.get("status") != "OK":
+            log.info("No outdoor Street View coverage near (%.6f, %.6f): status=%s",
+                     lat, lon, meta.get("status"))
+            return False
+        url = "https://maps.googleapis.com/maps/api/streetview"
+        params = {
+            "size": "640x640",
+            "location": f"{lat:.7f},{lon:.7f}",
+            "fov": fov,
+            "pitch": pitch,
+            "source": "outdoor",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        with requests.get(url, params=params, timeout=HTTP_TIMEOUT, stream=True) as r:
+            if r.status_code != 200:
+                log.warning("Street View Static error %s: %s", r.status_code, r.text[:200])
+                return False
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            img.save(out_path, format="JPEG", quality=92)
+        return True
+    except Exception as e:
+        log.error("Street View fetch failed: %s", e)
+        return False
+
+
 def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None,
                         provider: str = None) -> bool:
     """Dispatch to the imagery provider. An explicit `provider` (per-address override,
