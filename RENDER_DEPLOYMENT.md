@@ -11,7 +11,10 @@ The blueprint creates one Docker web service:
 - Docker context: repo root
 - Health check: `/api/health`
 - Instance count: `1`
-- Plan: `standard`
+- Plan: `free` (no card required; spins down after 15 min idle, ~30-60s cold start on
+  the next request — fine for occasional/interim use, but if n8n calls start timing
+  out or a batch OOMs from the two-model YOLO ensemble, upgrade to `starter` or
+  `standard` in render.yaml)
 - Auto deploy: enabled
 
 The Dockerfile already binds Gunicorn to Render's `PORT` env var:

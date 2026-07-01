@@ -94,6 +94,12 @@ _LIGHTBOX_CSS = (
     "box-shadow:0 0 40px rgba(0,0,0,0.6);}"
     ".ctlb .ctlb-hint{color:#ddd;font:12px " + _FONT + ";margin-top:10px;}"
     ".ctthumb{cursor:zoom-in;}"
+    # Click-through `<`/`>` image carousel. Browser-only (needs :target + :has()):
+    # email clients strip <style>, so the inline display:none/block defaults below
+    # stand untouched and only the first slide ever shows -- a safe, deliberate
+    # degrade, not a bug.
+    ".cslide:target{display:block !important;}"
+    ".carousel:has(.cslide:target) .cslide:not(:target){display:none !important;}"
 )
 
 
@@ -143,15 +149,73 @@ def _maps_links(address: str) -> str:
     )
 
 
+_CAROUSEL_SLOTS = [
+    ("result_image_url", "Normal (YOLO detections)"),
+    ("result_image_url_wide", "Wide / Aerial"),
+    ("result_image_url_streetview", "Street View"),
+]
+
+
+def _carousel_block(slides: List[tuple], idx: int, img_w: int) -> str:
+    """Click-through `<`/`>` carousel over 2+ images, pure CSS (:target + :has()).
+    Each slide also opens the existing full-size .ctlb lightbox on click. Loops
+    (last slide's `>` wraps to the first). See _LIGHTBOX_CSS for the browser-only
+    show/hide rules; the inline styles here are the email-safe fallback (first
+    slide only)."""
+    n = len(slides)
+    nav_style = (
+        "position:absolute;top:50%;margin-top:-15px;width:30px;height:30px;"
+        "line-height:30px;text-align:center;border-radius:50%;background:rgba(0,0,0,0.55);"
+        f"color:#f2f2f2;font:700 16px {_FONT};text-decoration:none;"
+    )
+    parts = []
+    for n_i, (url, label) in enumerate(slides):
+        slide_id = f"cs{idx}_{n_i}"
+        prev_id = f"cs{idx}_{(n_i - 1) % n}"
+        next_id = f"cs{idx}_{(n_i + 1) % n}"
+        lb_id = f"clb{idx}_{n_i}"
+        safe = html.escape(url, quote=True)
+        safe_label = html.escape(label)
+        img_tag = (
+            f'<img src="{safe}" width="{img_w}" alt="{safe_label}" class="ctthumb" '
+            f'style="width:{img_w}px;max-width:100%;height:auto;display:block;'
+            f'border:1px solid #dddddd;border-radius:4px;">'
+        )
+        nav = (
+            f'<a href="#{prev_id}" style="{nav_style}left:6px;">&lsaquo;</a>'
+            f'<a href="#{next_id}" style="{nav_style}right:6px;">&rsaquo;</a>'
+        )
+        overlay = (
+            f'<a id="{lb_id}" class="ctlb" href="#_" style="display:none;">'
+            f'<img src="{safe}" alt="enlarged {safe_label}">'
+            f'<div class="ctlb-hint">click anywhere to close</div></a>'
+        )
+        parts.append(
+            f'<div id="{slide_id}" class="cslide" style="display:{"block" if n_i == 0 else "none"};">'
+            f'<div style="position:relative;width:{img_w}px;max-width:100%;">'
+            f'<a href="#{lb_id}" style="text-decoration:none;">{img_tag}</a>{nav}</div>'
+            f'<div style="margin-top:4px;font:11px {_FONT};color:#999999;">'
+            f'{safe_label} &middot; {n_i + 1}/{n} &middot; click image to enlarge</div>'
+            f'</div>{overlay}'
+        )
+    return f'<div class="carousel" style="width:{img_w}px;max-width:100%;">{"".join(parts)}</div>'
+
+
 def _image_block(entry: Dict[str, Any], idx: int, email_mode: bool = False,
                  img_w: int = _IMG_W) -> str:
-    """Image + maps links. In browser mode the image opens a CSS lightbox; in
-    email_mode the image is plain (no lightbox / no duplicated overlay) so emails
+    """Image + maps links. In browser mode, 2+ available images (normal/wide/
+    street-view) render as a click-through `<`/`>` carousel; a single image opens
+    a CSS lightbox same as before. email_mode always shows just the first
+    available image, plain (no lightbox / carousel / duplicated overlay) so emails
     stay small and there's nothing for email clients to mis-render. img_w controls
     the displayed image width (large for the browser report, small for email)."""
-    url = entry.get("result_image_url")
     address = str(entry.get("address", ""))
-    if not url or not isinstance(url, str):
+    slides = [
+        (entry.get(key), label) for key, label in _CAROUSEL_SLOTS
+        if entry.get(key) and isinstance(entry.get(key), str)
+    ]
+
+    if not slides:
         thumb = (
             f'<div style="width:{img_w}px;padding:40px 0;background:#eeeeee;'
             f'text-align:center;color:#777777;font:13px {_FONT};border-radius:4px;">'
@@ -159,6 +223,10 @@ def _image_block(entry: Dict[str, Any], idx: int, email_mode: bool = False,
         )
         return thumb + _maps_links(address)
 
+    if not email_mode and len(slides) > 1:
+        return _carousel_block(slides, idx, img_w) + _maps_links(address)
+
+    url = slides[0][0]
     safe = html.escape(url, quote=True)
     thumb_img = (
         f'<img src="{safe}" width="{img_w}" alt="annotated satellite tile" '

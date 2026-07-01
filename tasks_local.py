@@ -17,7 +17,7 @@ from shapely.ops import transform
 
 from utils import (
     geocode_address_mapbox, geocode_with_confidence,
-    get_satellite_image, validate_address_google,
+    get_satellite_image, get_streetview_image_google, validate_address_google,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
@@ -330,11 +330,13 @@ def _build_web_entry(
     result_url: Optional[str],
     error: Optional[str] = None,
     result_url_wide: Optional[str] = None,
+    result_url_streetview: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a web_results entry. Keeps backward-compatible keys for html_report.py
     (address, confidence_score, result_image_url, original_image_url, error) plus
     the new pipeline fields surfaced for downstream consumers. result_url_wide is
-    the annotated wide-context tile (None for non-VLM rows).
+    the annotated wide-context tile (None for non-VLM rows). result_url_streetview
+    is a ground-level Google Street View photo (None when there's no coverage).
     """
     if consensus_dict is not None:
         confidence_score = consensus_dict.get('confidence')
@@ -370,6 +372,7 @@ def _build_web_entry(
         "confidence_score": confidence_score,
         "result_image_url": result_url,
         "result_image_url_wide": result_url_wide,
+        "result_image_url_streetview": result_url_streetview,
         "original_image_url": original_url,
         "verdict": verdict,
         "detection_count": detection_count,
@@ -817,6 +820,13 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
+        result_url_streetview = None
+        streetview_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_streetview.jpg")
+        if get_streetview_image_google(centroid_lat, centroid_lon, streetview_local):
+            sv_blob = f"results/{job_id}/{os.path.basename(streetview_local)}"
+            upload_file(streetview_local, sv_blob)
+            result_url_streetview = make_signed_url(sv_blob)
+
         notes = _build_notes({
             'verdict': 'registry_confirmed',
             'registry_citation': registry['citation'],
@@ -830,6 +840,7 @@ def _process_one_address_core(
             notes=notes,
             original_url=original_url,
             result_url=result_url,
+            result_url_streetview=result_url_streetview,
         )
         csv_row = _build_csv_row(
             full_address=full_address,
@@ -842,9 +853,9 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local):
+        for p in (original_local, annotated_local, streetview_local):
             try:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     os.remove(p)
             except Exception as e:
                 log.warning(f"Could not clean up temp file {p}: {e}")
@@ -1027,6 +1038,17 @@ def _process_one_address_core(
     result_url = _render_tile(render_src, MAPBOX_ZOOM, annotated_local)
     result_url_wide = _render_tile(render_wide, MAPBOX_ZOOM_WIDE, annotated_wide_local)
 
+    # Ground-level Street View photo for faster human review (separate from the
+    # detect/verify pipeline above -- failure here never affects the verdict).
+    # Heading is auto-aimed by Google from the centroid we already computed for
+    # the satellite tiles, so this costs one extra (cheap, free-if-no-coverage) call.
+    result_url_streetview = None
+    streetview_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_streetview.jpg")
+    if get_streetview_image_google(centroid_lat, centroid_lon, streetview_local):
+        sv_blob = f"results/{job_id}/{os.path.basename(streetview_local)}"
+        upload_file(streetview_local, sv_blob)
+        result_url_streetview = make_signed_url(sv_blob)
+
     # Construction → needs_review: active construction means the Mapbox tile may
     # predate the current building state, so the cooling-tower call isn't reliable.
     construction = consensus_dict.get('construction', False)
@@ -1076,6 +1098,7 @@ def _process_one_address_core(
         original_url=original_url,
         result_url=result_url,
         result_url_wide=result_url_wide,
+        result_url_streetview=result_url_streetview,
     )
     csv_row = _build_csv_row(
         full_address=full_address,
@@ -1090,7 +1113,7 @@ def _process_one_address_core(
 
     for p in (original_local, wide_local, annotated_local, annotated_wide_local,
               marked_detail, marked_wide, retry_detail, retry_marked,
-              closeup_local, retry_closeup, wide_retry, wr_marked):
+              closeup_local, retry_closeup, wide_retry, wr_marked, streetview_local):
         try:
             if p and os.path.exists(p):
                 os.remove(p)
