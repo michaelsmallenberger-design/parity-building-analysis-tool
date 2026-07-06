@@ -1,253 +1,168 @@
-# Building Analysis Tool
+# Parity Building Analysis Tool
 
-AI-powered cooling tower detection from satellite imagery for HVAC service prioritization.
+Internal cooling-tower analysis tool for building address lists. The app geocodes each address, fetches roof-centered satellite imagery, runs a cooling-tower YOLO detector, filters candidates against the target building footprint, and asks Gemini + Grok to verify the final address-level result.
 
-[![Built with Claude Code](https://img.shields.io/badge/Built%20with-Claude%20Code-7C3AED)](https://claude.ai/code)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## Current Status
 
-## Overview
+- Active branch: `piece4-concurrency`
+- Deployment target: Render
+- Runtime: single-process Flask app with one Gunicorn worker and threaded request handling
+- Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
+- Current report format: audit-card HTML from `report_audit.py`
+- Current automation paths: n8n calls `POST /api/run-file` for Excel upload or `POST /api/run` for address lists
 
-Automatically detects cooling towers on building rooftops by analyzing satellite imagery. Built for Parity Inc. to streamline identification of buildings suitable for HVAC optimization services.
+Older handoff and accuracy notes are preserved in `docs/archive/`. Presentation material is in `docs/presentation/`.
 
-**Key Features:**
-- 🎯 Dual-VLM verification (Gemini 3.1 Pro + Grok 4.3 consensus) of YOLO26m detections, with geometric footprint filtering against OSM building polygons
-- 🏗️ Construction-activity flag as a separate sales-actionable signal (independent of cooling-tower presence)
-- ⚡ ~15s per address (geocode + OSM footprint + YOLO + dual-VLM verification)
-- 💰 $5/month Railway hosting; VLM API spend additional (~$0.10-$0.30 per address)
-- 📊 CSV input/output with annotated images and 15-column audit trail
-- 🤖 **Built entirely with Claude Code** (AI-generated codebase)
+## Main Flows
 
-## Quick Start
+### Browser UI
 
-### Deploy Your Own Instance
+CSV upload -> SQLite job queue -> background worker -> results page and downloadable files.
+
+Primary files:
+
+- `app_railway.py`
+- `worker.py`
+- `job_queue.py`
+- `storage_helpers.py`
+- `tasks_local.py`
+
+### Stateless API
+
+External automations can call the app without the queue or local result storage.
+
+- `POST /api/run`: list of addresses -> finished self-contained audit HTML
+- `POST /api/run-file`: uploaded Excel/CSV file -> finished self-contained audit HTML
+- `POST /api/analyze`: one address -> one self-contained result entry
+- `POST /api/report`: result entries -> audit HTML
+- `GET /api/health`: API health check
+
+Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
+
+For the Excel upload flow, send a multipart form upload to `/api/run-file` with a `file` field containing `.xlsx`, `.xls`, or `.csv`. The file must have an address column such as `Address`, `Property Address`, `Street Address`, or `Building Address`.
+
+Primary files:
+
+- `api_analyze.py`
+- `report_audit.py`
+- `n8n/README.md`
+- `n8n/parity_cooling_tower.workflow.json`
+
+## Current Pipeline
+
+For each address:
+
+1. Compose and clean the input address.
+2. Geocode with the selected provider. Default is Google; Mapbox remains available and Nominatim is used as a corroborating/fallback signal.
+3. Validate address precision with Google Address Validation when available.
+4. Find the target building footprint through OSM Overpass, then NYC planimetric data, then Microsoft Building Footprints.
+5. Fetch two roof-centered satellite tiles: detail zoom and wide/context zoom.
+6. Run YOLO detections. `MODEL_PATHS` can enable an ensemble; if unset, only `MODEL_PATH` is used.
+7. Convert detections into geo-space and filter them against the footprint.
+8. Render marked detail/wide imagery and a close-up.
+9. Call `vlm.verify_address()` once for the address. Gemini and Grok run in parallel and are combined by consensus.
+10. Emit CSV-compatible data plus audit-card web entries.
+
+The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functions still exist in `vlm.py` for compatibility/testing, but the active per-address pipeline uses `verify_address()`.
+
+## Required Environment Variables
+
+- `GOOGLE_MAPS_API_KEY`: Google geocoding, Static Maps imagery, and Address Validation
+- `MAPBOX_API_KEY`: Mapbox fallback geocoding/imagery and dense-core imagery
+- `GEMINI_API_KEY`: Gemini verification
+- `XAI_API_KEY`: Grok verification
+- `ANALYZE_API_KEY`: required for `/api/analyze`, `/api/run`, `/api/run-file`, and `/api/report`
+
+## Important Optional Environment Variables
+
+- `PORT`: default `8080`
+- `GEOCODER_PROVIDER`: `google` by default; set `mapbox` for the legacy path
+- `IMAGERY_PROVIDER`: `google` by default; dense-core addresses can override to Mapbox
+- `MODEL_PATH`: default `models/rooftop_model.pt`
+- `MODEL_PATHS`: comma-separated model paths for ensemble inference
+- `YOLO_CONF`: default `0.18`
+- `MAPBOX_ZOOM`: detail tile zoom, default `19`
+- `MAPBOX_ZOOM_WIDE`: wide/context tile zoom, default `18`
+- `MAPBOX_SIZE`: default `768x768`
+- `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
+- `VLM_TIMEOUT_SECONDS`: default `120`
+- `VLM_CONSENSUS_THRESHOLD`: default `0.7`
+- `GEMINI_MODEL`: default `gemini-3.5-flash`
+- `GROK_MODEL`: default `grok-4.3`
+- `GEMINI_THINKING_LEVEL`: default `high`
+- `GROK_REASONING_EFFORT`: default `high`
+
+## Local Development
 
 ```bash
-# 1. Clone repository
-git clone https://github.com/mahkuhse/parity-building-analysis-tool.git
-cd parity-building-analysis-tool
-
-# 2. Get Mapbox API key (free tier: 50k requests/month)
-# Sign up at https://mapbox.com
-
-# 3. Deploy to Railway (first month free, then $5/month)
-# Visit https://railway.app
-# - New Project → Deploy from GitHub repo
-# - Set environment variables:
-#   MAPBOX_API_KEY=<your-token>
-#   PORT=8080
-
-# 4. Upload CSV with addresses and get results
+pip install -r requirements_railway.txt
+python app_railway.py
 ```
 
-**Setup time:** 30-45 minutes
+Health checks:
 
-## Usage
-
-### Input Format
-
-CSV file with required `Address` column:
-
-```csv
-Address,Boro_Area,Zip
-"123 Main St","Queens",11101
-"456 Broadway","Manhattan",10013
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/api/health
 ```
 
-### Results
+## Docker / Render
 
-- **Detection confidence:** High (≥70%), Needs Review (40-70%), No Detection (<40%)
-- **Outputs:** Annotated satellite images with bounding boxes, CSV with clickable URLs
-- **Copy-paste workflow:** Results paste directly into Google Sheets
-
-## Technology Stack
-
-- **Framework:** Flask (Python 3.8+)
-- **ML Model:** YOLO26m (Ultralytics, custom-trained on cooling towers)
-- **Verification:** Dual-VLM consensus — Gemini 3.1 Pro (Google GenAI SDK) + Grok 4.3 (xAI via OpenAI SDK). Both models must agree on the bucket and clear a confidence threshold; otherwise the result routes to `needs_review`.
-- **Geometry:** Shapely point-in-polygon filtering against OSM Overpass building footprints (replaces NYC-era heuristic crops)
-- **Geocoding:** Mapbox primary; Nominatim fallback for low-confidence or unrecognized Mapbox results (no geographic constraint)
-- **Imagery:** Mapbox Static Images API (768x768 @ zoom 19, centered on OSM building centroid)
-- **Hosting:** Railway.app
-- **Database:** SQLite (ephemeral job queue)
-
-## Built with Claude Code
-
-**This entire project was developed using Claude Code, Anthropic's AI development tool.**
-
-All application code (~2,000 lines), architecture decisions, accuracy optimizations, and deployment configurations were generated through natural language conversations with Claude Code. The only manual work was training the YOLO model on ~200 labeled images.
-
-**Future development can continue using Claude Code** - no traditional programming required for maintenance, debugging, or feature additions.
-
-Learn more: https://claude.ai/code
-
-## Architecture
-
-```
-User Upload (CSV) → Flask → SQLite Queue → Background Worker
-                                                ↓
-                                         Geocode Address
-                                                ↓
-                                    OSM Overpass Footprint
-                                                ↓
-                              Centroid-Centered Satellite Tile
-                                                ↓
-                                       YOLO26m Detection
-                                                ↓
-                              Shapely Point-in-Polygon Filter
-                                                ↓
-                                  ┌─────────────┴─────────────┐
-                                  ↓                           ↓
-                       verify_detection per                verify_rooftop
-                       kept candidate                       (whole tile)
-                       (Gemini + Grok agree)               (zero-detection
-                                  ↓                         last-line scan)
-                                  └─────────────┬─────────────┘
-                                                ↓
-                                  Class-Rank Winner Selection
-                                                ↓
-                              Annotated Image + 15-Column CSV
+```bash
+docker build -f Dockerfile.railway -t parity-building-analysis-tool .
+docker run -p 8080:8080 --env-file .env parity-building-analysis-tool
 ```
 
-**Key design constraint:** Both Gemini 3.1 Pro and Grok 4.3 must independently agree on the verdict bucket (positive / negative) AND clear the consensus confidence threshold (default 0.7). Any disagreement or low confidence → `needs_review`.
+Render builds from `Dockerfile.railway`. Keep both production model weights committed:
 
-## Model & Design Rationale
+- `models/rooftop_model.pt`
+- `models/rooftop_model_prev.pt`
 
-**Training:**
-- Dataset: ~200 rooftop images (NYC buildings)
-- Framework: YOLO26m (custom-trained from Ultralytics)
-- Training: 50-100 epochs
-- Resources:
-  - [YOLO Training Tutorial Video](https://www.youtube.com/watch?v=r0RspiLG260)
-  - [Train YOLO Models Guide](https://www.ejtech.io/learn/train-yolo-models)
+`MODEL_PATHS` must be set if both should be used at runtime.
 
-**Design choices (Phase 3):**
-- **Low YOLO confidence threshold (0.18) by design.** YOLO is treated as a recall-oriented candidate generator; the dual-VLM pass filters false positives downstream. Lowering the threshold catches more candidates that the heuristic-era pipeline (0.40) would have dropped.
-- **Dual-VLM consensus replaces neighbor-FP heuristics.** Instead of center-crop and distance-filter rules (the NYC-era approach), the system now uses geometric point-in-polygon filtering against OSM footprints PLUS independent verification from two VLMs that must agree.
-- **`verify_rooftop` as last-line-of-defense.** When YOLO returns zero candidates inside the building footprint, the system scans the full tile with the VLMs in rooftop-mode — catching cooling towers the YOLO pass missed.
+## Render
 
-**Accuracy:** Not yet benchmarked at production scale. The design tradeoffs above are validated against fixture data (`test_vlm.py`, `test_pipeline_no_vlm.py`) and design-reviewed prompt rules; national-scale precision/recall measurements are pending.
+Render deployment is configured by `render.yaml`. Create a new Render Blueprint from this repo/branch, then fill the five secret values Render asks for:
 
-## Design Choices
+- `GOOGLE_MAPS_API_KEY`
+- `MAPBOX_API_KEY`
+- `GEMINI_API_KEY`
+- `XAI_API_KEY`
+- `ANALYZE_API_KEY`
 
-The current pipeline replaced an earlier heuristic system (center-crop, multi-scale, distance-filter) with a smaller set of stronger primitives:
+See `RENDER_DEPLOYMENT.md` for the exact dashboard steps and smoke test.
 
-**Active design choices:**
-- ✅ **Geometric footprint filter.** OSM Overpass polygon + Shapely point-in-polygon. Deterministic attribution: a detection is either inside the target building's footprint or it isn't. Replaces NYC-era center-crop and distance-filter heuristics.
-- ✅ **Dual-VLM consensus.** Independent verification from Gemini 3.1 Pro + Grok 4.3. Both must agree on the bucket and clear a confidence threshold; any divergence → `needs_review`. Filters false positives that geometric attribution alone wouldn't catch.
-- ✅ **Construction flag as a separate signal.** The VLMs report construction activity independently of cooling-tower presence. A "no cooling tower, but construction visible" row is a sales-actionable lead for follow-up via CoStar.
-- ✅ **`verify_rooftop` fallback.** When YOLO returns zero candidates inside the footprint, the VLMs scan the tile directly. Catches cooling towers YOLO whiffed on.
-- ✅ **Ground-mounted equipment support.** Prompts and verdict logic accept cooling equipment on adjacent concrete pads or mechanical yards (within ~30 ft of the target footprint). Critical for non-urban markets where rooftop deployment is rare.
+For the no-touch Excel workflow, import `n8n/parity_excel_upload.workflow.json` into n8n and test with `n8n/address_upload_template.xlsx`. The short operating guide is `RUNBOOK.md`.
 
-**Removed in Phase 3:**
-- ❌ Center-crop analysis — superseded by footprint filter
-- ❌ Multi-scale dual-pass — superseded by footprint filter
-- ❌ Distance-based filtering — superseded by footprint filter
-- ❌ Aggressive crop mode — superseded by footprint filter
+## Tests and Harnesses
 
-See [HANDOVER.md](HANDOVER.md) for the historical Phase 1-2 experiments that informed these choices.
+These are not pure unit tests; most call external services, use model weights, or write generated images.
 
-## Cost
+- `python -m compileall app_railway.py api_analyze.py tasks_local.py utils.py geometry.py vlm.py pipeline_render.py report_audit.py job_queue.py worker.py storage_helpers.py`
+- `python test_pipeline_no_vlm.py`: geocoding, imagery, footprints, YOLO; no VLM spend
+- `python test_vlm.py`: legacy VLM harness using real Gemini/Grok calls
+- `python test_geometry_math.py`: geometry/image diagnostic, not a normal unit test
 
-**Monthly operating cost: $5**
+## Active Runtime Files
 
-- Railway: $5/month Hobby plan (first month free with $5 credit)
-- Mapbox: Free tier (50k requests/month)
-- Current usage: ~500 addresses/month (~$0.50 compute)
+- `app_railway.py`
+- `api_analyze.py`
+- `worker.py`
+- `job_queue.py`
+- `storage_helpers.py`
+- `tasks_local.py`
+- `utils.py`
+- `geometry.py`
+- `nyc_opendata.py`
+- `ms_footprints.py`
+- `vlm.py`
+- `pipeline_render.py`
+- `report_audit.py`
+- `html_report.py`
+- `zip_bundler.py`
+- `templates/`
+- `static/images/`
+- `reference_images/`
+- `models/`
 
-Scales to 5,000 addresses/month at flat $5/month.
-
-## Documentation
-
-- **[HANDOVER.md](HANDOVER.md)** - Comprehensive quickstart guide for team takeover
-- **[CLAUDE.md](CLAUDE.md)** - Technical documentation for developers
-- **[RAILWAY_DEPLOYMENT.md](RAILWAY_DEPLOYMENT.md)** - Deployment guide
-- **[ACCURACY_IMPROVEMENTS.md](ACCURACY_IMPROVEMENTS.md)** - Accuracy tuning details
-
-## Configuration
-
-Environment variables (Railway dashboard → Variables):
-
-**Required:**
-- `MAPBOX_API_KEY` — Mapbox geocoding + Static Images API token
-- `GEMINI_API_KEY` — Google AI Studio API key for Gemini 3.1 Pro verification
-- `XAI_API_KEY` — xAI API key for Grok 4.3 verification
-
-**Optional — Server:**
-- `PORT` — Server port (default: 8080)
-
-**Optional — YOLO tuning:**
-- `YOLO_CONF` — YOLO confidence threshold (default: 0.18). Lower = more recall, more candidates routed to dual-VLM verification.
-
-**Optional — VLM tuning:**
-- `GEMINI_MODEL` — Gemini model ID (default: `gemini-3.1-pro-preview`)
-- `GROK_MODEL` — Grok model ID (default: `grok-4.3`)
-- `VLM_TIMEOUT_SECONDS` — Per-VLM wall-clock timeout (default: 120)
-- `VLM_CONSENSUS_THRESHOLD` — Minimum confidence both models must clear for consensus (default: 0.7). Below this → `needs_review`.
-
-**Optional — Imagery:**
-- `MAPBOX_ZOOM` — Satellite zoom level (default: 19, range: 18-20). 20+ may produce blurry tiles.
-- `MAPBOX_SIZE` — Tile dimensions (default: `768x768`)
-- `MAPBOX_DPI` — @2x retina tiles (default: false). Note: env var name is `MAPBOX_DPI`, not `MAPBOX_HIGH_DPI`.
-
-**Optional — Geocoding and Footprint:**
-- `GEOCODE_CONFIDENCE_THRESHOLD` — Mapbox relevance threshold before falling back to Nominatim (default: 0.70). Lowering this reduces Nominatim fallbacks.
-- `FOOTPRINT_SEARCH_RADIUS` — OSM Overpass search radius in meters (default: 50). Increase for non-urban / suburban markets where the geocoded point may sit further from the building footprint.
-
-## File Structure
-
-```
-├── app_railway.py              # Flask app entrypoint, routes, worker init
-├── worker.py                   # Background job processor (daemon thread)
-├── job_queue.py                # SQLite job queue (thread-safe)
-├── storage_helpers.py          # File storage abstraction (local FS)
-├── tasks_local.py              # Per-address pipeline orchestrator
-├── utils.py                    # Geocoding, Mapbox imagery, YOLO loader
-├── geometry.py                 # OSM Overpass footprint lookup + Shapely filter
-├── vlm.py                      # Dual-VLM verify_detection + verify_rooftop
-├── pipeline_render.py          # Annotated-image rendering (footprint + bboxes)
-├── html_report.py              # Self-contained HTML report (embedded images)
-├── zip_bundler.py              # Result ZIP packaging
-├── test_vlm.py                 # Dual-VLM integration test (3 fixtures)
-├── test_pipeline_no_vlm.py     # Geometry + YOLO regression test (no VLM)
-├── models/
-│   └── rooftop_model.pt        # Custom YOLO26m (44 MB, cooling-tower-trained)
-├── reference_images/
-│   ├── positive/               # Confirmed cooling tower examples (few-shot)
-│   └── negative/               # Confirmed non-cooling-tower examples
-├── templates/                  # HTML interface
-├── Dockerfile.railway          # Container config
-└── requirements_railway.txt    # Python dependencies
-```
-
-## Contributing
-
-This project is in maintenance mode. For modifications:
-
-**Option 1: Use Claude Code (Recommended)**
-- Continue development through conversational AI
-- No programming experience required
-
-**Option 2: Traditional Development**
-- Python 3.8+ required
-- See [CLAUDE.md](CLAUDE.md) for technical details
-
-## License
-
-MIT License
-
-## Attribution
-
-- **Imagery:** © Maxar (via Mapbox)
-- **Map Data:** © OpenStreetMap contributors
-- **ML Framework:** Ultralytics YOLO (AGPL-3.0)
-- **Built for:** Parity Inc.
-- **Built with:** Claude Code by Anthropic
-
-## Contact
-
-For questions about this project, see [HANDOVER.md](HANDOVER.md) for support resources.
-
----
-
-**Note:** Originally built for NYC addresses. Phase 3 added support for ground-mounted cooling equipment on non-urban buildings, expanding usable scope beyond dense urban markets. National-scale accuracy is design-validated but not yet benchmarked at production volume.
+Generated outputs, caches, scratch files, local uploads, local queues, and one-off demo artifacts are intentionally ignored.

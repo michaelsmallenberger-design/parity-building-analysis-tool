@@ -1,5 +1,5 @@
 """
-Flask application for Railway deployment.
+Flask application for Render deployment.
 Uses local storage and SQLite job queue instead of Google Cloud services.
 """
 import os
@@ -190,7 +190,7 @@ def serve_file(blob_name):
 # -----------------------------------------------------------------------------
 @app.route('/health')
 def health():
-    """Health check endpoint for Railway."""
+    """Health check endpoint for Render."""
     return jsonify({
         "status": "healthy",
         "worker_running": worker is not None

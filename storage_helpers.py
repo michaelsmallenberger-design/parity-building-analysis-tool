@@ -25,15 +25,12 @@ def init_storage():
 
     # Log URL detection for debugging
     app_url = os.getenv('APP_URL')
-    railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
-    static_url = os.getenv('RAILWAY_STATIC_URL')
+    render_url = os.getenv('RENDER_EXTERNAL_URL')
 
     if app_url:
         log.info(f"Using APP_URL for file URLs: {app_url}")
-    elif railway_domain:
-        log.info(f"Using RAILWAY_PUBLIC_DOMAIN for file URLs: https://{railway_domain}")
-    elif static_url:
-        log.info(f"Using RAILWAY_STATIC_URL for file URLs: {static_url}")
+    elif render_url:
+        log.info(f"Using RENDER_EXTERNAL_URL for file URLs: {render_url}")
     else:
         log.warning("No base URL detected - file URLs will be relative paths. Set APP_URL env var for absolute URLs.")
 
@@ -93,7 +90,7 @@ def make_url(blob_path: str, base_url: str = None) -> str:
 
     Args:
         blob_path: Relative path (e.g., "results/job123/image.jpg")
-        base_url: Optional base URL (defaults to auto-detect from Railway env)
+        base_url: Optional base URL (defaults to auto-detect from APP_URL / RENDER_EXTERNAL_URL)
 
     Returns:
         Full URL or relative path for accessing the file
@@ -105,18 +102,13 @@ def make_url(blob_path: str, base_url: str = None) -> str:
         if app_url:
             base_url = app_url
         else:
-            # Priority 2: Railway public domain
-            railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
-            if railway_domain:
-                base_url = f"https://{railway_domain}"
+            # Priority 2: RENDER_EXTERNAL_URL (Render injects this automatically)
+            render_url = os.getenv('RENDER_EXTERNAL_URL')
+            if render_url:
+                base_url = render_url
             else:
-                # Priority 3: RAILWAY_STATIC_URL
-                static_url = os.getenv('RAILWAY_STATIC_URL')
-                if static_url:
-                    base_url = static_url
-                else:
-                    # Last resort: Use relative path (works for web UI, not for external use)
-                    return f"/files/{blob_path}"
+                # Last resort: Use relative path (works for web UI, not for external use)
+                return f"/files/{blob_path}"
 
     return f"{base_url.rstrip('/')}/files/{blob_path}"
 
