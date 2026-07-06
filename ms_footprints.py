@@ -14,7 +14,7 @@ PERFORMANCE: a US z9 tile can be tens of MB gzipped / hundreds of thousands of
 features, so the FIRST lookup in a new quadkey pays a download + an O(features)
 line scan. This is acceptable for a low-traffic (~1000/mo) batch tool where the
 addresses in a batch cluster by quadkey (the on-disk cache amortizes within a run).
-On Railway the cache dir is ephemeral (wiped on redeploy) — a within-deploy
+On Render the cache dir is ephemeral (wiped on redeploy) — a within-deploy
 accelerator, not durable storage. Point MS_FOOTPRINT_CACHE_DIR at a volume if that
 becomes painful.
 

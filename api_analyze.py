@@ -250,7 +250,7 @@ def analyze():
 @require_key
 def run():
     """Batch endpoint: analyze a whole list of addresses and return the finished
-    self-contained HTML audit report. This is the single Railway call the n8n
+    self-contained HTML audit report. This is the single Render call the n8n
     workflow makes (Sheet -> normalize -> /api/run -> email), so n8n doesn't have
     to loop per address. Body: {addresses: [str | {address,boro_area,zip}], title?}.
     Returns text/html."""

@@ -18,7 +18,7 @@ service.yaml
 # Ignore trained model weights by default (large; experimental weights stay local)
 models/*.pt
 # ...but the two production ensemble weights (MODEL_PATHS) MUST ship in the image:
-# Railway builds from GitHub, so anything not committed is absent from the container.
+# Render builds from GitHub, so anything not committed is absent from the container.
 !models/rooftop_model.pt
 !models/rooftop_model_prev.pt
 
@@ -54,6 +54,21 @@ scratch_*.md
 scratch_*.log
 scratch_*.json
 scratch_*.jsonl
+scratch_*.jpg
+scratch_*.jpeg
+scratch_*.png
 scratch_results.json
 scratch_*/
 smoke_*.py
+
+# Local cleanup/archive and generated demo outputs
+.local_archive/
+.tmp_render_push/
+demo_report*.html
+registry_options.html
+results.xlsx
+data/
+
+# n8n one-off/simple workflow drafts
+n8n/*simple*.workflow.json
+n8n/SIMPLE_SETUP.md

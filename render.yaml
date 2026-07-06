@@ -2,7 +2,7 @@ services:
   - type: web
     name: building-analyzer
     runtime: docker
-    plan: free
+    plan: standard
     dockerfilePath: ./Dockerfile.railway
     dockerContext: .
     healthCheckPath: /api/health
@@ -35,3 +35,5 @@ services:
         value: "0.7"
       - key: YOLO_CONF
         value: "0.18"
+      - key: APP_URL
+        value: https://building-analyzer.onrender.com
