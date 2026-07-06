@@ -827,6 +827,26 @@ def _process_one_address_core(
             upload_file(streetview_local, sv_blob)
             result_url_streetview = make_signed_url(sv_blob)
 
+        # Wide/aerial context tile so registry-confirmed rows also carry the wide view
+        # for human review (requirement: every report has one, no matter the path).
+        result_url_wide = None
+        wide_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_wide.jpg")
+        annotated_wide_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_annotated_wide.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+            render_annotated_image(
+                raw_image_path=wide_local,
+                output_path=annotated_wide_local,
+                footprint=footprint,
+                centroid_lat=centroid_lat,
+                centroid_lon=centroid_lon,
+                enriched_detections=[],
+                winner=None,
+                zoom=MAPBOX_ZOOM_WIDE,
+            )
+            wide_blob = f"results/{job_id}/{os.path.basename(annotated_wide_local)}"
+            upload_file(annotated_wide_local, wide_blob)
+            result_url_wide = make_signed_url(wide_blob)
+
         notes = _build_notes({
             'verdict': 'registry_confirmed',
             'registry_citation': registry['citation'],
@@ -841,6 +861,7 @@ def _process_one_address_core(
             original_url=original_url,
             result_url=result_url,
             result_url_streetview=result_url_streetview,
+            result_url_wide=result_url_wide,
         )
         csv_row = _build_csv_row(
             full_address=full_address,
@@ -853,7 +874,7 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local, streetview_local):
+        for p in (original_local, annotated_local, streetview_local, wide_local, annotated_wide_local):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
@@ -862,30 +883,30 @@ def _process_one_address_core(
 
         return web_entry, csv_row
 
-    # Dense-urban roof-only scan (gate computed above with the imagery provider): in dense
-    # cores cooling towers are roof-only and off-building detections are neighbor false
-    # positives — suppress the wide (ground) tile and the outside-footprint passthrough.
-    if dense:
-        log.info(f"Row {i+1}/{total}: dense urban core — roof-only scan (no wide tile, drop off-building detections)")
+    # Always fetch the wide/context tile so EVERY report carries an aerial view for human
+    # review (requirement: wide view in every report, no matter what). The dense-core gate
+    # governs DETECTION/VLM, not display: in dense cores cooling towers are roof-only and
+    # off-building detections are neighbor false positives, so below we skip YOLO on the
+    # wide tile and don't feed it to the VLM — it is display-only there. Outside dense cores
+    # the wide tile also drives ground-mounted-CT detection and VLM context.
+    wide_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_wide.jpg",
+    )
+    log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image"
+             + (" (dense: display-only)" if dense else ""))
+    if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+        log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
         wide_local = None
-    else:
-        # Fetch the wider tile (ground-mounted CTs / parcel context).
-        wide_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_wide.jpg",
-        )
-        log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
-        if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
-            log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
-            wide_local = None
 
     log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF}"
              + (" (dense: roof-only)" if dense else " on both zooms"))
     detail_kept = _detect_on_tile(
         original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
+    # Detect on the wide tile only outside dense cores (in dense it is display-only).
     wide_kept = (
         _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
-        if wide_local else []
+        if (wide_local and not dense) else []
     )
     merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
     log.info(
@@ -916,8 +937,10 @@ def _process_one_address_core(
         tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked.jpg")
     render_marked_tile(original_local, marked_detail, footprint,
                        centroid_lat, centroid_lon, detail_dets, zoom=MAPBOX_ZOOM)
+    # The VLM gets the wide tile as context only outside dense cores (preserve dense
+    # roof-only verify behavior); the wide tile still renders into the report below.
     marked_wide = None
-    if wide_local:
+    if wide_local and not dense:
         marked_wide = os.path.join(
             tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked_wide.jpg")
         render_marked_tile(wide_local, marked_wide, footprint,
@@ -980,7 +1003,7 @@ def _process_one_address_core(
                 detection_count = len(retry_dets)
                 rooftop_path = (detection_count == 0)
                 enriched = [{**d, 'vlm_result': consensus_dict} for d in retry_dets]
-                render_src, render_wide = retry_detail, None
+                render_src, render_wide = retry_detail, wide_local  # keep wide tile for the report
                 imagery_retried = True
 
     # Frame-inadequate zoom-out retry (Gemini-only signal): if Gemini judged the detail
@@ -1012,7 +1035,7 @@ def _process_one_address_core(
             detection_count = len(wr_dets)
             rooftop_path = (detection_count == 0)
             enriched = [{**d, 'vlm_result': consensus_dict} for d in wr_dets]
-            render_src, render_wide = wide_retry, None
+            render_src, render_wide = wide_retry, wide_local  # keep wide tile for the report
             frame_retried = True
 
     # Render BOTH tiles so manual review always has a clear close-up plus context.
