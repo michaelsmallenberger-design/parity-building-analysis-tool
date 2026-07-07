@@ -22,6 +22,9 @@
 var SHEET_NAME = 'Analysis';
 var HEADERS = ['Row_ID', 'Address', 'AI Verdict', 'AI Confidence', 'AI Reasoning',
                'HVAC Systems', 'Fit', 'Note', 'Reviewed At'];
+// Match the Washington Gas sheet dropdowns.
+var HVAC_OPTIONS = ['Cooling Tower', 'Chiller', 'Exhaust Fan', 'RTU', 'AHU', 'PTAC', 'Fan Coil', 'Heat Pump', 'VRF'];
+var FIT_OPTIONS = ['Optimizer', 'Periscope', 'Unclear', 'Bad'];
 
 function doPost(e) {
   try {
@@ -46,9 +49,35 @@ function _create(body) {
     rows.push([r.row_id, r.address, r.ai_verdict, r.ai_confidence, r.ai_reasoning, '', '', '', '']);
   });
   sh.getRange(1, 1, rows.length, HEADERS.length).setValues(rows);
-  sh.getRange(1, 1, 1, HEADERS.length).setFontWeight('bold');
+
+  var lastRow = Math.max(rows.length, 300); // format + dropdowns cover spare rows too
+
+  // Header styling + frozen panes
+  sh.getRange(1, 1, 1, HEADERS.length)
+    .setFontWeight('bold').setFontColor('#ffffff').setBackground('#0f5132').setVerticalAlignment('middle');
   sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, HEADERS.length);
+  sh.setFrozenColumns(2);
+  sh.setRowHeight(1, 30);
+
+  // Column widths + wrapping + confidence as %
+  [70, 260, 130, 95, 380, 210, 115, 220, 150].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
+  sh.getRange(2, 5, lastRow, 1).setWrap(true);            // AI Reasoning
+  sh.getRange(2, 8, lastRow, 1).setWrap(true);            // Note
+  sh.getRange(2, 4, lastRow, 1).setNumberFormat('0%');    // AI Confidence
+
+  // Dropdowns — HVAC (multi-value, so warn-not-reject) and Fit (single, strict)
+  var cH = HEADERS.indexOf('HVAC Systems') + 1;
+  var cF = HEADERS.indexOf('Fit') + 1;
+  sh.getRange(2, cH, lastRow, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList(HVAC_OPTIONS, true).setAllowInvalid(true)
+      .setHelpText('Pick from: ' + HVAC_OPTIONS.join(', ') + ' (multiple allowed, comma-separated)').build());
+  sh.getRange(2, cF, lastRow, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList(FIT_OPTIONS, true).setAllowInvalid(false).build());
+
+  // Alternating row banding on the data rows (keep the green header)
+  try {
+    sh.getRange(2, 1, lastRow - 1, HEADERS.length).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+  } catch (e) {}
 
   var folderId = _prop('FOLDER_ID');
   if (folderId) {
