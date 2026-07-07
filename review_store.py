@@ -9,7 +9,27 @@ what's already been reviewed.
 """
 from datetime import datetime
 
+import requests
+
 from storage_helpers import write_json, read_json
+
+
+def post_appscript(url: str, payload: dict, timeout: int = 90) -> dict:
+    """POST to a Google Apps Script /exec web app and return its JSON.
+
+    Apps Script answers a POST with a 302 to a script.googleusercontent.com "echo"
+    URL that carries the actual response; a plain requests.post mishandles that hop
+    (404). So POST without auto-follow, then GET the redirect target on the SAME
+    session (cookies carry over). Returns the parsed JSON, or an {"error": ...} dict.
+    """
+    s = requests.Session()
+    r = s.post(url, json=payload, allow_redirects=False, timeout=timeout)
+    if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+        r = s.get(r.headers["Location"], timeout=timeout)
+    try:
+        return r.json()
+    except ValueError:
+        return {"error": f"non-json response (HTTP {r.status_code})", "body": r.text[:200]}
 
 
 def _path(job_id: str) -> str:

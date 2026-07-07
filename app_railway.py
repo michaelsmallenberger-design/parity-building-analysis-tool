@@ -227,15 +227,15 @@ def api_review():
     writer = os.getenv("SHEET_WEBHOOK_URL")
     if writer:
         try:
-            r = requests.post(writer, json={
+            resp = review_store.post_appscript(writer, {
                 "action": "update",
                 "token": os.getenv("SHEET_WEBHOOK_TOKEN", ""),
                 "sheet_url": (batch or {}).get("sheet_url", ""),
                 **payload,
-            }, timeout=20)
-            if r.status_code >= 300:
-                log.error(f"Sheet writer returned {r.status_code}: {r.text[:200]}")
-                return jsonify({"error": "sheet write failed"}), 502
+            }, timeout=30)
+            if not resp.get("ok"):
+                log.error(f"Sheet update failed: {resp}")
+                return jsonify({"error": "sheet write failed", "detail": resp}), 502
         except Exception as e:
             log.error(f"Sheet writer call failed: {e}")
             return jsonify({"error": "sheet writer unreachable"}), 502
