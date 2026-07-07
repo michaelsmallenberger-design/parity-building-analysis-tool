@@ -38,6 +38,8 @@ COPY ms_footprints.py .
 COPY html_report.py .
 COPY report_audit.py .
 COPY api_analyze.py .
+COPY review_render.py .
+COPY review_store.py .
 COPY zip_bundler.py .
 COPY models/ models/
 COPY reference_images/ reference_images/
