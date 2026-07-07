@@ -23,6 +23,7 @@ fully self-contained and report_audit embeds it directly. No object storage.
 import base64
 import logging
 import os
+import re
 import tempfile
 import uuid
 from functools import wraps
@@ -34,6 +35,7 @@ from flask import Blueprint, jsonify, request, Response
 
 from tasks_local import _process_one_address, _build_web_entry
 from report_audit import build_audit_report
+from review_render import HVAC_SYSTEMS, FIT_OPTIONS
 import review_store
 
 log = logging.getLogger("api")
@@ -297,6 +299,48 @@ def analyze():
 
 
 CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID = "HVAC Systems", "Fit", "Notes", "Row_ID"
+# Header-name variants for locating the HVAC / Fit columns in an arbitrary upload
+# (fallback when the columns are blank; content detection below handles filled ones).
+HVAC_SYSTEM_COL_NAMES = ["HVAC Systems", "HVAC System", "HVAC", "HVAC Equipment", "HVAC Type"]
+FIT_COL_NAMES = ["Fit", "Fit Type", "Product Fit"]
+
+
+def _detect_hvac_fit_columns(df):
+    """Find the HVAC Systems and Fit columns in ANY uploaded format. Primary signal is
+    CONTENT — a column whose values match the HVAC or Fit vocabulary — which catches
+    mislabeled/duplicate headers (e.g. a 2nd 'HVAC Systems' column that actually holds
+    Optimizer/Periscope = Fit). Falls back to header-name variants for fresh uploads
+    where the columns are still blank. Returns (hvac_col, fit_col); either may be None."""
+    hvac_vocab = {s.lower() for s in HVAC_SYSTEMS}
+    fit_vocab = {s.lower() for s in FIT_OPTIONS}
+
+    def content_score(col, vocab):
+        vals = [str(v) for v in df[col].dropna().tolist() if str(v).strip()]
+        if not vals:
+            return 0.0
+        hits = sum(1 for v in vals
+                   if any(p.strip().lower() in vocab for p in re.split(r"[,/;]", v)))
+        return hits / len(vals)
+
+    def best_by_content(vocab, exclude):
+        best, col = 0.4, None
+        for c in df.columns:
+            if c in exclude:
+                continue
+            s = content_score(c, vocab)
+            if s > best:
+                best, col = s, c
+        return col
+
+    fit_col = best_by_content(fit_vocab, exclude=set())
+    hvac_col = best_by_content(hvac_vocab, exclude={fit_col} if fit_col else set())
+    if hvac_col is None:
+        hvac_col = _first_present(df.columns, HVAC_SYSTEM_COL_NAMES)
+    if fit_col is None:
+        fit_col = _first_present(df.columns, FIT_COL_NAMES)
+        if fit_col == hvac_col:
+            fit_col = None
+    return hvac_col, fit_col
 
 
 def _create_sheet(headers, rows, title):
@@ -334,6 +378,13 @@ def _table_from_df(df):
     if already present) and stamp a hidden Row_ID = 1-based row index. Returns
     (headers, rows) as plain strings for the sheet. No AI columns are added."""
     df = df.copy()
+    hvac_col, fit_col = _detect_hvac_fit_columns(df)
+    # Normalize the detected HVAC/Fit columns to canonical names (dedupes messy or
+    # duplicate headers); drop any stray same-named canonical column first.
+    for canon, detected in ((CANON_HVAC, hvac_col), (CANON_FIT, fit_col)):
+        if detected is not None and detected != canon:
+            df = df.drop(columns=[c for c in df.columns if c == canon])
+            df = df.rename(columns={detected: canon})
     for col in (CANON_HVAC, CANON_FIT, CANON_NOTES):
         if col not in df.columns:
             df[col] = ""
