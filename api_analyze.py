@@ -267,17 +267,17 @@ def _create_sheet(results, title):
         return ""
     rows = [_sheet_row(e, i) for i, e in enumerate(results, 1)]
     try:
-        r = requests.post(url, json={
+        resp = review_store.post_appscript(url, {
             "action": "create",
             "token": os.environ.get("SHEET_WEBHOOK_TOKEN", ""),
             "title": title,
             "rows": rows,
-        }, timeout=60)
-        if r.status_code < 300:
-            return (r.json() or {}).get("sheet_url", "")
-        log.error("sheet create returned %s: %s", r.status_code, r.text[:200])
+        }, timeout=120)
+        if resp.get("sheet_url"):
+            return resp["sheet_url"]
+        log.error("sheet create failed: %s", resp)
     except Exception as e:
-        log.error("sheet create failed: %s", e)
+        log.error("sheet create error: %s", e)
     return ""
 
 
