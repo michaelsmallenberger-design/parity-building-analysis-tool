@@ -742,16 +742,44 @@ def _process_one_address_core(
         log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
                  f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
         notes = _build_notes({'verdict': 'likely_residential'})
+        # Still fetch + render detail + wide tiles so a human can eyeball the gate
+        # decision — a small/wrong footprint on a real commercial building (e.g. a
+        # supertall geocoded to a tiny polygon) is caught by looking at the imagery
+        # (requirement: every report carries imagery incl. the wide view).
+        gate_provider = "mapbox" if (_in_nyc(centroid_lat, centroid_lon)
+                                     or _in_dense_core(centroid_lat, centroid_lon)) else None
+        original_url = result_url = result_url_wide = None
+        if get_satellite_image(centroid_lat, centroid_lon, original_local, provider=gate_provider):
+            original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
+            upload_file(original_local, original_blob)
+            original_url = make_signed_url(original_blob)
+            render_annotated_image(
+                raw_image_path=original_local, output_path=annotated_local,
+                footprint=footprint, centroid_lat=centroid_lat, centroid_lon=centroid_lon,
+                enriched_detections=[], winner=None)
+            result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
+            upload_file(annotated_local, result_blob)
+            result_url = make_signed_url(result_blob)
+        gate_wide = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_wide.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, gate_wide, zoom=MAPBOX_ZOOM_WIDE, provider=gate_provider):
+            render_annotated_image(
+                raw_image_path=gate_wide, output_path=annotated_wide_local,
+                footprint=footprint, centroid_lat=centroid_lat, centroid_lon=centroid_lon,
+                enriched_detections=[], winner=None, zoom=MAPBOX_ZOOM_WIDE)
+            wide_blob = f"results/{job_id}/{os.path.basename(annotated_wide_local)}"
+            upload_file(annotated_wide_local, wide_blob)
+            result_url_wide = make_signed_url(wide_blob)
         return (
             _build_web_entry(
                 full_address=full_address, verdict='likely_residential',
                 consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
+                notes=notes, original_url=original_url, result_url=result_url,
+                result_url_wide=result_url_wide,
             ),
             _build_csv_row(
                 full_address=full_address, verdict='likely_residential',
                 consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
+                notes=notes, original_url=original_url, result_url=result_url,
             ),
         )
 
