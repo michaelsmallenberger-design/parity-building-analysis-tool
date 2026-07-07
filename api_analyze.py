@@ -235,6 +235,54 @@ def _read_uploaded_address_file(uploaded_file):
     return items
 
 
+def _read_uploaded_dataframe(uploaded_file):
+    """Read the uploaded CSV/XLS/XLSX into a DataFrame with ALL columns preserved,
+    and locate the address / boro / zip columns. Enforces ANALYZE_FILE_MAX_ROWS.
+    Returns (df, address_col, boro_col, zip_col)."""
+    filename = uploaded_file.filename or "upload"
+    suffix = Path(filename).suffix.lower()
+    max_rows = int(os.environ.get("ANALYZE_FILE_MAX_ROWS", "250"))
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".xlsx") as tmp:
+        uploaded_file.save(tmp.name)
+        tmp_path = tmp.name
+    try:
+        try:
+            if suffix in {".xlsx", ".xls"}:
+                df = pd.read_excel(tmp_path)
+            elif suffix == ".csv":
+                df = _read_csv_with_fallback(tmp_path)
+            elif not suffix:
+                try:
+                    df = pd.read_excel(tmp_path)
+                except Exception:
+                    df = _read_csv_with_fallback(tmp_path)
+            else:
+                raise ValueError("Upload must be an .xlsx, .xls, or .csv file")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Could not read uploaded file: {e}") from e
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    if df.empty:
+        raise ValueError("Uploaded file has no rows")
+    address_col = _first_present(df.columns, ADDRESS_COLUMNS)
+    if not address_col:
+        raise ValueError(
+            "Uploaded file must include an address column (e.g. Address, Property "
+            f"Address, Street Address). Found columns: {list(df.columns)}")
+    if len(df) > max_rows:
+        raise ValueError(
+            f"Uploaded file has {len(df)} rows, above the safety limit of {max_rows}. "
+            "Split the file or raise ANALYZE_FILE_MAX_ROWS on the server.")
+    boro_col = _first_present(df.columns, BORO_COLUMNS)
+    zip_col = _first_present(df.columns, ZIP_COLUMNS)
+    return df, address_col, boro_col, zip_col
+
+
 @api.route("/analyze", methods=["POST"])
 @require_key
 def analyze():
@@ -248,29 +296,22 @@ def analyze():
     return jsonify(_analyze_one(address, body.get("boro_area"), body.get("zip")))
 
 
-def _sheet_row(entry, i):
-    """One row for the Google Sheet create call (Apps Script maps these to columns)."""
-    return {
-        "row_id": i,
-        "address": entry.get("address", ""),
-        "ai_verdict": entry.get("verdict", ""),
-        "ai_confidence": entry.get("confidence_score", ""),
-        "ai_reasoning": entry.get("reasoning", ""),
-    }
+CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID = "HVAC Systems", "Fit", "Notes", "Row_ID"
 
 
-def _create_sheet(results, title):
-    """Create a new team Google Sheet for this batch via the Apps Script web app
-    (SHEET_WEBHOOK_URL). Returns the sheet URL, or "" if not configured / on error."""
+def _create_sheet(headers, rows, title):
+    """Create the team Google Sheet (a COPY of the user's table + HVAC/Fit dropdowns,
+    NO AI columns) via the Apps Script web app. Returns the sheet URL, or "" on
+    error / when SHEET_WEBHOOK_URL is unset."""
     url = os.environ.get("SHEET_WEBHOOK_URL")
     if not url:
         return ""
-    rows = [_sheet_row(e, i) for i, e in enumerate(results, 1)]
     try:
         resp = review_store.post_appscript(url, {
             "action": "create",
             "token": os.environ.get("SHEET_WEBHOOK_TOKEN", ""),
             "title": title,
+            "headers": headers,
             "rows": rows,
         }, timeout=120)
         if resp.get("sheet_url"):
@@ -281,13 +322,45 @@ def _create_sheet(results, title):
     return ""
 
 
-def _finalize_batch(results, title):
-    """Stamp row ids, persist the batch for /review, create the sheet if configured.
-    Returns (batch_id, review_url, sheet_url)."""
+def _lean_table(results):
+    """No uploaded sheet (addresses only): minimal table = address + review columns."""
+    headers = ["Property Address", CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID]
+    rows = [[r.get("address", ""), "", "", "", i] for i, r in enumerate(results, 1)]
+    return headers, rows
+
+
+def _table_from_df(df):
+    """Preserve EVERY uploaded column; ensure HVAC Systems / Fit / Notes exist (reuse
+    if already present) and stamp a hidden Row_ID = 1-based row index. Returns
+    (headers, rows) as plain strings for the sheet. No AI columns are added."""
+    df = df.copy()
+    for col in (CANON_HVAC, CANON_FIT, CANON_NOTES):
+        if col not in df.columns:
+            df[col] = ""
+    df[CANON_ID] = range(1, len(df) + 1)
+    headers = [str(c) for c in df.columns]
+
+    def _cell(v):
+        if v == "" or v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():  # 12.0 -> "12", not "12.0"
+            return str(int(v))
+        return str(v)
+
+    filled = df.where(df.notna(), "")
+    rows = [[_cell(v) for v in rec] for rec in filled.values.tolist()]
+    return headers, rows
+
+
+def _finalize_batch(results, title, headers=None, rows=None):
+    """Stamp row ids, create the sheet (from the uploaded table when given, else a
+    lean one), persist the batch for /review. Returns (batch_id, review_url, sheet_url)."""
     for i, e in enumerate(results, 1):
         e["row_id"] = i
     batch_id = f"b-{uuid.uuid4().hex[:10]}"
-    sheet_url = _create_sheet(results, title)
+    if headers is None:
+        headers, rows = _lean_table(results)
+    sheet_url = _create_sheet(headers, rows, title)
     review_store.save_batch(batch_id, title, results, sheet_url=sheet_url)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
@@ -339,28 +412,33 @@ def run_file():
         return jsonify({"error": "missing uploaded file field named 'file'"}), 400
 
     try:
-        addresses = _read_uploaded_address_file(uploaded)
+        df, addr_col, boro_col, zip_col = _read_uploaded_dataframe(uploaded)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    title = (request.form.get("title") or "Cooling Tower Analysis").strip()
+    title = (request.form.get("title") or Path(uploaded.filename).stem or "Cooling Tower Analysis").strip()
     results = []
-    total = len(addresses)
-    for item in addresses:
-        addr, boro, zc = _coerce_address_item(item)
-        if not addr:
+    total = len(df)
+    for _, row in df.iterrows():
+        addr = str(row.get(addr_col) or "").strip()
+        if not addr or addr.lower() == "nan":
+            results.append(_build_web_entry(
+                full_address="", verdict="", consensus_dict=None, detection_count=0,
+                construction=False, notes="(no address in row)",
+                original_url=None, result_url=None))
             continue
+        boro = str(row.get(boro_col)).strip() if boro_col and pd.notna(row.get(boro_col)) else None
+        zc = str(row.get(zip_col)).strip() if zip_col and pd.notna(row.get(zip_col)) else None
         results.append(_analyze_one(addr, boro, zc, total=total))
 
-    batch_id, review_url, sheet_url = _finalize_batch(results, title)
-    html_str = build_audit_report(results, title=title)
-    response = Response(html_str, mimetype="text/html")
-    response.headers["X-Address-Count"] = str(total)
-    response.headers["X-Uploaded-Filename"] = uploaded.filename
-    response.headers["X-Review-URL"] = review_url
+    headers, rows = _table_from_df(df)
+    batch_id, review_url, sheet_url = _finalize_batch(results, title, headers, rows)
+    resp = jsonify({"ok": True, "count": total, "review_url": review_url, "sheet_url": sheet_url})
+    resp.headers["X-Review-URL"] = review_url
     if sheet_url:
-        response.headers["X-Sheet-URL"] = sheet_url
-    return response
+        resp.headers["X-Sheet-URL"] = sheet_url
+    resp.headers["X-Uploaded-Filename"] = uploaded.filename
+    return resp
 
 
 @api.route("/report", methods=["POST"])
