@@ -404,18 +404,20 @@ def _table_from_df(df):
 
 
 def _finalize_batch(results, title, headers=None, rows=None):
-    """Stamp row ids, create the sheet (from the uploaded table when given, else a
-    lean one), persist the batch for /review. Returns (batch_id, review_url, sheet_url)."""
+    """Stamp row ids and persist the batch for /review, storing the ORIGINAL uploaded
+    table (all the user's columns). No Google Sheet is created here — the operator
+    writes the finished sheet from the human picks via GET /api/batch (skill flow).
+    Returns (batch_id, review_url, sheet_url="")."""
     for i, e in enumerate(results, 1):
         e["row_id"] = i
     batch_id = f"b-{uuid.uuid4().hex[:10]}"
     if headers is None:
         headers, rows = _lean_table(results)
-    sheet_url = _create_sheet(headers, rows, title)
-    review_store.save_batch(batch_id, title, results, sheet_url=sheet_url)
+    review_store.save_batch(batch_id, title, results, sheet_url="",
+                            table_headers=headers, table_rows=rows)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
-    return batch_id, review_url, sheet_url
+    return batch_id, review_url, ""
 
 
 @api.route("/run", methods=["POST"])
@@ -490,6 +492,26 @@ def run_file():
         resp.headers["X-Sheet-URL"] = sheet_url
     resp.headers["X-Uploaded-Filename"] = uploaded.filename
     return resp
+
+
+@api.route("/batch/<batch_id>", methods=["GET"])
+@require_key
+def batch(batch_id):
+    """Operator/skill endpoint: return the ORIGINAL uploaded table (all the user's
+    columns) plus the human review decisions recorded so far, so the operator can
+    assemble the finished Google Sheet from the human HVAC/Fit picks. No AI columns."""
+    b = review_store.load_batch(batch_id)
+    if not b:
+        return jsonify({"error": "batch not found"}), 404
+    decisions = review_store.decisions_for(batch_id)
+    return jsonify({
+        "title": b.get("title", ""),
+        "headers": b.get("table_headers", []),
+        "rows": b.get("table_rows", []),
+        "decisions": decisions,
+        "count": len(b.get("table_rows", [])),
+        "reviewed": len(decisions),
+    })
 
 
 @api.route("/report", methods=["POST"])

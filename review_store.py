@@ -36,15 +36,35 @@ def _path(job_id: str) -> str:
     return f"reviews/{job_id}.json"
 
 
-def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "") -> None:
-    """Persist a batch's web_entries (with images) for later review."""
+def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
+               table_headers: list = None, table_rows: list = None) -> None:
+    """Persist a batch's web_entries (with images) for the review page, plus the
+    ORIGINAL uploaded table (headers + rows, all the user's columns) so the finished
+    Google Sheet can be assembled from the human picks later."""
     write_json(_path(job_id), {
         "job_id": job_id,
         "title": title,
         "sheet_url": sheet_url,
         "created": datetime.utcnow().isoformat(),
+        "table_headers": table_headers or [],
+        "table_rows": table_rows or [],
         "entries": entries,
     })
+
+
+def decisions_for(job_id: str) -> list:
+    """Return the human review decisions recorded so far for a batch, as a list of
+    {row_id, hvac_systems, fit, note} — what an operator merges into the sheet."""
+    batch = load_batch(job_id)
+    if not batch:
+        return []
+    out = []
+    for e in batch.get("entries", []):
+        h = e.get("human")
+        if h:
+            out.append({"row_id": _rid(e), "hvac_systems": h.get("hvac_systems", ""),
+                        "fit": h.get("fit", ""), "note": h.get("note", "")})
+    return out
 
 
 def load_batch(job_id: str):

@@ -217,31 +217,12 @@ def api_review():
     if not job_id or row_id is None:
         return jsonify({"error": "missing job_id/row_id"}), 400
 
-    batch = review_store.load_batch(job_id)
-    review_store.record_decision(job_id, row_id, {
+    if not review_store.record_decision(job_id, row_id, {
         "hvac_systems": payload.get("hvac_systems", ""),
         "fit": payload.get("fit", ""),
         "note": payload.get("note", ""),
-    })
-
-    writer = os.getenv("SHEET_WEBHOOK_URL")
-    if writer:
-        try:
-            resp = review_store.post_appscript(writer, {
-                "action": "update",
-                "token": os.getenv("SHEET_WEBHOOK_TOKEN", ""),
-                "sheet_url": (batch or {}).get("sheet_url", ""),
-                **payload,
-            }, timeout=30)
-            if not resp.get("ok"):
-                log.error(f"Sheet update failed: {resp}")
-                return jsonify({"error": "sheet write failed", "detail": resp}), 502
-        except Exception as e:
-            log.error(f"Sheet writer call failed: {e}")
-            return jsonify({"error": "sheet writer unreachable"}), 502
-    else:
-        log.warning("SHEET_WEBHOOK_URL not set; decision stored locally only")
-
+    }):
+        return jsonify({"error": "unknown batch/row"}), 404
     return jsonify({"ok": True})
 
 
