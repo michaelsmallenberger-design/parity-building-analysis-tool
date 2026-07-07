@@ -29,10 +29,12 @@ from functools import wraps
 from pathlib import Path
 
 import pandas as pd
+import requests
 from flask import Blueprint, jsonify, request, Response
 
 from tasks_local import _process_one_address, _build_web_entry
 from report_audit import build_audit_report
+import review_store
 
 log = logging.getLogger("api")
 
@@ -246,6 +248,52 @@ def analyze():
     return jsonify(_analyze_one(address, body.get("boro_area"), body.get("zip")))
 
 
+def _sheet_row(entry, i):
+    """One row for the Google Sheet create call (Apps Script maps these to columns)."""
+    return {
+        "row_id": i,
+        "address": entry.get("address", ""),
+        "ai_verdict": entry.get("verdict", ""),
+        "ai_confidence": entry.get("confidence_score", ""),
+        "ai_reasoning": entry.get("reasoning", ""),
+    }
+
+
+def _create_sheet(results, title):
+    """Create a new team Google Sheet for this batch via the Apps Script web app
+    (SHEET_WEBHOOK_URL). Returns the sheet URL, or "" if not configured / on error."""
+    url = os.environ.get("SHEET_WEBHOOK_URL")
+    if not url:
+        return ""
+    rows = [_sheet_row(e, i) for i, e in enumerate(results, 1)]
+    try:
+        r = requests.post(url, json={
+            "action": "create",
+            "token": os.environ.get("SHEET_WEBHOOK_TOKEN", ""),
+            "title": title,
+            "rows": rows,
+        }, timeout=60)
+        if r.status_code < 300:
+            return (r.json() or {}).get("sheet_url", "")
+        log.error("sheet create returned %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.error("sheet create failed: %s", e)
+    return ""
+
+
+def _finalize_batch(results, title):
+    """Stamp row ids, persist the batch for /review, create the sheet if configured.
+    Returns (batch_id, review_url, sheet_url)."""
+    for i, e in enumerate(results, 1):
+        e["row_id"] = i
+    batch_id = f"b-{uuid.uuid4().hex[:10]}"
+    sheet_url = _create_sheet(results, title)
+    review_store.save_batch(batch_id, title, results, sheet_url=sheet_url)
+    base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
+    return batch_id, review_url, sheet_url
+
+
 @api.route("/run", methods=["POST"])
 @require_key
 def run():
@@ -268,9 +316,13 @@ def run():
             continue
         results.append(_analyze_one(addr, boro, zc, total=total))
 
+    batch_id, review_url, sheet_url = _finalize_batch(results, title)
     html_str = build_audit_report(results, title=title)
     response = Response(html_str, mimetype="text/html")
     response.headers["X-Address-Count"] = str(total)
+    response.headers["X-Review-URL"] = review_url
+    if sheet_url:
+        response.headers["X-Sheet-URL"] = sheet_url
     return response
 
 
@@ -300,10 +352,14 @@ def run_file():
             continue
         results.append(_analyze_one(addr, boro, zc, total=total))
 
+    batch_id, review_url, sheet_url = _finalize_batch(results, title)
     html_str = build_audit_report(results, title=title)
     response = Response(html_str, mimetype="text/html")
     response.headers["X-Address-Count"] = str(total)
     response.headers["X-Uploaded-Filename"] = uploaded.filename
+    response.headers["X-Review-URL"] = review_url
+    if sheet_url:
+        response.headers["X-Sheet-URL"] = sheet_url
     return response
 
 

@@ -217,18 +217,20 @@ def api_review():
     if not job_id or row_id is None:
         return jsonify({"error": "missing job_id/row_id"}), 400
 
+    batch = review_store.load_batch(job_id)
     review_store.record_decision(job_id, row_id, {
         "hvac_systems": payload.get("hvac_systems", ""),
         "fit": payload.get("fit", ""),
         "note": payload.get("note", ""),
     })
 
-    sheet_url = os.getenv("SHEET_WEBHOOK_URL")
-    if sheet_url:
+    writer = os.getenv("SHEET_WEBHOOK_URL")
+    if writer:
         try:
-            r = requests.post(sheet_url, json={
+            r = requests.post(writer, json={
                 "action": "update",
                 "token": os.getenv("SHEET_WEBHOOK_TOKEN", ""),
+                "sheet_url": (batch or {}).get("sheet_url", ""),
                 **payload,
             }, timeout=20)
             if r.status_code >= 300:
