@@ -25,22 +25,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app_railway.py app.py
-COPY job_queue.py .
-COPY storage_helpers.py .
-COPY worker.py .
-COPY tasks_local.py .
-COPY utils.py .
-COPY geometry.py .
-COPY vlm.py .
-COPY pipeline_render.py .
-COPY nyc_opendata.py .
-COPY ms_footprints.py .
-COPY html_report.py .
-COPY report_audit.py .
-COPY api_analyze.py .
-COPY review_render.py .
-COPY review_store.py .
-COPY zip_bundler.py .
+# Copy ALL Python modules — avoids the recurring "forgot a COPY line" boot crash.
+# (app_railway.py is also copied to app.py above for the gunicorn entrypoint.)
+COPY *.py .
 COPY models/ models/
 COPY reference_images/ reference_images/
 COPY static/ static/
