@@ -15,6 +15,9 @@ from job_queue import init_db, enqueue_job, get_job_status, cancel_job, check_us
 from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists, read_file
 from worker import start_worker
 from api_analyze import api as api_blueprint
+from review_render import build_review_page
+import review_store
+import requests
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -184,6 +187,61 @@ def serve_file(blob_name):
     except Exception as e:
         log.error(f"Error serving file {blob_name}: {e}")
         abort(404)
+
+# -----------------------------------------------------------------------------
+# REVIEW LOOP (team confirms HVAC + fit per building; writes back to the sheet)
+# -----------------------------------------------------------------------------
+@app.route('/review/<job_id>')
+def review_page(job_id):
+    """Serve the blessed interactive review page for a persisted batch."""
+    batch = review_store.load_batch(job_id)
+    if not batch:
+        abort(404)
+    html = build_review_page(
+        batch.get("entries", []),
+        job_id=job_id,
+        webhook_url="/api/review",  # same-origin relay -> no browser CORS
+        title=batch.get("title", "Cooling Tower Review"),
+    )
+    return Response(html, mimetype="text/html")
+
+
+@app.route('/api/review', methods=['POST'])
+def api_review():
+    """Receive one reviewer decision, stamp it locally, and relay it to the Google
+    Sheet writer (Apps Script web app) server-side. No API key required from the
+    reviewer; the shared-secret token protects the actual sheet write."""
+    payload = request.get_json(silent=True) or {}
+    job_id = payload.get("job_id")
+    row_id = payload.get("row_id")
+    if not job_id or row_id is None:
+        return jsonify({"error": "missing job_id/row_id"}), 400
+
+    review_store.record_decision(job_id, row_id, {
+        "hvac_systems": payload.get("hvac_systems", ""),
+        "fit": payload.get("fit", ""),
+        "note": payload.get("note", ""),
+    })
+
+    sheet_url = os.getenv("SHEET_WEBHOOK_URL")
+    if sheet_url:
+        try:
+            r = requests.post(sheet_url, json={
+                "action": "update",
+                "token": os.getenv("SHEET_WEBHOOK_TOKEN", ""),
+                **payload,
+            }, timeout=20)
+            if r.status_code >= 300:
+                log.error(f"Sheet writer returned {r.status_code}: {r.text[:200]}")
+                return jsonify({"error": "sheet write failed"}), 502
+        except Exception as e:
+            log.error(f"Sheet writer call failed: {e}")
+            return jsonify({"error": "sheet writer unreachable"}), 502
+    else:
+        log.warning("SHEET_WEBHOOK_URL not set; decision stored locally only")
+
+    return jsonify({"ok": True})
+
 
 # -----------------------------------------------------------------------------
 # HEALTH CHECK
