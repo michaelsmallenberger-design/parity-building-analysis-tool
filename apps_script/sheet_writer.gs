@@ -1,28 +1,23 @@
 /**
  * Parity — Google Sheet writer for the cooling-tower review loop.
  *
- * A standalone Apps Script web app (deployed once by a team member; runs as them,
- * under your Workspace — NO service-account key, NO n8n). The Render app calls it
- * server-side for two actions:
- *   • create → make a NEW sheet for a batch, write the analysis rows, share it
- *              with the team, return the sheet URL.
- *   • update → when a reviewer submits, write HVAC Systems + Fit + Note into the row.
+ * Standalone Apps Script web app (deployed once by a team member; runs as them,
+ * no service-account key, no n8n). The Render app calls it server-side:
+ *   • create → make a NEW sheet that is a COPY of the uploaded building sheet
+ *              (ALL the user's columns preserved), then add HVAC/Fit dropdowns.
+ *              NO AI columns — the AI is only guidance on the review web page.
+ *   • update → when a reviewer submits, write HVAC Systems + Fit (+ Notes) into
+ *              that building's row (matched by the hidden Row_ID column).
  *
- * Setup (see apps_script/README.md):
- *   1. Extensions ▸ Apps Script in any sheet, or script.google.com ▸ New project.
- *   2. Paste this file.
- *   3. Project Settings ▸ Script Properties — add:
- *        SHARED_TOKEN = a long random string (must match Render SHEET_WEBHOOK_TOKEN)
- *        TEAM_EMAILS  = comma-separated emails to auto-share each new sheet with
- *        FOLDER_ID    = (optional) a Drive folder ID to drop new sheets into
- *   4. Deploy ▸ New deployment ▸ Web app ▸ Execute as: Me, Access: Anyone with the link.
- *   5. Copy the /exec URL → give it to Render as SHEET_WEBHOOK_URL.
+ * The tool guarantees the columns "HVAC Systems", "Fit", "Notes", and "Row_ID"
+ * exist in the headers it sends (reusing the user's if already present), so this
+ * script always finds them by name.
+ *
+ * Setup / redeploy: see apps_script/README.md. Script Properties needed:
+ *   SHARED_TOKEN (must match Render SHEET_WEBHOOK_TOKEN), TEAM_EMAILS, FOLDER_ID?
  */
 
 var SHEET_NAME = 'Analysis';
-var HEADERS = ['Row_ID', 'Address', 'AI Verdict', 'AI Confidence', 'AI Reasoning',
-               'HVAC Systems', 'Fit', 'Note', 'Reviewed At'];
-// Match the Washington Gas sheet dropdowns.
 var HVAC_OPTIONS = ['Cooling Tower', 'Chiller', 'Exhaust Fan', 'RTU', 'AHU', 'PTAC', 'Fan Coil', 'Heat Pump', 'VRF'];
 var FIT_OPTIONS = ['Optimizer', 'Periscope', 'Unclear', 'Bad'];
 
@@ -40,49 +35,41 @@ function doPost(e) {
 
 function _create(body) {
   var title = body.title || ('Cooling Tower Analysis ' + _today());
+  var headers = body.headers || [];
+  var rows = body.rows || [];
+  var nCols = headers.length;
+
   var ss = SpreadsheetApp.create(title);
   var sh = ss.getActiveSheet();
   sh.setName(SHEET_NAME);
 
-  var rows = [HEADERS];
-  (body.rows || []).forEach(function (r) {
-    rows.push([r.row_id, r.address, r.ai_verdict, r.ai_confidence, r.ai_reasoning, '', '', '', '']);
-  });
-  sh.getRange(1, 1, rows.length, HEADERS.length).setValues(rows);
+  var all = [headers].concat(rows);
+  if (nCols) sh.getRange(1, 1, all.length, nCols).setValues(all);
+  var lastRow = Math.max(all.length, 300);
 
-  var lastRow = Math.max(rows.length, 300); // format + dropdowns cover spare rows too
-
-  // Header styling + frozen panes
-  sh.getRange(1, 1, 1, HEADERS.length)
-    .setFontWeight('bold').setFontColor('#ffffff').setBackground('#0f5132').setVerticalAlignment('middle');
+  // Header styling + freeze
+  sh.getRange(1, 1, 1, nCols).setFontWeight('bold').setFontColor('#ffffff').setBackground('#0f5132');
   sh.setFrozenRows(1);
-  sh.setFrozenColumns(2);
   sh.setRowHeight(1, 30);
 
-  // Column widths + wrapping + confidence as %
-  [70, 260, 130, 95, 380, 210, 115, 220, 150].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
-  sh.getRange(2, 5, lastRow, 1).setWrap(true);            // AI Reasoning
-  sh.getRange(2, 8, lastRow, 1).setWrap(true);            // Note
-  sh.getRange(2, 4, lastRow, 1).setNumberFormat('0%');    // AI Confidence
-
-  // Dropdowns — HVAC (multi-value, so warn-not-reject) and Fit (single, strict)
-  var cH = HEADERS.indexOf('HVAC Systems') + 1;
-  var cF = HEADERS.indexOf('Fit') + 1;
-  sh.getRange(2, cH, lastRow, 1).setDataValidation(
+  // Dropdowns on HVAC Systems (multi, warn-not-reject) and Fit (single, strict)
+  var cH = headers.indexOf('HVAC Systems') + 1;
+  var cF = headers.indexOf('Fit') + 1;
+  if (cH > 0) sh.getRange(2, cH, lastRow, 1).setDataValidation(
     SpreadsheetApp.newDataValidation().requireValueInList(HVAC_OPTIONS, true).setAllowInvalid(true)
       .setHelpText('Pick from: ' + HVAC_OPTIONS.join(', ') + ' (multiple allowed, comma-separated)').build());
-  sh.getRange(2, cF, lastRow, 1).setDataValidation(
+  if (cF > 0) sh.getRange(2, cF, lastRow, 1).setDataValidation(
     SpreadsheetApp.newDataValidation().requireValueInList(FIT_OPTIONS, true).setAllowInvalid(false).build());
 
-  // Alternating row banding on the data rows (keep the green header)
-  try {
-    sh.getRange(2, 1, lastRow - 1, HEADERS.length).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
-  } catch (e) {}
+  // Readability: banding on data rows, sensible widths, hide the Row_ID key column
+  try { sh.getRange(2, 1, lastRow - 1, nCols).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false); } catch (e) {}
+  try { sh.autoResizeColumns(1, nCols); } catch (e) {}
+  var cId = headers.indexOf('Row_ID') + 1;
+  if (cId > 0) { try { sh.hideColumns(cId); } catch (e) {} }
 
+  // Move to folder + share with the team
   var folderId = _prop('FOLDER_ID');
-  if (folderId) {
-    try { DriveApp.getFileById(ss.getId()).moveTo(DriveApp.getFolderById(folderId)); } catch (e) {}
-  }
+  if (folderId) { try { DriveApp.getFileById(ss.getId()).moveTo(DriveApp.getFolderById(folderId)); } catch (e) {} }
   _prop('TEAM_EMAILS').split(',').map(function (s) { return s.trim(); }).filter(String)
     .forEach(function (em) { try { ss.addEditor(em); } catch (e) {} });
 
@@ -96,13 +83,13 @@ function _update(body) {
   var data = sh.getDataRange().getValues();
   var head = data[0];
   var cId = head.indexOf('Row_ID'), cH = head.indexOf('HVAC Systems'),
-      cF = head.indexOf('Fit'), cN = head.indexOf('Note'), cR = head.indexOf('Reviewed At');
+      cF = head.indexOf('Fit'), cN = head.indexOf('Notes');
+  if (cId < 0) return _json({ error: 'no Row_ID column' });
   for (var i = 1; i < data.length; i++) {
     if (String(data[i][cId]) === String(body.row_id)) {
       if (cH >= 0) sh.getRange(i + 1, cH + 1).setValue(body.hvac_systems || '');
       if (cF >= 0) sh.getRange(i + 1, cF + 1).setValue(body.fit || '');
-      if (cN >= 0) sh.getRange(i + 1, cN + 1).setValue(body.note || '');
-      if (cR >= 0) sh.getRange(i + 1, cR + 1).setValue(new Date());
+      if (cN >= 0 && body.note) sh.getRange(i + 1, cN + 1).setValue(body.note);
       return _json({ ok: true, row: i + 1 });
     }
   }

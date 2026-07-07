@@ -45,14 +45,18 @@ That's it. From then on:
 `POST` JSON to the web app URL:
 
 ```jsonc
-// create — Render calls this after a run
-{ "action":"create", "token":"…", "title":"Washington Gas — 2026-07-07",
-  "rows":[ {"row_id":1,"address":"…","ai_verdict":"confirmed","ai_confidence":0.9,"ai_reasoning":"…"}, … ] }
+// create — Render sends the user's WHOLE uploaded table (all their columns
+// preserved, NO AI columns). The tool guarantees HVAC Systems / Fit / Notes /
+// Row_ID are present in headers; the script adds dropdowns to HVAC Systems + Fit
+// and hides Row_ID.
+{ "action":"create", "token":"…", "title":"Washington Gas 2026-07-07",
+  "headers":["Property Address","Property Name","HVAC Systems","Fit","Notes","City","Row_ID"],
+  "rows":[ ["7333 New Hampshire Ave","Takoma Overlook","","","","Takoma Park","1"], … ] }
 // → { "ok":true, "sheet_url":"https://docs.google.com/…", "sheet_id":"…" }
 
-// update — Render calls this on each reviewer Submit
+// update — on each reviewer Submit (matched by the hidden Row_ID column)
 { "action":"update", "token":"…", "sheet_url":"https://docs.google.com/…",
-  "row_id":1, "hvac_systems":"Cooling Tower, Exhaust Fan", "fit":"Optimizer", "note":"" }
+  "row_id":"1", "hvac_systems":"Cooling Tower, Exhaust Fan", "fit":"Optimizer", "note":"" }
 // → { "ok":true, "row":2 }
 ```
 
