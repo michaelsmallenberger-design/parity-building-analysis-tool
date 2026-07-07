@@ -30,3 +30,5 @@ training_setup/
 training_addresses.csv
 download_training_images.py
 data/
+# tests don't belong in the runtime image (but real modules now auto-copy via COPY *.py)
+test_*.py
