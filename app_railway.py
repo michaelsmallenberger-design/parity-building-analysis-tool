@@ -17,6 +17,7 @@ from worker import start_worker
 from api_analyze import api as api_blueprint
 from review_render import build_review_page
 import review_store
+import sheets_writer
 import requests
 
 # Initialize Flask app
@@ -208,22 +209,38 @@ def review_page(job_id):
 
 @app.route('/api/review', methods=['POST'])
 def api_review():
-    """Receive one reviewer decision from the review page and stamp it into the local
-    batch store. Decisions are read back later via GET /api/batch to build the Google
-    Sheet from the human picks. No API key required from the reviewer."""
+    """Receive one reviewer decision from the review page: stamp it into the local
+    batch store AND write it live into the batch's Google Sheet row (when the batch
+    has a sheet). The local record stays authoritative for GET /api/batch, so a
+    Sheets outage never loses a decision or fails the reviewer's Submit. No API key
+    required from the reviewer."""
     payload = request.get_json(silent=True) or {}
     job_id = payload.get("job_id")
     row_id = payload.get("row_id")
     if not job_id or row_id is None:
         return jsonify({"error": "missing job_id/row_id"}), 400
 
-    if not review_store.record_decision(job_id, row_id, {
+    batch = review_store.record_decision(job_id, row_id, {
         "hvac_systems": payload.get("hvac_systems", ""),
         "fit": payload.get("fit", ""),
         "note": payload.get("note", ""),
-    }):
+    })
+    if not batch:
         return jsonify({"error": "unknown batch/row"}), 404
-    return jsonify({"ok": True})
+
+    sheet = "none"
+    if batch.get("sheet_url") and sheets_writer.enabled():
+        try:
+            ok = sheets_writer.write_decision(
+                batch["sheet_url"], batch.get("table_headers", []),
+                batch.get("table_rows", []), row_id,
+                hvac=payload.get("hvac_systems", ""),
+                fit=payload.get("fit", ""), note=payload.get("note", ""))
+            sheet = "updated" if ok else "row_not_found"
+        except Exception as e:
+            log.error(f"Sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)
+            sheet = "error"
+    return jsonify({"ok": True, "sheet": sheet})
 
 
 # -----------------------------------------------------------------------------

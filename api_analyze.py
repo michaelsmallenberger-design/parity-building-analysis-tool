@@ -37,6 +37,7 @@ from tasks_local import _process_one_address, _build_web_entry
 from report_audit import build_audit_report
 from review_render import HVAC_SYSTEMS, FIT_OPTIONS
 import review_store
+import sheets_writer
 
 log = logging.getLogger("api")
 
@@ -382,19 +383,29 @@ def _table_from_df(df):
 
 def _finalize_batch(results, title, headers=None, rows=None):
     """Stamp row ids and persist the batch for /review, storing the ORIGINAL uploaded
-    table (all the user's columns). No Google Sheet is created here — the operator
-    writes the finished sheet from the human picks via GET /api/batch (skill flow).
-    Returns (batch_id, review_url, sheet_url="")."""
+    table (all the user's columns). When a Sheets service-account credential is
+    configured, the output Google Sheet is created HERE, up front — each review
+    Submit then writes straight into it (/api/review). Without the credential,
+    sheet_url stays "" and the operator/skill flow via GET /api/batch is the
+    fallback. Sheet-creation failure is logged, not fatal: the batch and review
+    page must survive a Sheets outage. Returns (batch_id, review_url, sheet_url)."""
     for i, e in enumerate(results, 1):
         e["row_id"] = i
     batch_id = f"b-{uuid.uuid4().hex[:10]}"
     if headers is None:
         headers, rows = _lean_table(results)
-    review_store.save_batch(batch_id, title, results, sheet_url="",
+    sheet_url = ""
+    if sheets_writer.enabled():
+        try:
+            sheet_url = sheets_writer.create_batch_sheet(
+                title, headers, rows, HVAC_SYSTEMS, FIT_OPTIONS)
+        except Exception as e:
+            log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
+    review_store.save_batch(batch_id, title, results, sheet_url=sheet_url,
                             table_headers=headers, table_rows=rows)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
-    return batch_id, review_url, ""
+    return batch_id, review_url, sheet_url
 
 
 @api.route("/run", methods=["POST"])

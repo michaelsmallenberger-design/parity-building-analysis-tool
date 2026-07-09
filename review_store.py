@@ -55,17 +55,20 @@ def _rid(entry) -> str:
     return str(entry.get("i") if entry.get("i") is not None else entry.get("row_id", ""))
 
 
-def record_decision(job_id: str, row_id, decision: dict) -> bool:
+def record_decision(job_id: str, row_id, decision: dict):
     """Stamp a reviewer's decision onto the matching entry so a page reload shows
-    it as already reviewed. Returns False if the batch/row is unknown."""
+    it as already reviewed. Returns the updated batch dict (so the caller can
+    reach sheet_url/table without re-reading the JSON), or None if the batch/row
+    is unknown."""
     batch = load_batch(job_id)
     if not batch:
-        return False
+        return None
     hit = False
     for e in batch.get("entries", []):
         if _rid(e) == str(row_id):
             e["human"] = {**decision, "reviewed_at": datetime.utcnow().isoformat()}
             hit = True
-    if hit:
-        write_json(_path(job_id), batch)
-    return hit
+    if not hit:
+        return None
+    write_json(_path(job_id), batch)
+    return batch
