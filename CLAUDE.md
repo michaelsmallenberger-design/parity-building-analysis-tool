@@ -11,7 +11,7 @@ This repository is the Parity cooling-tower analyzer. It is currently a Render-h
 
 The active pipeline is the Phase 4 shape on branch `piece4-concurrency`: Google defaults for geocoding/imagery, Mapbox fallback and dense-core imagery, OSM -> NYC -> Microsoft footprint fallback, two zoom levels, optional YOLO model ensemble through `MODEL_PATHS`, and one address-level `vlm.verify_address()` call.
 
-Do not rely on older archived docs as current behavior. Historical docs live under `docs/archive/`.
+Do not rely on older docs or code comments as current behavior; verify against the code.
 
 ## Active Files
 
@@ -30,7 +30,8 @@ Runtime:
 - `vlm.py`
 - `pipeline_render.py`
 - `report_audit.py`
-- `html_report.py`
+- `review_render.py`
+- `review_store.py`
 - `zip_bundler.py`
 
 Assets/config:

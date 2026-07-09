@@ -208,9 +208,9 @@ def review_page(job_id):
 
 @app.route('/api/review', methods=['POST'])
 def api_review():
-    """Receive one reviewer decision, stamp it locally, and relay it to the Google
-    Sheet writer (Apps Script web app) server-side. No API key required from the
-    reviewer; the shared-secret token protects the actual sheet write."""
+    """Receive one reviewer decision from the review page and stamp it into the local
+    batch store. Decisions are read back later via GET /api/batch to build the Google
+    Sheet from the human picks. No API key required from the reviewer."""
     payload = request.get_json(silent=True) or {}
     job_id = payload.get("job_id")
     row_id = payload.get("row_id")

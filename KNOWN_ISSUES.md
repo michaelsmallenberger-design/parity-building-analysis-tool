@@ -6,7 +6,6 @@ Current as of the `piece4-concurrency` branch.
 
 - `test_vlm.py` still exercises the older `verify_detection()` / `verify_rooftop()` helpers. The active pipeline uses `verify_address()`.
 - `test_geometry_math.py` is a diagnostic script, not a normal unit test. It calls external services and writes images.
-- Some archived docs under `docs/archive/` describe older Mapbox-first and per-box-VLM behavior. Treat them as historical notes only.
 
 ## Runtime Behavior
 

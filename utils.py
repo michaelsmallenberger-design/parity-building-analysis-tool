@@ -579,7 +579,7 @@ def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None,
 def _get_model():
     """
     Load the YOLO model once, on first call.
-    Using lru_cache avoids import-time model load (which caused Cloud Run OOM).
+    Using lru_cache avoids an import-time model load (a past OOM cause on memory-constrained hosts).
     """
     from ultralytics import YOLO  # import here to avoid heavy import at module load
     if not os.path.exists(MODEL_PATH):

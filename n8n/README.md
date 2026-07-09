@@ -1,39 +1,11 @@
 # n8n Orchestration
 
-This folder has two ways to run the cooling-tower analyzer from n8n.
+n8n is one way to drive the cooling-tower analyzer. The primary operator path is the
+Claude skill (`.claude/skills/parity-cooling-tower`), which runs a batch, hands the team a
+review page, and writes the reviewed picks into a Google Sheet. Use n8n when you want a
+hands-off, scheduled/triggered run that emails a finished report instead.
 
-## Recommended: Excel Upload
-
-Import:
-
-```text
-n8n/parity_excel_upload.workflow.json
-```
-
-Flow:
-
-```text
-Form upload -> POST /api/run-file on Render -> Gmail sends HTML report -> optional Slack confirmation
-```
-
-Use this when someone wants to upload an `.xlsx`, `.xls`, or `.csv` file and get an emailed report without maintaining a Google Sheet.
-
-First test file:
-
-```text
-n8n/address_upload_template.xlsx
-```
-
-Setup notes:
-
-- Render URL in the HTTP node: `https://YOUR-SERVICE.onrender.com/api/run-file`
-- Header in the HTTP node: `X-API-Key: <ANALYZE_API_KEY from Render>`
-- Gmail credentials are required.
-- Slack is optional and disabled by default in the import file.
-
-Detailed steps are in `n8n/EXCEL_UPLOAD_WORKFLOW.md` and `RUNBOOK.md`.
-
-## Optional: Google Sheet + Grok Cleanup
+## Google Sheet + Grok Cleanup
 
 Import:
 
@@ -47,7 +19,9 @@ Flow:
 Webhook -> Google Sheet -> Grok normalize -> aggregate -> POST /api/run on Render -> Gmail -> Slack
 ```
 
-Use this when the source list is messy and you want Grok in n8n to normalize each row before the analyzer sees it.
+Use this when the source list is messy and you want Grok in n8n to normalize each row before
+the analyzer sees it. `POST /api/run` returns a finished `text/html` audit report that the Gmail
+node sends.
 
 Setup notes:
 
@@ -57,14 +31,17 @@ Setup notes:
 
 ## What n8n Does
 
-n8n only orchestrates file intake, optional cleanup, and notifications. YOLO, imagery, geocoding, Gemini, and Grok verification all run on the Render Flask service through `api_analyze.py`.
+n8n only orchestrates intake, optional cleanup, and notifications. YOLO, imagery, geocoding,
+Gemini, and Grok verification all run on the Render Flask service through `api_analyze.py`.
 
 ## Endpoints
 
 | Method | Path | Auth | Body | Returns |
 | --- | --- | --- | --- | --- |
 | `GET` | `/api/health` | none | none | health JSON |
-| `POST` | `/api/run-file` | `X-API-Key` | multipart file upload | `text/html` report |
-| `POST` | `/api/run` | `X-API-Key` | `{addresses:[...]}` | `text/html` report |
+| `POST` | `/api/run` | `X-API-Key` | `{addresses:[...]}` | `text/html` report (+ `X-Review-URL` header) |
+| `POST` | `/api/run-file` | `X-API-Key` | multipart file upload | JSON `{review_url, count}` (drives the review flow; used by the Claude skill) |
 | `POST` | `/api/analyze` | `X-API-Key` | one address | one result JSON |
 | `POST` | `/api/report` | `X-API-Key` | result entries | `text/html` report |
+| `GET` | `/review/<batch_id>` | none | none | interactive review page |
+| `GET` | `/api/batch/<batch_id>` | `X-API-Key` | none | original table + human review decisions |

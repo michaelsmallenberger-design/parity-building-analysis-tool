@@ -74,52 +74,24 @@ curl -X POST "https://YOUR-SERVICE.onrender.com/api/run" \
 
 ## n8n
 
-After the Render service is live, import one of these workflows into n8n:
+The primary operator path is the Claude skill `.claude/skills/parity-cooling-tower`, not n8n.
 
-- `n8n/parity_excel_upload.workflow.json`: upload an Excel/CSV file through an n8n form.
-- `n8n/parity_cooling_tower.workflow.json`: read addresses from a Google Sheet.
-
-For the Excel upload workflow, update the analyzer HTTP node:
-
-- URL: `https://YOUR-SERVICE.onrender.com/api/run-file`
-- Header: `X-API-Key: <same ANALYZE_API_KEY from Render>`
-
-For the Google Sheet workflow, update the analyzer HTTP node:
+For a scheduled/triggered n8n run, import `n8n/parity_cooling_tower.workflow.json` (reads addresses from a Google Sheet) and update the analyzer HTTP node:
 
 - URL: `https://YOUR-SERVICE.onrender.com/api/run`
 - Header: `X-API-Key: <same ANALYZE_API_KEY from Render>`
 
-The workflow still needs its own Google Sheets, xAI, Gmail, and optional Slack credentials.
+The workflow also needs its own Google Sheets, xAI, Gmail, and optional Slack credentials. See `n8n/README.md`.
 
-## Excel Upload Endpoint
+## Verify the API key
 
-For a simpler n8n workflow where a user uploads an Excel/CSV file instead of maintaining a Google Sheet, call:
+Confirm the analyzer key is live once secrets are set:
 
-```text
-POST https://YOUR-SERVICE.onrender.com/api/run-file
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X POST "https://YOUR-SERVICE.onrender.com/api/run" \
+  -H "X-API-Key: $ANALYZE_API_KEY" -H "Content-Type: application/json" \
+  -d '{"title":"key check","addresses":["140 West End Ave, New York, NY 10023"]}'
 ```
 
-Headers:
-
-```text
-X-API-Key: <same ANALYZE_API_KEY from Render>
-```
-
-Multipart form fields:
-
-- `file`: `.xlsx`, `.xls`, or `.csv`
-- `title`: optional report title
-
-The uploaded file must contain an address column. Supported names include:
-
-- `Address`
-- `Property Address`
-- `Street Address`
-- `Building Address`
-
-Optional context columns:
-
-- `Boro_Area`, `Borough`, or `City`
-- `Zip`, `Zip Code`, or `Postal Code`
-
-The endpoint parses the file, runs the analysis, and returns `text/html` for n8n to email.
+`200` means the key matches; `401` means it does not.

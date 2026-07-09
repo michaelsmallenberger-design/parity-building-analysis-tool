@@ -332,7 +332,7 @@ def _build_web_entry(
     result_url_wide: Optional[str] = None,
     result_url_streetview: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a web_results entry. Keeps backward-compatible keys for html_report.py
+    """Build a web_results entry. Keeps the shared keys the report/CSV renderers expect
     (address, confidence_score, result_image_url, original_image_url, error) plus
     the new pipeline fields surfaced for downstream consumers. result_url_wide is
     the annotated wide-context tile (None for non-VLM rows). result_url_streetview
