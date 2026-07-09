@@ -3,6 +3,39 @@
 _Written 2026-07-09, after the live team demo. Alex's feedback: the process isn't
 streamlined enough. This is the talk-through list for next time._
 
+---
+
+## STATUS UPDATE — built later the same day (2026-07-09)
+
+Decisions made with Alex: **n8n dropped** (it was never actually running — the
+"leaning n8n" option assumed wired infrastructure that didn't exist). The Flask app
+now owns the sheet via a Google **service account** (`sheets_writer.py`):
+
+- **DONE** — sheet created up front at run time (`_finalize_batch`), real `sheet_url`
+  returned, all original columns + HVAC/Fit dropdowns + hidden Row_ID.
+- **DONE** — each review Submit fan-outs: local record (authoritative for
+  `GET /api/batch`) + live write into the sheet row. Sheets outage never fails a Submit.
+- **DONE** — failed-building cleanup: `GET /api/batch/<id>/failures` +
+  `POST /api/batch/<id>/rerun` (in-place re-run with optional corrected addresses),
+  driven by the new `parity-cleanup-failed` skill. This is the chosen answer to the
+  demo's whole-batch imagery failure and the Arlington VA miss (auto-fix-and-rerun
+  instead of an in-pipeline retry).
+- Everything is env-gated: without `GOOGLE_SERVICE_ACCOUNT_JSON` the app behaves
+  exactly as before (operator/skill fallback).
+
+**Remaining to go live:** (1) Alex creates the service account + key
+(`RENDER_DEPLOYMENT.md` → "Google Sheets service account", ~15 min); (2) set
+`GOOGLE_SERVICE_ACCOUNT_JSON` + `SHEET_SHARE_WITH` on Render; (3) deploy (autoDeploy
+webhook still not wired — POST /v1/services/{id}/deploys); (4) paid E2E verify.
+
+**Deliberately not done:** in-pipeline per-tile imagery retry and /api/run vs
+/api/run-file intake consolidation (superseded by the cleanup skill for now); the
+verify pass over the filled sheet (next phase, unchanged).
+
+The original write-up follows for context.
+
+---
+
 ## The goal for next session
 
 One clean pipeline, no human in the middle:

@@ -10,9 +10,16 @@ take a list of buildings, produce a **review packet** the team fills out, then w
 the reviewed **HVAC Systems + Fit** results into a **Google Sheet (with dropdowns) in
 the operator's Drive**. The AI is guidance only — the finished sheet holds the HUMAN picks.
 
-There is NO Apps Script, NO service account, NO terminal for reviewers. The analysis
-runs on the hosted service; you (Claude) write the sheet directly via the operator's
-connected Google Drive.
+**Primary path (server has a Sheets service account):** the run itself creates the
+Google Sheet up front and returns its `sheet_url`; every reviewer Submit writes that
+row into the sheet LIVE. When review is done, the sheet is already done — you hand
+over two links (review page + sheet) at run time and there is nothing to pull or
+build afterwards. Steps 4–5 below are the FALLBACK for when `sheet_url` comes back
+empty (credential not configured on Render, or sheet creation failed — check Render
+logs for "Sheet creation failed").
+
+There is NO Apps Script and NO terminal for reviewers. In the fallback, you (Claude)
+write the sheet via the operator's connected Google Drive.
 
 ## Prerequisites (check first)
 - **Analyzer API key (`KEY`).** Try the repo's `.env` (`ANALYZE_API_KEY=`) or the
@@ -40,12 +47,15 @@ Accept either a **spreadsheet/CSV file** (any columns — they're preserved) or 
 It runs ~30-40s per building (serial), so a 20-building sheet takes several minutes —
 tell the operator to expect that. **The two endpoints return DIFFERENT shapes:**
 
-- **File** → `POST /api/run-file` returns **JSON** `{ok, count, review_url, sheet_url}`:
+- **File** → `POST /api/run-file` returns **JSON** `{ok, count, review_url, sheet_url}`
+  (`sheet_url` is the LIVE Google Sheet when the server has the Sheets credential;
+  empty string means fallback mode):
   ```bash
   curl -s -X POST ".../api/run-file" -H "X-API-Key: $KEY" -F "file=@<path>" -F "title=TITLE"
   ```
 - **Address list** → `POST /api/run` returns the **audit HTML body**, and the
-  **`review_url` is in the `X-Review-URL` response header** (NOT in the body). Capture
+  **`review_url` is in the `X-Review-URL` response header** (NOT in the body; the
+  sheet link, when live, is in `X-Sheet-URL`). Capture
   headers with `-D`. Send the JSON body from a UTF-8 file (an em-dash in the title
   through the shell breaks it):
   ```bash
@@ -57,14 +67,22 @@ tell the operator to expect that. **The two endpoints return DIFFERENT shapes:**
 
 Extract the `batch_id` (the `b-xxxxxxxx` at the end of the review_url) either way.
 
-### 3. Hand off the review link
-Give the operator the **review_url** and open it for them. Each reviewer clicks through
-the buildings (imagery carousel + AI guidance), checks the **HVAC systems** they see,
-picks a **Fit**, and hits **Submit per building** (Submit posts to `/api/review` →
-recorded server-side). Then **wait** — ask the operator to tell you when review is done.
+### 3. Hand off the links
+Give the operator the **review_url** (and, when present, the **sheet_url**) and open
+the review page for them. Each reviewer clicks through the buildings (imagery
+carousel + AI guidance), checks the **HVAC systems** they see, picks a **Fit**, and
+hits **Submit per building** (Submit posts to `/api/review` → recorded server-side
+AND written into the live sheet row when the batch has one).
 
-### 4. Pull the picks + write the Google Sheet (WITH DROPDOWNS)
-When the operator says done:
+**If `sheet_url` was returned, you are DONE after this step** — the sheet fills
+itself as the team reviews; there is no "tell me when finished" and no step 4/5.
+If any buildings failed analysis (error rows, "No Images"), run the
+**`parity-cleanup-failed`** skill on the batch — it re-runs the failures in place and
+the same review page + sheet pick up the fresh results.
+
+### 4. FALLBACK ONLY — pull the picks + write the Google Sheet (WITH DROPDOWNS)
+Only when `sheet_url` came back empty. Ask the operator to tell you when review is
+done, then:
 
 1. Fetch the batch + human picks:
    ```bash
@@ -111,13 +129,18 @@ When the operator says done:
    opened in Sheets) or write the .xlsx locally.
 5. Give the operator the resulting **sheet link** (`viewUrl`).
 
-### 5. Report
+### 5. FALLBACK ONLY — report
 Tell the operator: how many buildings, how many reviewed, and the sheet link. Un-reviewed
 rows have blank HVAC/Fit (re-run step 4 after more review). To show a reviewer's picks back,
-`GET /api/batch/BATCH_ID` returns the `decisions` list.
+`GET /api/batch/BATCH_ID` returns the `decisions` list (this works in the live-sheet
+path too — the local record is kept as the authoritative backup).
 
 ## Notes & gotchas
-- **The connected Drive may not be the operator's.** The sheet lands in whatever Google
+- **Live-sheet path:** the sheet is owned by the server's service account and shared
+  per the `SHEET_SHARE_WITH` env var on Render (comma-separated emails, writer
+  access). If the operator can't open it, add their email there and redeploy — or
+  fall back to step 4.
+- **The connected Drive may not be the operator's.** (Fallback path.) The sheet lands in whatever Google
   account is connected to Claude (often an owner/admin, e.g. Alex), and there is **no
   share/permission-write tool** — you cannot grant another person access. If the operator
   can't open it, fall back to a **local `.xlsx`** (same dropdown recipe) in their Downloads

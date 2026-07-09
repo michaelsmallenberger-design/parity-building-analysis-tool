@@ -32,6 +32,7 @@ Runtime:
 - `report_audit.py`
 - `review_render.py`
 - `review_store.py`
+- `sheets_writer.py`
 - `zip_bundler.py`
 
 Assets/config:
@@ -70,6 +71,14 @@ Required for production:
 - `GEMINI_API_KEY`
 - `XAI_API_KEY`
 - `ANALYZE_API_KEY` for stateless API routes
+
+Optional (live review-to-sheet loop; without them `sheet_url` stays empty and the
+operator/skill flow is the fallback):
+
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_SERVICE_ACCOUNT_FILE` locally) — enables
+  `sheets_writer.py`: the batch's Google Sheet is created at run time and each
+  review Submit writes its row live
+- `SHEET_SHARE_WITH` — comma-separated emails granted writer access to created sheets
 
 Important defaults:
 
