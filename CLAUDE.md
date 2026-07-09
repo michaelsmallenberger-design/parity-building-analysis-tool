@@ -78,6 +78,9 @@ operator/skill flow is the fallback):
 - `GOOGLE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_SERVICE_ACCOUNT_FILE` locally) — enables
   `sheets_writer.py`: the batch's Google Sheet is created at run time and each
   review Submit writes its row live
+- `SHEET_PARENT_FOLDER_ID` — Drive folder (shared to the service account as Editor)
+  where sheets are created; required in practice because service accounts have zero
+  Drive storage quota of their own
 - `SHEET_SHARE_WITH` — comma-separated emails granted writer access to created sheets
 
 Important defaults:

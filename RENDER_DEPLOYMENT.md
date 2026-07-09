@@ -38,9 +38,11 @@ Use a long random value for `ANALYZE_API_KEY`; n8n will send it in the `X-API-Ke
 Optional (enables the live review-to-sheet loop):
 
 - `GOOGLE_SERVICE_ACCOUNT_JSON` — full service-account key JSON (see setup below)
+- `SHEET_PARENT_FOLDER_ID` — Drive folder ID where sheets are created (see setup —
+  required in practice: service accounts have zero Drive storage of their own)
 - `SHEET_SHARE_WITH` — comma-separated emails granted writer access to created sheets
 
-Without these two, the app runs exactly as before: `sheet_url` stays empty and the
+Without these, the app runs exactly as before: `sheet_url` stays empty and the
 operator/skill flow builds the sheet from `GET /api/batch`.
 
 ## Google Sheets service account (one-time, ~15 min)
@@ -55,18 +57,26 @@ review Submit into it live.
    `sheet-writer`. No roles needed (it only touches files it creates). Create.
 4. Open the new service account → **Keys → Add key → Create new key → JSON.**
    A `.json` file downloads — treat it like a password.
-5. In Render (service `building-analyzer`) → **Environment**:
+5. **Share a Drive folder with the service account.** Service accounts have ZERO
+   Drive storage of their own (Google policy), so the sheet must be created inside
+   a folder a human owns. In drive.google.com: create a folder (e.g. "Parity
+   Analysis Sheets") → Share → add the service account's email (the
+   `...@...iam.gserviceaccount.com` address from the JSON) as **Editor**. Copy the
+   folder ID from its URL (`drive.google.com/drive/folders/<FOLDER_ID>`).
+6. In Render (service `building-analyzer`) → **Environment**:
    - `GOOGLE_SERVICE_ACCOUNT_JSON` = the entire contents of that JSON file, pasted
      as one value.
-   - `SHEET_SHARE_WITH` = your email (and any teammates'), comma-separated.
-6. Deploy. Verify: run a small batch via `/api/run-file` — the JSON response's
-   `sheet_url` should be a real `docs.google.com` link that opens for the emails in
-   `SHEET_SHARE_WITH`, and a Submit on the review page should appear in the sheet
-   within a second or two.
+   - `SHEET_PARENT_FOLDER_ID` = the folder ID from step 5.
+   - `SHEET_SHARE_WITH` = teammates' emails, comma-separated (the folder owner
+     already has access).
+7. Deploy. Verify: run a small batch via `/api/run-file` — the JSON response's
+   `sheet_url` should be a real `docs.google.com` link that opens in your Drive
+   folder, and a Submit on the review page should appear in the sheet within a
+   second or two.
 
-Sheets created this way are OWNED by the service account (they don't count against
-your Drive storage and live outside "My Drive"); the `SHEET_SHARE_WITH` grants are
-how humans reach them, so keep that variable current.
+Sheets land in (and are owned via) the parent folder's owner for consumer Gmail
+accounts — they use that owner's storage quota, which is why the shared folder is
+required.
 
 The blueprint also sets `ANALYZE_FILE_MAX_ROWS=250` for uploaded spreadsheets. Raise it only when you intentionally want larger paid batches.
 
