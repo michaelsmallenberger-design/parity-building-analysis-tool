@@ -35,6 +35,39 @@ When Render creates the service from the blueprint, it should ask for these secr
 
 Use a long random value for `ANALYZE_API_KEY`; n8n will send it in the `X-API-Key` header.
 
+Optional (enables the live review-to-sheet loop):
+
+- `GOOGLE_SERVICE_ACCOUNT_JSON` — full service-account key JSON (see setup below)
+- `SHEET_SHARE_WITH` — comma-separated emails granted writer access to created sheets
+
+Without these two, the app runs exactly as before: `sheet_url` stays empty and the
+operator/skill flow builds the sheet from `GET /api/batch`.
+
+## Google Sheets service account (one-time, ~15 min)
+
+This lets the server create the output Google Sheet at run time and write each
+review Submit into it live.
+
+1. Open https://console.cloud.google.com/ and select the project that already holds
+   your Maps API key (any project works).
+2. **APIs & Services → Library**: enable **Google Sheets API** and **Google Drive API**.
+3. **IAM & Admin → Service Accounts → Create service account.** Name it e.g.
+   `sheet-writer`. No roles needed (it only touches files it creates). Create.
+4. Open the new service account → **Keys → Add key → Create new key → JSON.**
+   A `.json` file downloads — treat it like a password.
+5. In Render (service `building-analyzer`) → **Environment**:
+   - `GOOGLE_SERVICE_ACCOUNT_JSON` = the entire contents of that JSON file, pasted
+     as one value.
+   - `SHEET_SHARE_WITH` = your email (and any teammates'), comma-separated.
+6. Deploy. Verify: run a small batch via `/api/run-file` — the JSON response's
+   `sheet_url` should be a real `docs.google.com` link that opens for the emails in
+   `SHEET_SHARE_WITH`, and a Submit on the review page should appear in the sheet
+   within a second or two.
+
+Sheets created this way are OWNED by the service account (they don't count against
+your Drive storage and live outside "My Drive"); the `SHEET_SHARE_WITH` grants are
+how humans reach them, so keep that variable current.
+
 The blueprint also sets `ANALYZE_FILE_MAX_ROWS=250` for uploaded spreadsheets. Raise it only when you intentionally want larger paid batches.
 
 ## Dashboard Steps

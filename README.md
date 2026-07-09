@@ -32,12 +32,14 @@ Primary files:
 
 External automations can call the app without the queue or local result storage.
 
-- `POST /api/run`: list of addresses -> finished self-contained audit HTML (also persists a review batch; returns its `/review/<batch_id>` URL in the `X-Review-URL` header)
-- `POST /api/run-file`: uploaded Excel/CSV file -> JSON `{review_url, count}` (all original columns preserved for the sheet)
+- `POST /api/run`: list of addresses -> finished self-contained audit HTML (also persists a review batch; returns its `/review/<batch_id>` URL in the `X-Review-URL` header and, when the Sheets credential is configured, the live sheet link in `X-Sheet-URL`)
+- `POST /api/run-file`: uploaded Excel/CSV file -> JSON `{review_url, sheet_url, count}` (all original columns preserved; `sheet_url` is the live Google Sheet created at run time when `GOOGLE_SERVICE_ACCOUNT_JSON` is configured, else `""`)
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
-- `GET /review/<batch_id>`: interactive dark review page for the team (imagery carousel + AI guidance, HVAC multi-select + Fit single-select, Submit per building)
-- `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — used to build the final Google Sheet
+- `GET /review/<batch_id>`: interactive dark review page for the team (imagery carousel + AI guidance, HVAC multi-select + Fit single-select, Submit per building; each Submit is recorded server-side AND written live into the batch's Google Sheet row when one exists)
+- `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — the fallback for building the final Google Sheet by hand
+- `GET /api/batch/<batch_id>/failures`: the rows that failed analysis (imagery/geocode/analyzer errors) for the cleanup skill
+- `POST /api/batch/<batch_id>/rerun`: re-run failed rows in place (optionally with corrected addresses) and merge fresh results into the same review page/sheet
 - `GET /api/health`: API health check
 
 Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
@@ -51,25 +53,33 @@ Primary files:
 - `n8n/README.md`
 - `n8n/parity_cooling_tower.workflow.json`
 
-### Team Review + Google Sheet (Claude skill)
+### Team Review + Google Sheet
 
-The operator-facing path, driven by the Claude skill `.claude/skills/parity-cooling-tower`
-(`SKILL.md` is the runbook). No Apps Script, no service account, no terminal for reviewers.
+The primary flow needs no operator in the middle (requires `GOOGLE_SERVICE_ACCOUNT_JSON`
+on the server — see `RENDER_DEPLOYMENT.md` for the one-time setup):
 
-1. The skill runs a batch (`POST /api/run` for an address list, or `POST /api/run-file` for an
-   uploaded sheet) and gets back a `/review/<batch_id>` URL.
-2. The team opens that dark review page, clicks through each building (imagery + AI guidance),
-   checks the **HVAC systems** they see, picks a **Fit**, and hits Submit per building. Picks are
-   persisted server-side by `review_store.py` (ephemeral disk — pull results before a redeploy).
-3. When review is done, the skill fetches `GET /api/batch/<batch_id>` (the operator's original
-   table + the human decisions) and writes a Google Sheet in the operator's Drive via the
-   connected Google Drive integration — **human picks only, no AI verdict/confidence columns**.
+1. A run (`POST /api/run` or `POST /api/run-file`, or the `parity-cooling-tower` skill)
+   creates the output Google Sheet up front and returns BOTH links: the `/review/<batch_id>`
+   page and the `sheet_url`.
+2. The team opens the dark review page, clicks through each building (imagery + AI guidance),
+   checks the **HVAC systems** they see, picks a **Fit**, and hits Submit per building. Each
+   Submit is recorded server-side by `review_store.py` AND written live into that row of the
+   Google Sheet — when review is done, the sheet is already done. **Human picks only, no AI
+   verdict/confidence columns.**
+3. Failed buildings (no imagery, geocode misses) are fixed with the `parity-cleanup-failed`
+   skill, which diagnoses and re-runs them in place via `/api/batch/<id>/failures` + `/rerun`.
+
+Fallback (credential not configured): `sheet_url` comes back empty, picks are only recorded
+server-side, and the `parity-cooling-tower` skill builds the sheet from `GET /api/batch`
+after review — the pre-existing operator flow.
 
 Primary files:
 
-- `.claude/skills/parity-cooling-tower/SKILL.md`
+- `.claude/skills/parity-cooling-tower/SKILL.md` (run + review runbook)
+- `.claude/skills/parity-cleanup-failed/SKILL.md` (failed-row cleanup runbook)
 - `review_render.py` (review page + `HVAC_SYSTEMS` / `FIT_OPTIONS` taxonomy)
 - `review_store.py` (batch + decision storage)
+- `sheets_writer.py` (service-account sheet creation + live row writes)
 - `api_analyze.py` (`/api/run*`, `/review/*`, `/api/batch/*`)
 
 ## Current Pipeline
@@ -95,7 +105,9 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MAPBOX_API_KEY`: Mapbox fallback geocoding/imagery and dense-core imagery
 - `GEMINI_API_KEY`: Gemini verification
 - `XAI_API_KEY`: Grok verification
-- `ANALYZE_API_KEY`: required for `/api/analyze`, `/api/run`, `/api/run-file`, and `/api/report`
+- `ANALYZE_API_KEY`: required for `/api/analyze`, `/api/run`, `/api/run-file`, `/api/report`, and `/api/batch/*`
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (optional): service-account key enabling `sheets_writer.py` — sheet created at run time, review Submits written live; without it `sheet_url` stays empty
+- `SHEET_SHARE_WITH` (optional): comma-separated emails granted writer access to created sheets
 
 ## Important Optional Environment Variables
 
