@@ -24,6 +24,8 @@ geopy==2.4.1
 # Phase 3: building footprints + VLM verification
 shapely
 google-genai
+google-api-python-client   # Sheets/Drive write-back (sheets_writer.py)
+google-auth
 openai
 httpx  # used directly in vlm.py (timeouts/errors); also a transitive dep of google-genai/openai
 python-dotenv
