@@ -51,6 +51,12 @@ def load_batch(job_id: str):
     return read_json(_path(job_id))
 
 
+def save_raw(job_id: str, batch: dict) -> None:
+    """Persist an already-mutated batch dict (re-run merges). Callers own the
+    mutation; this just writes it back."""
+    write_json(_path(job_id), batch)
+
+
 def _rid(entry) -> str:
     return str(entry.get("i") if entry.get("i") is not None else entry.get("row_id", ""))
 

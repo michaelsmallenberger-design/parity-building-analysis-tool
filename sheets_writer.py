@@ -120,10 +120,10 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
 
 
-def write_decision(sheet_url, headers, rows, row_id, hvac, fit, note) -> bool:
-    """Write one reviewer decision into its sheet row (matched by the hidden
-    Row_ID column). Notes only written when non-empty so an uploaded sheet's
-    existing note text is never wiped. Returns False if the row can't be found."""
+def write_row_values(sheet_url, headers, rows, row_id, mapping) -> bool:
+    """Write arbitrary {column header: value} cells into the sheet row matched by
+    the hidden Row_ID column. Returns False if the sheet/row/columns can't be
+    found. Unknown headers in mapping are skipped."""
     sid = sheet_id_from_url(sheet_url)
     if not sid or ID_COL not in headers:
         return False
@@ -135,14 +135,20 @@ def write_decision(sheet_url, headers, rows, row_id, hvac, fit, note) -> bool:
             break
     if target is None:
         return False
-    data = []
-    for col_name, value in ((HVAC_COL, hvac), (FIT_COL, fit), (NOTES_COL, note)):
-        if col_name in headers and (value or col_name != NOTES_COL):
-            data.append({"range": f"{_col_letter(headers.index(col_name))}{target}",
-                         "values": [[value]]})
+    data = [{"range": f"{_col_letter(headers.index(k))}{target}", "values": [[v]]}
+            for k, v in mapping.items() if k in headers]
     if not data:
         return False
     sheets, _ = _get_services()
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=sid, body={"valueInputOption": "RAW", "data": data}).execute()
     return True
+
+
+def write_decision(sheet_url, headers, rows, row_id, hvac, fit, note) -> bool:
+    """Write one reviewer decision into its sheet row. Notes only written when
+    non-empty so an uploaded sheet's existing note text is never wiped."""
+    mapping = {HVAC_COL: hvac, FIT_COL: fit}
+    if note:
+        mapping[NOTES_COL] = note
+    return write_row_values(sheet_url, headers, rows, row_id, mapping)
