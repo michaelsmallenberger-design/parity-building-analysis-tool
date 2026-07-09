@@ -27,6 +27,8 @@ models/*.pt
 .env.local
 .env.*.local
 *.env
+google_service_account.json
+gen-lang-client-*.json
 
 # Test artifacts
 math_test*.jpg

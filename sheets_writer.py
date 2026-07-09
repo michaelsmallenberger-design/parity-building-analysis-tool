@@ -7,6 +7,12 @@ review is finished — no operator step.
 Env:
     GOOGLE_SERVICE_ACCOUNT_JSON  full service-account key JSON (Render)
     GOOGLE_SERVICE_ACCOUNT_FILE  path to the key file (local dev alternative)
+    SHEET_PARENT_FOLDER_ID       Drive folder (shared to the service account as
+                                 Editor) where sheets are created. REQUIRED in
+                                 practice: service accounts have zero Drive
+                                 storage quota of their own, so without a human
+                                 owner's folder, creation 403s. For consumer
+                                 Gmail folders the folder owner owns the files.
     SHEET_SHARE_WITH             comma-separated emails granted writer access
 
 If neither credential var is set, enabled() is False and callers skip Sheets
@@ -74,9 +80,22 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
     dropdowns, hidden Row_ID column. HVAC validation is warn-only because the
     review page submits comma-joined multi-selects. Returns the sheet URL."""
     sheets, drive = _get_services()
-    sid = sheets.spreadsheets().create(
-        body={"properties": {"title": title}}, fields="spreadsheetId"
-    ).execute()["spreadsheetId"]
+    folder = os.environ.get("SHEET_PARENT_FOLDER_ID", "").strip()
+    if folder:
+        sid = drive.files().create(
+            body={"name": title,
+                  "mimeType": "application/vnd.google-apps.spreadsheet",
+                  "parents": [folder]},
+            fields="id", supportsAllDrives=True).execute()["id"]
+    else:
+        # Only works if the account has its own Drive quota (service accounts
+        # generally don't anymore — set SHEET_PARENT_FOLDER_ID).
+        sid = sheets.spreadsheets().create(
+            body={"properties": {"title": title}}, fields="spreadsheetId"
+        ).execute()["spreadsheetId"]
+    grid = sheets.spreadsheets().get(
+        spreadsheetId=sid, fields="sheets.properties.sheetId"
+    ).execute()["sheets"][0]["properties"]["sheetId"]
     values = [list(headers)] + [[str(c) for c in r] for r in rows]
     sheets.spreadsheets().values().update(
         spreadsheetId=sid, range="A1", valueInputOption="RAW",
@@ -84,10 +103,10 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
 
     n = len(rows)
     reqs = [
-        {"repeatCell": {"range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
+        {"repeatCell": {"range": {"sheetId": grid, "startRowIndex": 0, "endRowIndex": 1},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                         "fields": "userEnteredFormat.textFormat.bold"}},
-        {"updateSheetProperties": {"properties": {"sheetId": 0,
+        {"updateSheetProperties": {"properties": {"sheetId": grid,
                                                   "gridProperties": {"frozenRowCount": 1}},
                                    "fields": "gridProperties.frozenRowCount"}},
     ]
@@ -95,7 +114,7 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
         if col_name in headers and n:
             c = headers.index(col_name)
             reqs.append({"setDataValidation": {
-                "range": {"sheetId": 0, "startRowIndex": 1, "endRowIndex": n + 1,
+                "range": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": n + 1,
                           "startColumnIndex": c, "endColumnIndex": c + 1},
                 "rule": {"condition": {"type": "ONE_OF_LIST",
                                        "values": [{"userEnteredValue": o} for o in options]},
@@ -103,17 +122,20 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
     if ID_COL in headers:
         c = headers.index(ID_COL)
         reqs.append({"updateDimensionProperties": {
-            "range": {"sheetId": 0, "dimension": "COLUMNS",
+            "range": {"sheetId": grid, "dimension": "COLUMNS",
                       "startIndex": c, "endIndex": c + 1},
             "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}})
     sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
 
     emails = [e.strip() for e in os.environ.get("SHEET_SHARE_WITH", "").split(",") if e.strip()]
     for email in emails:
-        drive.permissions().create(fileId=sid, sendNotificationEmail=False,
-                                   body={"type": "user", "role": "writer",
-                                         "emailAddress": email}).execute()
-    if not emails:
+        try:
+            drive.permissions().create(fileId=sid, sendNotificationEmail=False,
+                                       body={"type": "user", "role": "writer",
+                                             "emailAddress": email}).execute()
+        except Exception as e:  # e.g. email is already the folder owner
+            log.warning("Could not share sheet with %s: %s", email, e)
+    if not emails and not folder:
         log.warning("SHEET_SHARE_WITH unset — granting anyone-with-link writer access")
         drive.permissions().create(fileId=sid,
                                    body={"type": "anyone", "role": "writer"}).execute()
