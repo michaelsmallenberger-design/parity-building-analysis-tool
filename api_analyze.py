@@ -502,6 +502,111 @@ def batch(batch_id):
     })
 
 
+def _entry_failures(b):
+    """Rows that failed analysis: pipeline errors plus run-file's no-address
+    placeholders. needs_review rows are NOT failures — they're the review
+    page's job — but /rerun accepts explicit row_ids for them."""
+    out = []
+    for e in b.get("entries", []):
+        err = e.get("error") or ""
+        no_addr = "(no address in row)" in (e.get("notes") or "")
+        if err or no_addr:
+            out.append({
+                "row_id": e.get("row_id") if e.get("row_id") is not None else e.get("i"),
+                "address": e.get("address", ""),
+                "error": err or "No Address",
+                "verdict": e.get("verdict", ""),
+                "notes": e.get("notes", ""),
+                "has_image": bool(e.get("result_image_url")),
+            })
+    return out
+
+
+@api.route("/batch/<batch_id>/failures", methods=["GET"])
+@require_key
+def batch_failures(batch_id):
+    """Cleanup-skill endpoint: list the rows that failed analysis (imagery /
+    geocode / analyzer errors, no-address placeholders) for diagnosis."""
+    b = review_store.load_batch(batch_id)
+    if not b:
+        return jsonify({"error": "batch not found"}), 404
+    failures = _entry_failures(b)
+    return jsonify({"batch_id": batch_id, "count": len(failures), "failures": failures})
+
+
+@api.route("/batch/<batch_id>/rerun", methods=["POST"])
+@require_key
+def batch_rerun(batch_id):
+    """Re-run rows in place and merge the fresh results into the batch, so the
+    existing /review page and Google Sheet reflect them on reload. Body:
+    {rows: [{row_id, address?}, ...]} — an address value overrides the stored
+    one (the cleanup skill's fix for geocode misses); with no rows given, every
+    currently-failed row is re-run as-is. Replaced entries drop any prior human
+    decision (it was made against the failed result). When an address was
+    overridden and the batch has a live sheet, the sheet's address cell is
+    updated too. Not safe to run concurrently with active reviewing of the SAME
+    rows (last write wins on the batch JSON)."""
+    b = review_store.load_batch(batch_id)
+    if not b:
+        return jsonify({"error": "batch not found"}), 404
+    body = request.get_json(silent=True) or {}
+    rows_req = body.get("rows") or [{"row_id": f["row_id"]} for f in _entry_failures(b)]
+    if not rows_req:
+        return jsonify({"ok": True, "batch_id": batch_id, "rerun": [],
+                        "remaining_failures": 0})
+
+    by_rid = {review_store._rid(e): e for e in b.get("entries", [])}
+    headers = b.get("table_headers", [])
+    addr_header = _first_present(headers, ADDRESS_COLUMNS)
+    fresh, statuses, table_updates = {}, [], {}
+    for r in rows_req:
+        rid = str(r.get("row_id", "")).strip()
+        old = by_rid.get(rid)
+        if not old:
+            statuses.append({"row_id": rid, "status": "unknown_row"})
+            continue
+        addr = (r.get("address") or old.get("address") or "").strip()
+        if not addr:
+            statuses.append({"row_id": rid, "status": "no_address"})
+            continue
+        entry = _analyze_one(addr, total=len(rows_req))
+        entry["row_id"] = old.get("row_id")
+        if old.get("i") is not None:
+            entry["i"] = old.get("i")
+        fresh[rid] = entry
+        statuses.append({"row_id": rid, "status": "ok",
+                         "verdict": entry.get("verdict", ""),
+                         "error": entry.get("error") or ""})
+        if (r.get("address") or "").strip() and addr_header:
+            table_updates[rid] = {addr_header: addr}
+
+    if fresh:
+        entries = b.get("entries", [])
+        for idx, e in enumerate(entries):
+            rid = review_store._rid(e)
+            if rid in fresh:
+                entries[idx] = fresh[rid]
+        if table_updates and CANON_ID in headers:
+            idc = headers.index(CANON_ID)
+            for row in b.get("table_rows", []):
+                rid = str(row[idc]).strip() if idc < len(row) else ""
+                if rid in table_updates:
+                    for h, v in table_updates[rid].items():
+                        row[headers.index(h)] = v
+        review_store.save_raw(batch_id, b)
+        if b.get("sheet_url") and sheets_writer.enabled():
+            for rid, upd in table_updates.items():
+                try:
+                    sheets_writer.write_row_values(
+                        b["sheet_url"], headers, b.get("table_rows", []), rid, upd)
+                except Exception as e:
+                    log.error("Sheet address update failed for %s/%s: %s", batch_id, rid, e)
+
+    remaining = len(_entry_failures(b))
+    return jsonify({"ok": True, "batch_id": batch_id, "rerun": statuses,
+                    "remaining_failures": remaining})
+
+
 @api.route("/report", methods=["POST"])
 @require_key
 def report():
