@@ -343,29 +343,6 @@ def _detect_hvac_fit_columns(df):
     return hvac_col, fit_col
 
 
-def _create_sheet(headers, rows, title):
-    """Create the team Google Sheet (a COPY of the user's table + HVAC/Fit dropdowns,
-    NO AI columns) via the Apps Script web app. Returns the sheet URL, or "" on
-    error / when SHEET_WEBHOOK_URL is unset."""
-    url = os.environ.get("SHEET_WEBHOOK_URL")
-    if not url:
-        return ""
-    try:
-        resp = review_store.post_appscript(url, {
-            "action": "create",
-            "token": os.environ.get("SHEET_WEBHOOK_TOKEN", ""),
-            "title": title,
-            "headers": headers,
-            "rows": rows,
-        }, timeout=120)
-        if resp.get("sheet_url"):
-            return resp["sheet_url"]
-        log.error("sheet create failed: %s", resp)
-    except Exception as e:
-        log.error("sheet create error: %s", e)
-    return ""
-
-
 def _lean_table(results):
     """No uploaded sheet (addresses only): minimal table = address + review columns."""
     headers = ["Property Address", CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID]

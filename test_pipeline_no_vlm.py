@@ -117,7 +117,7 @@ def _load_test_addresses() -> list:
             f"ERROR: {INPUT_CSV.name} not found at {INPUT_CSV}\n\n"
             "Create test_addresses_local.csv with 8-10 addresses to validate the\n"
             "Phase 3 pipeline before VLM is wired in. Suggested mix:\n"
-            "  - 4 NYC controls drawn from addresses.csv\n"
+            "  - 4 NYC controls drawn from training/addresses.csv\n"
             "  - 4-6 non-NYC addresses from the TAM spreadsheet\n\n"
             "Required column: Address\n"
             "Optional column: Expected (positive | negative | unknown)\n"

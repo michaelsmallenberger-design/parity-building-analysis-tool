@@ -1,4 +1,4 @@
-# Optimized Dockerfile for Railway deployment
+# Optimized Dockerfile for the Render deployment (filename kept for continuity)
 # Reduces build time from 16 minutes to ~6-8 minutes
 
 FROM python:3.11-slim

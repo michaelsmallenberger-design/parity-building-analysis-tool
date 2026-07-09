@@ -10,7 +10,7 @@ The current system has two front doors:
 
 1. Browser CSV upload through `app_railway.py`, `worker.py`, `job_queue.py`, and `tasks_local.py`.
 2. Stateless n8n/API flow through `api_analyze.py`, especially `POST /api/run`.
-3. File-upload automation through `POST /api/run-file`, which accepts `.xlsx`, `.xls`, or `.csv` and returns the same audit-card HTML.
+3. File-upload automation through `POST /api/run-file` (accepts `.xlsx`, `.xls`, or `.csv`), which returns JSON `{review_url, count}` and drives the team review flow — this is the endpoint the Claude skill calls.
 
 The active per-address pipeline uses Google geocoding/imagery by default, Mapbox fallback/dense-core imagery, OSM -> NYC -> Microsoft footprint fallback, two zoom levels, optional YOLO ensemble through `MODEL_PATHS`, and one address-level `vlm.verify_address()` call.
 
@@ -31,7 +31,8 @@ Keep and treat as active:
 - `vlm.py`
 - `pipeline_render.py`
 - `report_audit.py`
-- `html_report.py`
+- `review_render.py`
+- `review_store.py`
 - `zip_bundler.py`
 - `models/`
 - `reference_images/`
@@ -41,11 +42,9 @@ Keep and treat as active:
 - `requirements_railway.txt`
 - `n8n/README.md`
 - `n8n/parity_cooling_tower.workflow.json`
-- `n8n/parity_excel_upload.workflow.json`
-- `n8n/EXCEL_UPLOAD_WORKFLOW.md`
-- `n8n/address_upload_template.xlsx`
+- `.claude/skills/parity-cooling-tower/SKILL.md`
 
-Historical docs live in `docs/archive/`. Presentation docs live in `docs/presentation/`.
+Presentation docs live in `docs/presentation/`.
 
 ## Environment
 

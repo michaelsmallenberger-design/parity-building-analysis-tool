@@ -8,10 +8,11 @@ Internal cooling-tower analysis tool for building address lists. The app geocode
 - Deployment target: Render
 - Runtime: single-process Flask app with one Gunicorn worker and threaded request handling
 - Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
-- Current report format: audit-card HTML from `report_audit.py`
+- Current report format: audit-card HTML from `report_audit.py`; interactive dark review page from `review_render.py`
 - Current automation paths: n8n calls `POST /api/run-file` for Excel upload or `POST /api/run` for address lists
+- Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC/Fit picks into a Google Sheet
 
-Older handoff and accuracy notes are preserved in `docs/archive/`. Presentation material is in `docs/presentation/`.
+Presentation material is in `docs/presentation/`.
 
 ## Main Flows
 
@@ -31,10 +32,12 @@ Primary files:
 
 External automations can call the app without the queue or local result storage.
 
-- `POST /api/run`: list of addresses -> finished self-contained audit HTML
-- `POST /api/run-file`: uploaded Excel/CSV file -> finished self-contained audit HTML
+- `POST /api/run`: list of addresses -> finished self-contained audit HTML (also persists a review batch; returns its `/review/<batch_id>` URL in the `X-Review-URL` header)
+- `POST /api/run-file`: uploaded Excel/CSV file -> JSON `{review_url, count}` (all original columns preserved for the sheet)
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
+- `GET /review/<batch_id>`: interactive dark review page for the team (imagery carousel + AI guidance, HVAC multi-select + Fit single-select, Submit per building)
+- `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — used to build the final Google Sheet
 - `GET /api/health`: API health check
 
 Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
@@ -47,6 +50,27 @@ Primary files:
 - `report_audit.py`
 - `n8n/README.md`
 - `n8n/parity_cooling_tower.workflow.json`
+
+### Team Review + Google Sheet (Claude skill)
+
+The operator-facing path, driven by the Claude skill `.claude/skills/parity-cooling-tower`
+(`SKILL.md` is the runbook). No Apps Script, no service account, no terminal for reviewers.
+
+1. The skill runs a batch (`POST /api/run` for an address list, or `POST /api/run-file` for an
+   uploaded sheet) and gets back a `/review/<batch_id>` URL.
+2. The team opens that dark review page, clicks through each building (imagery + AI guidance),
+   checks the **HVAC systems** they see, picks a **Fit**, and hits Submit per building. Picks are
+   persisted server-side by `review_store.py` (ephemeral disk — pull results before a redeploy).
+3. When review is done, the skill fetches `GET /api/batch/<batch_id>` (the operator's original
+   table + the human decisions) and writes a Google Sheet in the operator's Drive via the
+   connected Google Drive integration — **human picks only, no AI verdict/confidence columns**.
+
+Primary files:
+
+- `.claude/skills/parity-cooling-tower/SKILL.md`
+- `review_render.py` (review page + `HVAC_SYSTEMS` / `FIT_OPTIONS` taxonomy)
+- `review_store.py` (batch + decision storage)
+- `api_analyze.py` (`/api/run*`, `/review/*`, `/api/batch/*`)
 
 ## Current Pipeline
 
@@ -132,8 +156,6 @@ Render deployment is configured by `render.yaml`. Create a new Render Blueprint 
 
 See `RENDER_DEPLOYMENT.md` for the exact dashboard steps and smoke test.
 
-For the no-touch Excel workflow, import `n8n/parity_excel_upload.workflow.json` into n8n and test with `n8n/address_upload_template.xlsx`. The short operating guide is `RUNBOOK.md`.
-
 ## Tests and Harnesses
 
 These are not pure unit tests; most call external services, use model weights, or write generated images.
@@ -158,7 +180,8 @@ These are not pure unit tests; most call external services, use model weights, o
 - `vlm.py`
 - `pipeline_render.py`
 - `report_audit.py`
-- `html_report.py`
+- `review_render.py`
+- `review_store.py`
 - `zip_bundler.py`
 - `templates/`
 - `static/images/`
