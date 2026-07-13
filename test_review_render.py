@@ -38,6 +38,8 @@ def test_review_contract():
 
     for s in EXPECTED_HVAC:
         assert f'data-sys="{s}"' in html, f"missing HVAC system chip: {s}"
+    assert 'data-sys="None"' in html, "missing the None chip (reviewer sees no HVAC)"
+    assert "c.dataset.sys==='None'" in html, "None chip must be mutually exclusive with system chips"
     for f in EXPECTED_FIT:
         assert f'data-fit="{f}"' in html, f"missing fit option: {f}"
     for host in MAP_HOSTS:
