@@ -15,6 +15,9 @@ import urllib.parse
 # NOTE: 'Unclear' is NOT here — in the sheet that belongs to the separate fit/status
 # column (Optimizer/Periscope/Unclear/Bad), not the HVAC Systems column.
 HVAC_SYSTEMS = ["Cooling Tower", "Chiller", "Exhaust Fan", "RTU", "AHU", "PTAC", "Fan Coil", "Heat Pump", "VRF"]
+# Reviewers sometimes see no relevant HVAC at all; "None" is a submittable answer,
+# mutually exclusive with the systems above. Not part of the taxonomy itself.
+NONE_OPTION = "None"
 # Separate fit/status classification (single choice) — the sheet's second dropdown.
 FIT_OPTIONS = ["Optimizer", "Periscope", "Unclear", "Bad"]
 # AI verdicts that mean "cooling tower present" -> pre-check Cooling Tower for the reviewer.
@@ -94,7 +97,7 @@ def _card(e):
 
     dis = " disabled" if reviewed else ""
     chips = ""
-    for s in HVAC_SYSTEMS:
+    for s in HVAC_SYSTEMS + [NONE_OPTION]:
         if reviewed:
             pre = " sel" if s in picked else ""
         else:
@@ -201,14 +204,19 @@ function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
   imgs.forEach((im,k)=>im.classList.toggle('cur',k==i));
   c.querySelector('.cap').textContent=imgs[i].dataset.label+' · '+(i+1)+'/'+imgs.length+' · click image to enlarge';}}
 function nav(btn,d){{const c=btn.closest('.carousel');const n=+c.dataset.n;c.dataset.i=((+c.dataset.i+d)%n+n)%n;setCap(c);}}
-function toggle(chip){{chip.classList.toggle('sel');}}
+function toggle(chip){{
+  if(!chip.classList.toggle('sel'))return;
+  const none=chip.dataset.sys==='None';
+  chip.parentElement.querySelectorAll('.chip.sel').forEach(c=>{{
+    if(c!==chip&&(none||c.dataset.sys==='None'))c.classList.remove('sel');}});
+}}
 function pickFit(chip){{chip.parentElement.querySelectorAll('.fitchip').forEach(c=>c.classList.remove('sel'));chip.classList.add('sel');}}
 document.querySelectorAll('.carousel').forEach(setCap);
 async function submitCard(btn){{
   const card=btn.closest('.card');
   const sys=[...card.querySelectorAll('.chip.sel')].map(c=>c.dataset.sys);
   const status=card.querySelector('.status');
-  if(!sys.length){{status.textContent='pick at least one system (or Unclear)';status.className='status err';return;}}
+  if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return;}}
   const fitEl=card.querySelector('.fitchip.sel');
   const payload={{job_id:JOB,row_id:card.dataset.rid,address:card.dataset.addr,ai_verdict:card.dataset.ai,
     hvac_systems:sys.join(', '),fit:fitEl?fitEl.dataset.fit:'',note:card.querySelector('.note').value}};

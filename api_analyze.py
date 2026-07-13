@@ -35,7 +35,7 @@ from flask import Blueprint, jsonify, request, Response
 
 from tasks_local import _process_one_address, _build_web_entry
 from report_audit import build_audit_report
-from review_render import HVAC_SYSTEMS, FIT_OPTIONS
+from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS
 import review_store
 import sheets_writer
 
@@ -398,7 +398,7 @@ def _finalize_batch(results, title, headers=None, rows=None):
     if sheets_writer.enabled():
         try:
             sheet_url = sheets_writer.create_batch_sheet(
-                title, headers, rows, HVAC_SYSTEMS, FIT_OPTIONS)
+                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS)
         except Exception as e:
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
     review_store.save_batch(batch_id, title, results, sheet_url=sheet_url,
