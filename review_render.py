@@ -58,6 +58,12 @@ def _model_boxes(e, reasoning):
 
 
 def _card(e):
+    # A batch entry carries a "human" decision once reviewed (review_store); render
+    # such cards in the exact state a live Submit leaves them in, so reopening the
+    # page mid-batch shows what's already done.
+    human = e.get("human") or {}
+    reviewed = bool(human)
+    picked = {s.strip() for s in str(human.get("hvac_systems", "")).split(",") if s.strip()}
     rid = _html.escape(str(e.get("i") or e.get("row_id") or ""))
     addr = str(e.get("address", ""))
     addr_e = _html.escape(addr)
@@ -86,16 +92,29 @@ def _card(e):
                     f'<div class="frame">{slides}</div>'
                     f'<div class="cap"></div></div>')
 
+    dis = " disabled" if reviewed else ""
     chips = ""
     for s in HVAC_SYSTEMS:
-        pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
-        chips += f'<button type="button" class="chip{pre}" data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
+        if reviewed:
+            pre = " sel" if s in picked else ""
+        else:
+            pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
+        chips += f'<button type="button" class="chip{pre}"{dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
     fitchips = ""
     for fo in FIT_OPTIONS:
-        fitchips += f'<button type="button" class="fitchip" data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>'
+        pre = " sel" if (reviewed and fo == human.get("fit")) else ""
+        fitchips += f'<button type="button" class="fitchip{pre}"{dis} data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>'
+
+    if reviewed:
+        saved = "✓ saved: " + str(human.get("hvac_systems", ""))
+        if human.get("fit"):
+            saved += " · " + str(human["fit"])
+        status = f'<span class="status ok">{_html.escape(saved)}</span>'
+    else:
+        status = '<span class="status"></span>'
 
     return f'''
-<article class="card" data-rid="{rid}" data-addr="{addr_e}" data-ai="{_html.escape(ai)}">
+<article class="card{' done' if reviewed else ''}" data-rid="{rid}" data-addr="{addr_e}" data-ai="{_html.escape(ai)}">
   <div class="head">
     <div class="addr">{addr_e}</div>
     <div class="ai">model: <span class="badge" style="background:{ai_color}">{_html.escape(ai) or '—'}</span></div>
@@ -112,9 +131,9 @@ def _card(e):
     <div class="chips">{chips}</div>
     <div class="label">Fit:</div>
     <div class="fitchips">{fitchips}</div>
-    <input class="note" type="text" placeholder="optional note…">
-    <button type="button" class="submit" onclick="submitCard(this)">Submit</button>
-    <span class="status"></span>
+    <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}">
+    <button type="button" class="submit"{dis} onclick="submitCard(this)">Submit</button>
+    {status}
   </div>
 </article>'''
 
@@ -122,6 +141,7 @@ def _card(e):
 def build_review_page(entries, job_id, webhook_url="", title="Cooling Tower Review"):
     cards = "\n".join(_card(e) for e in entries)
     total = len(entries)
+    done0 = sum(1 for e in entries if e.get("human"))
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     return f'''<!doctype html><html><head><meta charset="utf-8">
@@ -171,11 +191,11 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 #lb img{{max-width:96%;max-height:92vh;border:2px solid #fff;border-radius:6px}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
-<div class="sub"><span id="done">0</span>/{total} reviewed · check the HVAC systems you see on each building; it writes back to the sheet</div></header>
+<div class="sub"><span id="done">{done0}</span>/{total} reviewed · check the HVAC systems you see on each building; it writes back to the sheet</div></header>
 <div class="wrap">{cards}</div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
 <script>
-const WEBHOOK={wh}, JOB={jid};let done=0;
+const WEBHOOK={wh}, JOB={jid};let done={done0};
 function zoom(s){{document.getElementById('lbi').src=s;document.getElementById('lb').style.display='block';}}
 function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
   imgs.forEach((im,k)=>im.classList.toggle('cur',k==i));

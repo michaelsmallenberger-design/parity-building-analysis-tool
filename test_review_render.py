@@ -53,5 +53,27 @@ def test_review_contract():
           "Gemini/Grok split boxes, carousel, and full controls.")
 
 
+def test_reviewed_cards_rehydrate():
+    """Reopening the page must show already-reviewed cards as done (green card,
+    picked chips selected+disabled, note prefilled, counter counts them)."""
+    fresh = _entry()
+    done = {**_entry(), "i": 2,
+            "human": {"hvac_systems": "Cooling Tower, RTU", "fit": "Optimizer",
+                      "note": "checked from roof photo"}}
+    html = build_review_page([fresh, done], job_id="t", title="Test")
+
+    assert html.count('class="card done"') == 1, "reviewed card must render pre-done"
+    assert '<span id="done">1</span>/2 reviewed' in html, "counter must include prior decisions"
+    assert "let done=1;" in html, "JS counter must start at prior-decision count"
+    assert 'class="chip sel" disabled data-sys="RTU"' in html, "picked chip must be selected+disabled"
+    assert 'class="fitchip sel" disabled data-fit="Optimizer"' in html, "picked fit must be selected+disabled"
+    assert 'value="checked from roof photo"' in html, "note must prefill"
+    assert "✓ saved: Cooling Tower, RTU · Optimizer" in html, "saved status must render"
+    # The fresh card must be untouched: its Submit stays enabled.
+    assert 'class="submit" onclick' in html, "unreviewed card lost its live Submit"
+    print("OK: reviewed cards rehydrate as done; fresh cards unaffected.")
+
+
 if __name__ == "__main__":
     test_review_contract()
+    test_reviewed_cards_rehydrate()
