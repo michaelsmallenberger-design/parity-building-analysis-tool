@@ -131,13 +131,14 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
     for email in emails:
         try:
             drive.permissions().create(fileId=sid, sendNotificationEmail=False,
+                                       supportsAllDrives=True,
                                        body={"type": "user", "role": "writer",
                                              "emailAddress": email}).execute()
         except Exception as e:  # e.g. email is already the folder owner
             log.warning("Could not share sheet with %s: %s", email, e)
     if not emails and not folder:
         log.warning("SHEET_SHARE_WITH unset — granting anyone-with-link writer access")
-        drive.permissions().create(fileId=sid,
+        drive.permissions().create(fileId=sid, supportsAllDrives=True,
                                    body={"type": "anyone", "role": "writer"}).execute()
     return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
 
