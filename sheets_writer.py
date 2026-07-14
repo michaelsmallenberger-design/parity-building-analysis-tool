@@ -33,7 +33,8 @@ _SCOPES = [
 _lock = threading.Lock()
 _services = None
 
-HVAC_COL, FIT_COL, NOTES_COL, ID_COL = "HVAC Systems", "Fit", "Notes", "Row_ID"
+HVAC_COL, NOTES_COL, ID_COL = "HVAC Systems", "Notes", "Row_ID"
+OPT_FIT_COL, PERI_FIT_COL = "Optimizer Fit", "Periscope Fit"
 
 
 def enabled() -> bool:
@@ -147,7 +148,8 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
                                                   "gridProperties": {"frozenRowCount": 1}},
                                    "fields": "gridProperties.frozenRowCount"}},
     ]
-    for col_name, options in ((HVAC_COL, hvac_options), (FIT_COL, fit_options)):
+    for col_name, options in ((HVAC_COL, hvac_options), (OPT_FIT_COL, fit_options),
+                              (PERI_FIT_COL, fit_options)):
         if col_name in headers and n:
             if col_name == HVAC_COL and hvac_from_template:
                 continue
@@ -207,10 +209,11 @@ def write_row_values(sheet_url, headers, rows, row_id, mapping) -> bool:
     return True
 
 
-def write_decision(sheet_url, headers, rows, row_id, hvac, fit, note) -> bool:
+def write_decision(sheet_url, headers, rows, row_id, hvac,
+                   optimizer_fit="", periscope_fit="", note="") -> bool:
     """Write one reviewer decision into its sheet row. Notes only written when
     non-empty so an uploaded sheet's existing note text is never wiped."""
-    mapping = {HVAC_COL: hvac, FIT_COL: fit}
+    mapping = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
     if note:
         mapping[NOTES_COL] = note
     return write_row_values(sheet_url, headers, rows, row_id, mapping)

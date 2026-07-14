@@ -68,7 +68,9 @@ def decisions_for(job_id: str) -> list:
         h = e.get("human")
         if h:
             out.append({"row_id": _rid(e), "hvac_systems": h.get("hvac_systems", ""),
-                        "fit": h.get("fit", ""), "note": h.get("note", "")})
+                        "optimizer_fit": h.get("optimizer_fit", ""),
+                        "periscope_fit": h.get("periscope_fit", ""),
+                        "note": h.get("note", "")})
     return out
 
 

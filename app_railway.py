@@ -266,7 +266,8 @@ def api_review():
 
     batch = review_store.record_decision(job_id, row_id, {
         "hvac_systems": payload.get("hvac_systems", ""),
-        "fit": payload.get("fit", ""),
+        "optimizer_fit": payload.get("optimizer_fit", ""),
+        "periscope_fit": payload.get("periscope_fit", ""),
         "note": payload.get("note", ""),
     })
     if not batch:
@@ -279,7 +280,9 @@ def api_review():
                 batch["sheet_url"], batch.get("table_headers", []),
                 batch.get("table_rows", []), row_id,
                 hvac=payload.get("hvac_systems", ""),
-                fit=payload.get("fit", ""), note=payload.get("note", ""))
+                optimizer_fit=payload.get("optimizer_fit", ""),
+                periscope_fit=payload.get("periscope_fit", ""),
+                note=payload.get("note", ""))
             sheet = "updated" if ok else "row_not_found"
         except Exception as e:
             log.error(f"Sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)

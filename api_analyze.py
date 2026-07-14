@@ -33,9 +33,9 @@ import pandas as pd
 import requests
 from flask import Blueprint, jsonify, request, Response
 
-from tasks_local import _process_one_address, _build_web_entry
+from tasks_local import _process_one_address, _build_web_entry, ADDRESS_VARIANTS
 from report_audit import build_audit_report
-from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS
+from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS, LEGACY_FIT_VALUES
 import review_store
 import sheets_writer
 
@@ -299,9 +299,43 @@ def analyze():
     return jsonify(_analyze_one(address, body.get("boro_area"), body.get("zip")))
 
 
-CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID = "HVAC Systems", "Fit", "Notes", "Row_ID"
-# Header-name variants for locating the HVAC / Fit columns in an arbitrary upload
-# (fallback when the columns are blank; content detection below handles filled ones).
+CANON_HVAC, CANON_NOTES, CANON_ID = "HVAC Systems", "Notes", "Row_ID"
+CANON_ADDR = "Property Address"
+# THE output sheet format (2026-07-13 directive): every batch sheet has exactly
+# these columns in this order, matching the team's TAM sheet. Upload columns are
+# mapped in by synonym; anything unrecognized is left blank — "we only care
+# about the ones we fill out" (Optimizer/Periscope Fit, HVAC Systems, Notes).
+CANONICAL_COLUMNS = [
+    "Optimizer Fit", "Periscope Fit", CANON_HVAC, CANON_NOTES,
+    "Property Name", CANON_ADDR, "City", "Market Name", "Units", "Stories",
+    "Total Buildings", "Year Built", "Year Renovated", "Property Type",
+    "Secondary Type", "Affordable Type", "True Owner Name",
+    "Recorded Owner Name", "Property Manager Name",
+]
+# Lower-cased upload-header synonyms for each canonical column. The canonical
+# name itself always matches; HVAC and the address column get special handling.
+COLUMN_SYNONYMS = {
+    "Optimizer Fit": ["optimizer", "optimizer fit?"],
+    "Periscope Fit": ["periscope", "periscope fit?"],
+    CANON_NOTES: ["note", "comments", "comment"],
+    "Property Name": ["building name", "name", "property"],
+    "City": [],
+    "Market Name": ["submarket", "submarket name", "market"],
+    "Units": ["# of units", "unit count", "number of units"],
+    "Stories": ["floors", "# of stories"],
+    "Total Buildings": ["buildings", "# of buildings", "number of buildings"],
+    "Year Built": ["built"],
+    "Year Renovated": ["renovated", "year renov"],
+    "Property Type": ["primary property type", "type"],
+    "Secondary Type": ["secondary property type"],
+    "Affordable Type": [],
+    "True Owner Name": ["owner", "owner name", "true owner"],
+    "Recorded Owner Name": ["recorded owner"],
+    "Property Manager Name": ["property manager", "property manager name", "pm name", "manager"],
+}
+# Header-name variants for locating the HVAC / legacy-Fit columns in an
+# arbitrary upload (fallback when the columns are blank; content detection
+# below handles filled ones).
 HVAC_SYSTEM_COL_NAMES = ["HVAC Systems", "HVAC System", "HVAC", "HVAC Equipment", "HVAC Type"]
 FIT_COL_NAMES = ["Fit", "Fit Type", "Product Fit"]
 
@@ -313,7 +347,10 @@ def _detect_hvac_fit_columns(df):
     Optimizer/Periscope = Fit). Falls back to header-name variants for fresh uploads
     where the columns are still blank. Returns (hvac_col, fit_col); either may be None."""
     hvac_vocab = {s.lower() for s in HVAC_SYSTEMS}
-    fit_vocab = {s.lower() for s in FIT_OPTIONS}
+    # Legacy single-Fit vocabulary (Optimizer/Periscope/...) plus the current
+    # Good/Bad/Not Sure — so a filled fit column in ANY vintage of re-uploaded
+    # sheet is recognized and never mistaken for the HVAC column.
+    fit_vocab = {s.lower() for s in LEGACY_FIT_VALUES + FIT_OPTIONS}
 
     def content_score(col, vocab):
         vals = [str(v) for v in df[col].dropna().tolist() if str(v).strip()]
@@ -344,40 +381,75 @@ def _detect_hvac_fit_columns(df):
     return hvac_col, fit_col
 
 
+def _cell(v):
+    if v == "" or v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():  # 12.0 -> "12", not "12.0"
+        return str(int(v))
+    return str(v)
+
+
+def _norm_header(h):
+    return re.sub(r"\s+", " ", str(h)).strip().lower()
+
+
 def _lean_table(results):
-    """No uploaded sheet (addresses only): minimal table = address + review columns."""
-    headers = ["Property Address", CANON_HVAC, CANON_FIT, CANON_NOTES, CANON_ID]
-    rows = [[r.get("address", ""), "", "", "", i] for i, r in enumerate(results, 1)]
+    """No uploaded sheet (addresses only): the canonical format with just the
+    address filled in."""
+    headers = CANONICAL_COLUMNS + [CANON_ID]
+    ai = CANONICAL_COLUMNS.index(CANON_ADDR)
+    rows = []
+    for i, r in enumerate(results, 1):
+        row = [""] * len(CANONICAL_COLUMNS) + [str(i)]
+        row[ai] = r.get("address", "")
+        rows.append(row)
     return headers, rows
 
 
 def _table_from_df(df):
-    """Preserve EVERY uploaded column; ensure HVAC Systems / Fit / Notes exist (reuse
-    if already present) and stamp a hidden Row_ID = 1-based row index. Returns
-    (headers, rows) as plain strings for the sheet. No AI columns are added."""
-    df = df.copy()
+    """Map ANY upload into THE canonical sheet format: exactly CANONICAL_COLUMNS
+    in order (+ hidden Row_ID), regardless of what was uploaded. Recognized
+    upload columns (by synonym, or by content for HVAC) carry their values
+    over; unrecognized ones are dropped; missing ones come out blank. A legacy
+    single-Fit column (Optimizer/Periscope values) is detected only so it is
+    never mistaken for HVAC — its values are not carried."""
     hvac_col, fit_col = _detect_hvac_fit_columns(df)
-    # Normalize the detected HVAC/Fit columns to canonical names (dedupes messy or
-    # duplicate headers); drop any stray same-named canonical column first.
-    for canon, detected in ((CANON_HVAC, hvac_col), (CANON_FIT, fit_col)):
-        if detected is not None and detected != canon:
-            df = df.drop(columns=[c for c in df.columns if c == canon])
-            df = df.rename(columns={detected: canon})
-    for col in (CANON_HVAC, CANON_FIT, CANON_NOTES):
-        if col not in df.columns:
-            df[col] = ""
-    df[CANON_ID] = range(1, len(df) + 1)
-    headers = [str(c) for c in df.columns]
+    norm_cols = {}
+    for c in df.columns:
+        norm_cols.setdefault(_norm_header(c), c)
 
-    def _cell(v):
-        if v == "" or v is None:
-            return ""
-        if isinstance(v, float) and v.is_integer():  # 12.0 -> "12", not "12.0"
-            return str(int(v))
-        return str(v)
+    # fit_col is NOT excluded here: a column actually named "Optimizer Fit" /
+    # "Periscope" maps by name below; only a fit-content column with no
+    # recognizable name (legacy "Fit", "HVAC Systems.1") drops out naturally.
+    used = {hvac_col} if hvac_col is not None else set()
+    mapping = {}
+    if hvac_col is not None:
+        mapping[CANON_HVAC] = hvac_col
+    addr_norms = [v.lower() for v in ADDRESS_VARIANTS]
+    for canon in CANONICAL_COLUMNS:
+        if canon in mapping:
+            continue
+        candidates = [_norm_header(canon)]
+        if canon == CANON_ADDR:
+            candidates += addr_norms
+        candidates += COLUMN_SYNONYMS.get(canon, [])
+        for name in candidates:
+            src = norm_cols.get(name)
+            if src is not None and src not in used:
+                mapping[canon] = src
+                used.add(src)
+                break
 
+    n = len(df)
     filled = df.where(df.notna(), "")
-    rows = [[_cell(v) for v in rec] for rec in filled.values.tolist()]
+    cols_out = {}
+    for canon in CANONICAL_COLUMNS:
+        src = mapping.get(canon)
+        vals = filled[src].tolist() if src is not None else [""] * n
+        cols_out[canon] = [_cell(v) for v in vals]
+    headers = CANONICAL_COLUMNS + [CANON_ID]
+    rows = [[cols_out[c][i] for c in CANONICAL_COLUMNS] + [str(i + 1)]
+            for i in range(n)]
     return headers, rows
 
 
