@@ -394,17 +394,18 @@ def _finalize_batch(results, title, headers=None, rows=None):
     batch_id = f"b-{uuid.uuid4().hex[:10]}"
     if headers is None:
         headers, rows = _lean_table(results)
+    base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
     sheet_url = ""
     if sheets_writer.enabled():
         try:
             sheet_url = sheets_writer.create_batch_sheet(
-                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS)
+                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                review_url=review_url if base else "")
         except Exception as e:
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
     review_store.save_batch(batch_id, title, results, sheet_url=sheet_url,
                             table_headers=headers, table_rows=rows)
-    base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
-    review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url

@@ -192,6 +192,50 @@ def serve_file(blob_name):
 # -----------------------------------------------------------------------------
 # REVIEW LOOP (team confirms HVAC + fit per building; writes back to the sheet)
 # -----------------------------------------------------------------------------
+@app.route('/reviews')
+def reviews_index():
+    """One bookmarkable page listing every batch, newest first — the team's
+    front door. No auth, same as the review pages themselves; batch ids stay
+    unguessable elsewhere but this page trades that for accessibility."""
+    import html as _h
+    rows = ""
+    for b in review_store.list_batches():
+        title = _h.escape(b.get("title") or b["batch_id"])
+        created = _h.escape((b.get("created") or "")[:10])
+        prog = f"{b['reviewed']}/{b['count']} reviewed"
+        done = ' style="color:#37b24d"' if b["count"] and b["reviewed"] >= b["count"] else ""
+        sheet = (f'<a class="btn ghost" href="{_h.escape(b["sheet_url"])}" target="_blank" '
+                 f'rel="noopener">Sheet</a>' if b.get("sheet_url") else "")
+        rows += (f'<div class="row"><div class="meta"><div class="t">{title}</div>'
+                 f'<div class="s">{created} · <span{done}>{prog}</span></div></div>'
+                 f'<div class="acts"><a class="btn" href="/review/{_h.escape(b["batch_id"])}">'
+                 f'Review</a>{sheet}</div></div>')
+    if not rows:
+        rows = '<div class="row"><div class="meta"><div class="s">No batches yet.</div></div></div>'
+    html = f'''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cooling Tower Reviews</title>
+<style>
+:root{{color-scheme:dark}}*{{box-sizing:border-box}}
+body{{margin:0;background:#0d0f12;color:#e6e8eb;font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}}
+header{{background:#12151a;border-bottom:1px solid #262b33;padding:14px 20px}}
+header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;margin-top:2px}}
+.wrap{{max-width:760px;margin:0 auto;padding:18px}}
+.row{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+ background:#161a20;border:1px solid #262b33;border-radius:12px;padding:14px 16px;margin:0 0 12px}}
+.t{{font-weight:600}}.s{{color:#9aa3ad;font-size:13px;margin-top:2px}}
+.acts{{display:flex;gap:8px}}
+.btn{{background:#2563eb;color:#fff;text-decoration:none;border-radius:8px;padding:8px 16px;font-size:14px}}
+.btn.ghost{{background:#1e232b;color:#cfd4da;border:1px solid #333b45}}
+.btn:hover{{filter:brightness(1.15)}}
+</style></head><body>
+<header><h1>Cooling Tower Reviews</h1>
+<div class="sub">every analysis batch, newest first · bookmark this page</div></header>
+<div class="wrap">{rows}</div>
+</body></html>'''
+    return Response(html, mimetype="text/html")
+
+
 @app.route('/review/<job_id>')
 def review_page(job_id):
     """Serve the blessed interactive review page for a persisted batch."""
