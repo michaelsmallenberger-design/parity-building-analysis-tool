@@ -76,6 +76,177 @@ def _col_letter(idx: int) -> str:
     return s
 
 
+# --- Run-in-place mode: analyze an EXISTING team Google Sheet and write review
+# --- decisions back into ITS rows (2026-07-13 directive: no new sheets).
+
+# The four columns we fill; anything else in the team's sheet is never touched.
+_FILL_SYNONYMS = {
+    HVAC_COL: ["hvac systems", "hvac system", "hvac"],
+    OPT_FIT_COL: ["optimizer fit", "optimizer", "optimizer fit?"],
+    PERI_FIT_COL: ["periscope fit", "periscope", "periscope fit?"],
+    NOTES_COL: ["notes", "note"],
+}
+
+
+def _norm(h) -> str:
+    return re.sub(r"\s+", " ", str(h)).strip().lower()
+
+
+def read_bound_sheet(sheet_url, address_variants):
+    """Open the team's live Google Sheet for run-in-place mode. Picks the
+    leftmost tab whose header row has an address column (sales workbooks lead
+    with Read Me tabs). Returns (binding, headers, data_rows): binding carries
+    everything /api/review later needs to write cells back into THAT sheet;
+    data_rows are stringified cell lists 1:1 with binding['row_numbers'] (blank
+    sheet rows are skipped and never analyzed)."""
+    sid = sheet_id_from_url(sheet_url)
+    if not sid:
+        raise ValueError("That doesn't look like a Google Sheets link.")
+    sheets, _ = _get_services()
+    ss = sheets.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="properties.title,sheets.properties(sheetId,title)").execute()
+    ss_title = ss.get("properties", {}).get("title", "")
+    meta = ss["sheets"]
+    addr_norms = {v.lower() for v in address_variants}
+    chosen = None
+    for t in meta:
+        title = t["properties"]["title"]
+        head = sheets.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"'{title}'!1:1").execute().get("values", [[]])
+        headers = [str(h).strip() for h in (head[0] if head else [])]
+        if {_norm(h) for h in headers} & addr_norms:
+            chosen = (t["properties"], headers)
+            break
+    if chosen is None:
+        raise ValueError(
+            "No tab in that sheet has a recognizable address column "
+            "(e.g. 'Property Address' or 'Address') in its first row.")
+    props, headers = chosen
+    vals = sheets.spreadsheets().values().get(
+        spreadsheetId=sid, range=f"'{props['title']}'").execute().get("values", [])
+    data_rows, row_numbers = [], []
+    for rn, row in enumerate(vals[1:], start=2):
+        cells = [str(c).strip() for c in row]
+        if any(cells):
+            data_rows.append(cells + [""] * (len(headers) - len(cells)))
+            row_numbers.append(rn)
+    binding = {
+        "spreadsheet_id": sid,
+        "grid_id": props["sheetId"],
+        "tab": props["title"],
+        "headers": headers,
+        "row_numbers": row_numbers,
+        "title": f"{ss_title} — {props['title']}" if ss_title else props["title"],
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{sid}/edit#gid={props['sheetId']}",
+    }
+    return binding, headers, data_rows
+
+
+def ensure_review_columns(binding, headers, hvac_options, fit_options,
+                          review_url=""):
+    """Make sure the bound sheet has the four fill-out columns (matched by
+    name; missing ones are APPENDED after the last header so the team's layout
+    is untouched) and give them dropdowns. Stores the resulting column map
+    (fill column -> 0-based index) in the binding. Legacy 'Fit' columns are
+    ignored, not repurposed."""
+    sheets, _ = _get_services()
+    sid, grid, tab = binding["spreadsheet_id"], binding["grid_id"], binding["tab"]
+    norm_to_idx = {}
+    for i, h in enumerate(headers):
+        norm_to_idx.setdefault(_norm(h), i)
+    colmap, missing = {}, []
+    for canon, syns in _FILL_SYNONYMS.items():
+        idx = None
+        for name in [_norm(canon)] + syns:
+            if name in norm_to_idx:
+                idx = norm_to_idx[name]
+                break
+        if idx is None:
+            missing.append(canon)
+        else:
+            colmap[canon] = idx
+    next_idx = len(headers)
+    if missing:
+        start = _col_letter(next_idx)
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"'{tab}'!{start}1", valueInputOption="RAW",
+            body={"values": [missing]}).execute()
+        for canon in missing:
+            colmap[canon] = next_idx
+            next_idx += 1
+    if review_url:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"'{tab}'!{_col_letter(next_idx)}1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[f'=HYPERLINK("{review_url}", "▸ Open review page")']]}).execute()
+
+    last_row = max(binding["row_numbers"]) if binding["row_numbers"] else 1
+    hvac_from_template = False
+    template_id = os.environ.get("SHEET_TEMPLATE_ID", "").strip()
+    if template_id:
+        try:
+            tgrid = sheets.spreadsheets().get(
+                spreadsheetId=template_id, fields="sheets.properties.sheetId"
+            ).execute()["sheets"][0]["properties"]["sheetId"]
+            copied = sheets.spreadsheets().sheets().copyTo(
+                spreadsheetId=template_id, sheetId=tgrid,
+                body={"destinationSpreadsheetId": sid}).execute()["sheetId"]
+            c = colmap[HVAC_COL]
+            sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [
+                {"copyPaste": {
+                    "source": {"sheetId": copied, "startRowIndex": 1, "endRowIndex": 2,
+                               "startColumnIndex": 0, "endColumnIndex": 1},
+                    "destination": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": last_row,
+                                    "startColumnIndex": c, "endColumnIndex": c + 1},
+                    "pasteType": "PASTE_DATA_VALIDATION"}},
+                {"deleteSheet": {"sheetId": copied}},
+            ]}).execute()
+            hvac_from_template = True
+        except Exception as e:
+            log.warning("Template validation copy failed (%s); single-select fallback", e)
+    reqs = []
+    rules = [(OPT_FIT_COL, fit_options), (PERI_FIT_COL, fit_options)]
+    if not hvac_from_template:
+        rules.append((HVAC_COL, hvac_options))
+    for canon, options in rules:
+        c = colmap[canon]
+        reqs.append({"setDataValidation": {
+            "range": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": last_row,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "rule": {"condition": {"type": "ONE_OF_LIST",
+                                   "values": [{"userEnteredValue": o} for o in options]},
+                     "strict": False, "showCustomUi": True}}})
+    if reqs:
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
+    binding["colmap"] = colmap
+    return binding
+
+
+def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit="",
+                         note="") -> bool:
+    """Write one reviewer decision into the bound team sheet. row_id is the
+    1-based data-row position; binding['row_numbers'] maps it to the actual
+    sheet row. Notes only written when non-empty."""
+    try:
+        row = binding["row_numbers"][int(row_id) - 1]
+    except (IndexError, ValueError, TypeError):
+        return False
+    colmap = binding.get("colmap") or {}
+    cells = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
+    if note:
+        cells[NOTES_COL] = note
+    data = [{"range": f"'{binding['tab']}'!{_col_letter(colmap[k])}{row}", "values": [[v]]}
+            for k, v in cells.items() if k in colmap]
+    if not data:
+        return False
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"valueInputOption": "USER_ENTERED", "data": data}).execute()
+    return True
+
+
 def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
                        review_url="") -> str:
     """Create the output Sheet: user's table + bold frozen header, HVAC/Fit

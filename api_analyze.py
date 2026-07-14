@@ -453,7 +453,7 @@ def _table_from_df(df):
     return headers, rows
 
 
-def _finalize_batch(results, title, headers=None, rows=None):
+def _finalize_batch(results, title, headers=None, rows=None, binding=None):
     """Stamp row ids and persist the batch for /review, storing the ORIGINAL uploaded
     table (all the user's columns). When a Sheets service-account credential is
     configured, the output Google Sheet is created HERE, up front — each review
@@ -474,7 +474,18 @@ def _finalize_batch(results, title, headers=None, rows=None):
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
     sheet_url = ""
-    if sheets_writer.enabled():
+    if binding and sheets_writer.enabled():
+        # Run-in-place: no new sheet — add the fill-out columns + dropdowns to
+        # the team's own sheet and write decisions back into it.
+        try:
+            sheets_writer.ensure_review_columns(
+                binding, binding.get("headers", []), HVAC_SYSTEMS + [NONE_OPTION],
+                FIT_OPTIONS, review_url=review_url if base else "")
+            sheet_url = binding["sheet_url"]
+        except Exception as e:
+            log.error("Bound-sheet setup failed for %s: %s", batch_id, e, exc_info=True)
+            binding = None  # fall back to review-page-only; decisions stay local
+    elif sheets_writer.enabled():
         try:
             sheet_url = sheets_writer.create_batch_sheet(
                 title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
@@ -482,7 +493,8 @@ def _finalize_batch(results, title, headers=None, rows=None):
         except Exception as e:
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
     review_store.save_batch(batch_id, title, results, sheet_url=sheet_url,
-                            table_headers=headers, table_rows=rows)
+                            table_headers=headers, table_rows=rows,
+                            sheet_binding=binding)
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url
