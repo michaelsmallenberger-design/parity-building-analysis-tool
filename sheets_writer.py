@@ -75,10 +75,13 @@ def _col_letter(idx: int) -> str:
     return s
 
 
-def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
+def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
+                       review_url="") -> str:
     """Create the output Sheet: user's table + bold frozen header, HVAC/Fit
     dropdowns, hidden Row_ID column. HVAC validation is warn-only because the
-    review page submits comma-joined multi-selects. Returns the sheet URL."""
+    review page submits comma-joined multi-selects. When review_url is given,
+    an "Open review page" link is written next to the header row so the sheet
+    itself leads back to the review. Returns the sheet URL."""
     sheets, drive = _get_services()
     folder = os.environ.get("SHEET_PARENT_FOLDER_ID", "").strip()
     if folder:
@@ -100,6 +103,11 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options) -> str:
     sheets.spreadsheets().values().update(
         spreadsheetId=sid, range="A1", valueInputOption="RAW",
         body={"values": values}).execute()
+    if review_url:
+        link_col = _col_letter(len(headers))  # first column past the table (0-based)
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{link_col}1", valueInputOption="USER_ENTERED",
+            body={"values": [[f'=HYPERLINK("{review_url}", "▸ Open review page")']]}).execute()
 
     n = len(rows)
     reqs = [
