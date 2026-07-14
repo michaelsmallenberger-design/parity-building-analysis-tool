@@ -9,11 +9,36 @@ what's already been reviewed.
 """
 from datetime import datetime
 
-from storage_helpers import write_json, read_json
+from storage_helpers import write_json, read_json, get_file_path
 
 
 def _path(job_id: str) -> str:
     return f"reviews/{job_id}.json"
+
+
+def list_batches() -> list:
+    """Summaries of every persisted batch, newest first. This is the recovery
+    path when an /api/run response is lost in transit: batch ids are random and
+    appear nowhere else, so without this listing a lost response means a lost
+    review URL."""
+    base = get_file_path("reviews")
+    if not base.exists():
+        return []
+    out = []
+    for p in sorted(base.glob("*.json"), key=lambda q: q.stat().st_mtime, reverse=True):
+        b = read_json(f"reviews/{p.name}")
+        if not b:
+            continue
+        entries = b.get("entries", [])
+        out.append({
+            "batch_id": b.get("job_id", p.stem),
+            "title": b.get("title", ""),
+            "created": b.get("created", ""),
+            "sheet_url": b.get("sheet_url", ""),
+            "count": len(entries),
+            "reviewed": sum(1 for e in entries if e.get("human")),
+        })
+    return out
 
 
 def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",

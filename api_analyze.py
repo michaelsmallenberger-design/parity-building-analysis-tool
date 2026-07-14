@@ -405,6 +405,8 @@ def _finalize_batch(results, title, headers=None, rows=None):
                             table_headers=headers, table_rows=rows)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
+    log.info("Batch %s finalized: %d rows, review %s, sheet %s",
+             batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url
 
 
@@ -480,6 +482,19 @@ def run_file():
         resp.headers["X-Sheet-URL"] = sheet_url
     resp.headers["X-Uploaded-Filename"] = uploaded.filename
     return resp
+
+
+@api.route("/batches", methods=["GET"])
+@require_key
+def batches():
+    """List persisted batches (newest first) with review URLs — the recovery path
+    when an /api/run response never reaches the client."""
+    base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    out = review_store.list_batches()
+    for b in out:
+        b["review_url"] = (f"{base}/review/{b['batch_id']}" if base
+                           else f"/review/{b['batch_id']}")
+    return jsonify({"batches": out})
 
 
 @api.route("/batch/<batch_id>", methods=["GET"])
