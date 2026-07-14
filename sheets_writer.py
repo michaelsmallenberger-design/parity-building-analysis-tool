@@ -110,6 +110,35 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
             body={"values": [[f'=HYPERLINK("{review_url}", "▸ Open review page")']]}).execute()
 
     n = len(rows)
+    # Multi-select dropdowns can't be created via the API (DataValidationRule has
+    # no such field — UI-only), but the setting SURVIVES a copy. When
+    # SHEET_TEMPLATE_ID names a spreadsheet whose first tab holds a multi-select
+    # HVAC validation cell (A2, checkbox ticked once by hand), copy that
+    # validation onto the HVAC column instead of building a single-select rule.
+    hvac_from_template = False
+    template_id = os.environ.get("SHEET_TEMPLATE_ID", "").strip()
+    if template_id and HVAC_COL in headers and n:
+        try:
+            tgrid = sheets.spreadsheets().get(
+                spreadsheetId=template_id, fields="sheets.properties.sheetId"
+            ).execute()["sheets"][0]["properties"]["sheetId"]
+            copied = sheets.spreadsheets().sheets().copyTo(
+                spreadsheetId=template_id, sheetId=tgrid,
+                body={"destinationSpreadsheetId": sid}).execute()["sheetId"]
+            c = headers.index(HVAC_COL)
+            sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [
+                {"copyPaste": {
+                    "source": {"sheetId": copied, "startRowIndex": 1, "endRowIndex": 2,
+                               "startColumnIndex": 0, "endColumnIndex": 1},
+                    "destination": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                    "startColumnIndex": c, "endColumnIndex": c + 1},
+                    "pasteType": "PASTE_DATA_VALIDATION"}},
+                {"deleteSheet": {"sheetId": copied}},
+            ]}).execute()
+            hvac_from_template = True
+        except Exception as e:
+            log.warning("Template validation copy failed (%s); falling back to "
+                        "single-select HVAC dropdown", e)
     reqs = [
         {"repeatCell": {"range": {"sheetId": grid, "startRowIndex": 0, "endRowIndex": 1},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
@@ -120,6 +149,8 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
     ]
     for col_name, options in ((HVAC_COL, hvac_options), (FIT_COL, fit_options)):
         if col_name in headers and n:
+            if col_name == HVAC_COL and hvac_from_template:
+                continue
             c = headers.index(col_name)
             reqs.append({"setDataValidation": {
                 "range": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": n + 1,
