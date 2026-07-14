@@ -530,8 +530,31 @@
                         displayNewResults(finalResult.web_results);
                     }
 
-                    // Add copy-paste instruction banner
-                    if (!headerElement.querySelector('.copy-paste-instructions')) {
+                    // Primary hand-off: the review page + live Google Sheet.
+                    if (finalResult && finalResult.review_url && !headerElement.querySelector('.review-handoff')) {
+                        const banner = document.createElement('div');
+                        banner.className = 'review-handoff';
+                        const sheetBtn = finalResult.sheet_url
+                            ? `<a href="${finalResult.sheet_url}" target="_blank" rel="noopener" class="download-button secondary">📄 Open Google Sheet</a>`
+                            : '';
+                        banner.innerHTML = `
+                            <div style="background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 1rem 1.5rem; margin: 1.5rem 0; border-radius: 4px;">
+                                <strong style="color: #2e7d32; font-size: 1.1rem;">✅ Ready for review</strong>
+                                <p style="margin: 0.5rem 0 0.8rem 0; color: #333;">
+                                    Review each building below — every Submit writes straight into the Google Sheet.
+                                    You can stop and finish later; progress is saved per building.
+                                </p>
+                                <div class="download-buttons" style="justify-content:flex-start; margin-top:0;">
+                                    <a href="${finalResult.review_url}" class="download-button primary">🏢 Open Review Page</a>
+                                    ${sheetBtn}
+                                </div>
+                            </div>
+                        `;
+                        headerElement.appendChild(banner);
+                    }
+
+                    // Fallback hand-off (no Sheets credential): copy-paste instructions
+                    if (!(finalResult && finalResult.review_url) && !headerElement.querySelector('.copy-paste-instructions')) {
                         const instructionBanner = document.createElement('div');
                         instructionBanner.className = 'copy-paste-instructions';
                         instructionBanner.innerHTML = `

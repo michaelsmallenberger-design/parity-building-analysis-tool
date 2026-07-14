@@ -390,7 +390,12 @@ def _finalize_batch(results, title, headers=None, rows=None):
     fallback. Sheet-creation failure is logged, not fatal: the batch and review
     page must survive a Sheets outage. Returns (batch_id, review_url, sheet_url)."""
     for i, e in enumerate(results, 1):
+        # Normalize BOTH ids to the 1-based input position: worker-path entries
+        # carry the pandas index label as "i" (0-based, gappy after dropna), and
+        # the review page matches sheet rows by this id against the sheet's
+        # 1-based hidden Row_ID column.
         e["row_id"] = i
+        e["i"] = i
     batch_id = f"b-{uuid.uuid4().hex[:10]}"
     if headers is None:
         headers, rows = _lean_table(results)

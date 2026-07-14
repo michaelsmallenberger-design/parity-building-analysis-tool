@@ -134,6 +134,26 @@ class BackgroundWorker:
                                 message=error_msg)
                 return
 
+            # Finalize into the review loop: same path as /api/run — persist the
+            # batch for /review(s) and create the live Google Sheet from the
+            # ORIGINAL uploaded table. Non-fatal: the classic report must still
+            # come out if Sheets is down.
+            table_df = result.pop("table_df", None)
+            web_results = result.get("web_results") or []
+            if web_results:
+                try:
+                    from api_analyze import _finalize_batch, _table_from_df
+                    headers = rows = None
+                    if table_df is not None:
+                        headers, rows = _table_from_df(table_df)
+                    title = Path(csv_path).stem or job_id
+                    _bid, review_url, sheet_url = _finalize_batch(
+                        web_results, title, headers, rows)
+                    result["review_url"] = review_url
+                    result["sheet_url"] = sheet_url
+                except Exception as e:
+                    log.error(f"Review finalize failed for {job_id}: {e}", exc_info=True)
+
             # Save result
             write_result(job_id, result)
 

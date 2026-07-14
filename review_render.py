@@ -82,7 +82,9 @@ def _card(e):
     n = 0
     for key, label in _IMG_SLOTS:
         v = e.get(key)
-        if isinstance(v, str) and v.startswith("data:"):
+        # data: URIs (API path) or server-hosted /files/ paths & absolute URLs
+        # (browser-upload worker path) — all render in the same carousel.
+        if isinstance(v, str) and v.startswith(("data:", "/files/", "http")):
             slides += (f'<img src="{v}" data-label="{label}" alt="{label}" loading="lazy" '
                        f'onclick="zoom(this.src)"{"" if n else " class=cur"}>')
             n += 1
