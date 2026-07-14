@@ -1174,6 +1174,38 @@ def _process_one_address_core(
     return web_entry, csv_row
 
 
+ADDRESS_VARIANTS = [
+    'Address', 'address', 'ADDRESS',
+    'Property Address', 'property address', 'PROPERTY ADDRESS',
+    'PropertyAddress', 'propertyaddress', 'PROPERTYADDRESS',
+    'Street Address', 'street address', 'STREET ADDRESS',
+    'StreetAddress', 'streetaddress', 'STREETADDRESS',
+    'Building Address', 'building address', 'BUILDING ADDRESS',
+    'BuildingAddress', 'buildingaddress', 'BUILDINGADDRESS',
+    'Property_Address', 'property_address', 'PROPERTY_ADDRESS',
+    'Street_Address', 'street_address', 'STREET_ADDRESS',
+    'Building_Address', 'building_address', 'BUILDING_ADDRESS'
+]
+
+
+def _pick_excel_tab(all_sheets):
+    """Choose the worksheet to analyze from a multi-tab workbook. Real sales
+    workbooks lead with Read Me / notes tabs (e.g. the Washington Gas campaign
+    file: Read Me, then four different tabs holding addresses), so take the
+    LEFTMOST non-empty tab with a recognizable address column; fall back to the
+    first non-empty tab. Returns (tab_name, df) or (None, None)."""
+    variants = {v.lower() for v in ADDRESS_VARIANTS}
+    fallback = (None, None)
+    for name, d in all_sheets.items():
+        if d is None or not len(d.columns) or not len(d):
+            continue
+        if fallback == (None, None):
+            fallback = (name, d)
+        if {str(c).strip().lower() for c in d.columns} & variants:
+            return name, d
+    return fallback
+
+
 def process_address_list(
     uploaded_filepath: str,
     job_id: str,
@@ -1204,18 +1236,23 @@ def process_address_list(
     df = None
 
     # Handle Excel files (.xlsx, .xls)
+    chosen_tab = None
     if file_ext in ['.xlsx', '.xls']:
         try:
-            df = pd.read_excel(uploaded_filepath, engine='openpyxl' if file_ext == '.xlsx' else None)
-
-            # Validate: must have at least 1 column and 1 row
-            if len(df.columns) >= 1 and len(df) > 0:
-                log.info(f"Excel file loaded successfully: {len(df)} rows, {len(df.columns)} columns")
-            else:
-                df = None
+            all_sheets = pd.read_excel(uploaded_filepath, sheet_name=None,
+                                       engine='openpyxl' if file_ext == '.xlsx' else None)
+            tab, df = _pick_excel_tab(all_sheets)
+            if df is None:
                 error_msg = "Excel file is empty or has no valid data"
                 log.error(error_msg)
                 return {"error": error_msg}
+            if len(all_sheets) > 1:
+                chosen_tab = tab
+                others = [n for n in all_sheets if n != tab]
+                log.info(f"Workbook has {len(all_sheets)} tabs; analyzing '{tab}' "
+                         f"({len(df)} rows). Skipped: {others}")
+            else:
+                log.info(f"Excel file loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         except Exception as e:
             error_msg = f"Failed to read Excel file: {str(e)}"
             log.error(error_msg)
@@ -1295,18 +1332,7 @@ def process_address_list(
 
     # Auto-detect address column (support common variations)
     address_col = None
-    address_variants = [
-        'Address', 'address', 'ADDRESS',
-        'Property Address', 'property address', 'PROPERTY ADDRESS',
-        'PropertyAddress', 'propertyaddress', 'PROPERTYADDRESS',
-        'Street Address', 'street address', 'STREET ADDRESS',
-        'StreetAddress', 'streetaddress', 'STREETADDRESS',
-        'Building Address', 'building address', 'BUILDING ADDRESS',
-        'BuildingAddress', 'buildingaddress', 'BUILDINGADDRESS',
-        'Property_Address', 'property_address', 'PROPERTY_ADDRESS',
-        'Street_Address', 'street_address', 'STREET_ADDRESS',
-        'Building_Address', 'building_address', 'BUILDING_ADDRESS'
-    ]
+    address_variants = ADDRESS_VARIANTS
 
     for variant in address_variants:
         if variant in df.columns:
@@ -1505,4 +1531,6 @@ def process_address_list(
         # in order with web_results — the caller finalizes it into the review
         # batch + Google Sheet. Not JSON-serializable; pop before write_result.
         "table_df": df,
+        # Set when a multi-tab workbook was uploaded: which tab was analyzed.
+        "sheet_tab": chosen_tab,
     }
