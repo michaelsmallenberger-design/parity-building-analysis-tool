@@ -39,6 +39,9 @@ init_db()
 init_storage()
 worker = start_worker()
 
+from drive_inbox import start_watcher
+start_watcher()
+
 log.info("Application initialized - database and worker started")
 
 # -----------------------------------------------------------------------------
