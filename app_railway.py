@@ -102,6 +102,63 @@ def upload():
 
     return redirect(url_for('results', job_id=job_id, total=total))
 
+
+@app.route('/upload-sheet', methods=['POST'])
+def upload_sheet():
+    """Run-in-place mode (the primary flow): paste a link to the team's live
+    Google Sheet; the analyzer reads it, runs the pipeline, and review Submits
+    write back into THAT sheet's own rows. No new sheet is created."""
+    link = (request.form.get('sheet_link') or '').strip()
+    if not link:
+        return redirect(url_for('index'))
+    if not sheets_writer.enabled():
+        return render_template('error.html', error_title="Sheets not configured",
+                               error_message="The server has no Google credential."), 500
+    from tasks_local import ADDRESS_VARIANTS
+    try:
+        binding, headers, data_rows = sheets_writer.read_bound_sheet(link, ADDRESS_VARIANTS)
+    except ValueError as e:
+        return render_template('error.html', error_title="Can't use that link",
+                               error_message=str(e)), 400
+    except Exception as e:
+        log.warning(f"Bound-sheet read failed for {link}: {e}")
+        return render_template(
+            'error.html', error_title="Can't open that Google Sheet",
+            error_message=("The analyzer couldn't read it. Make sure the sheet is shared with "
+                           "the analyzer robot as Editor: sheet-writer@gen-lang-client-0702830838"
+                           ".iam.gserviceaccount.com — then paste the link again.")), 400
+
+    total = len(data_rows)
+    if not total:
+        return render_template('error.html', error_title="No rows found",
+                               error_message=f"Tab '{binding['tab']}' has a header but no data rows."), 400
+    can_process, current_usage, error_msg = check_usage_limit(total)
+    if not can_process:
+        return render_template('error.html', error_title="Monthly Limit Reached",
+                               error_message=error_msg, current_usage=current_usage), 403
+
+    job_id = str(uuid.uuid4())
+    local_path = UPLOAD_FOLDER / f"{job_id}.csv"
+    import csv as _csv
+    with open(local_path, 'w', newline='', encoding='utf-8') as fh:
+        w = _csv.writer(fh)
+        w.writerow(binding["headers"])
+        w.writerows(data_rows)
+    csv_blob_path = f"uploads/{job_id}/{job_id}.csv"
+    upload_file(str(local_path), csv_blob_path)
+    try:
+        enqueue_job(job_id, {
+            "job_id": job_id,
+            "csv_path": csv_blob_path,
+            "total": total,
+            "sheet_binding": binding,
+        })
+        log.info(f"Job {job_id} enqueued from live sheet '{binding['title']}' ({total} rows)")
+    except Exception as e:
+        log.error(f"Failed to enqueue sheet job: {e}", exc_info=True)
+        return f"Error enqueuing job: {e}", 500
+    return redirect(url_for('results', job_id=job_id, total=total))
+
 @app.route('/results/<job_id>')
 def results(job_id):
     """Results page with progress polling."""
@@ -274,7 +331,20 @@ def api_review():
         return jsonify({"error": "unknown batch/row"}), 404
 
     sheet = "none"
-    if batch.get("sheet_url") and sheets_writer.enabled():
+    if batch.get("sheet_binding") and sheets_writer.enabled():
+        # Run-in-place batch: write straight into the team's own sheet row.
+        try:
+            ok = sheets_writer.write_decision_bound(
+                batch["sheet_binding"], row_id,
+                hvac=payload.get("hvac_systems", ""),
+                optimizer_fit=payload.get("optimizer_fit", ""),
+                periscope_fit=payload.get("periscope_fit", ""),
+                note=payload.get("note", ""))
+            sheet = "updated" if ok else "row_not_found"
+        except Exception as e:
+            log.error(f"Bound sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)
+            sheet = "error"
+    elif batch.get("sheet_url") and sheets_writer.enabled():
         try:
             ok = sheets_writer.write_decision(
                 batch["sheet_url"], batch.get("table_headers", []),

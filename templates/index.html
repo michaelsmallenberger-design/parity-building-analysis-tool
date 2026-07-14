@@ -7,74 +7,82 @@
         justify-content: center;
         align-items: center;
         min-height: 100vh;
+        margin: 0;
+        background: #0d0f12;
+        color: #e6e8eb;
     }
     .container {
-        background-color: white;
-        padding: 2rem 3rem;
-        border-radius: 10px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        background: #161a20;
+        border: 1px solid #262b33;
+        padding: 2.2rem 2.6rem;
+        border-radius: 14px;
         text-align: center;
-        max-width: 500px;
+        max-width: 560px;
+        width: calc(100% - 2rem);
     }
-    .logo {
-        width: 80px;
-        height: 80px;
-        margin-bottom: 1rem;
+    .logo { width: 64px; height: 64px; margin-bottom: .6rem; }
+    h1 { margin: 0 0 .3rem; color: #e6e8eb; font-size: 22px; }
+    .blurb { font-size: .95rem; color: #9aa3ad; margin: 0 0 1.6rem; }
+    .steps {
+        text-align: left; font-size: .9rem; color: #c7ccd2;
+        background: #0f1216; border: 1px solid #222833; border-radius: 10px;
+        padding: .9rem 1.1rem .9rem 2rem; margin: 0 0 1.6rem;
     }
-    .blurb {
-        font-size: 0.9rem;
-        color: #666;
-        margin-top: -0.5rem;
-        margin-bottom: 1.5rem;
+    .steps li { margin: .3rem 0; }
+    form.sheet { display: flex; flex-direction: column; gap: .8rem; }
+    input[type="url"] {
+        background: #0f1216; color: #e6e8eb; border: 1px solid #333b45;
+        border-radius: 8px; padding: 12px 14px; font-size: 15px; width: 100%;
+        box-sizing: border-box;
     }
-    h1 {
-        margin-top: 0;
-        color: #2c3e50;
+    input[type="url"]::placeholder { color: #6b7280; }
+    .go {
+        background: #2563eb; color: white; border: none; padding: 13px 25px;
+        border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 15px;
     }
-    h2 {
-        margin-top: 0;
-        color: #2c3e50;
-        font-size: 16px;
-        font-weight: normal;
-    }
-    form {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 1rem;
-    }
+    .go:hover { background: #1d4ed8; }
+    .hint { font-size: .8rem; color: #6b7280; margin-top: .2rem; }
+    details { margin-top: 1.4rem; text-align: left; }
+    summary { cursor: pointer; color: #9aa3ad; font-size: .85rem; }
+    details form { display: flex; flex-direction: column; gap: .8rem; margin-top: .8rem; align-items: flex-start; }
     input[type="file"] {
-        border: 2px dashed #ddd;
-        border-radius: 5px;
-        padding: 1rem;
-        cursor: pointer;
+        border: 2px dashed #333b45; border-radius: 8px; padding: 1rem;
+        cursor: pointer; color: #9aa3ad; width: 100%; box-sizing: border-box;
     }
     input[type="submit"] {
-        background-color: #3498db;
-        color: white;
-        border: none;
-        padding: 12px 25px;
-        border-radius: 5px;
-        cursor: pointer;
-        font-weight: bold;
-        transition: background-color 0.3s ease;
+        background: #1e232b; color: #cfd4da; border: 1px solid #333b45;
+        padding: 10px 20px; border-radius: 8px; cursor: pointer;
     }
-    input[type="submit"]:hover {
-        background-color: #2980b9;
-    }
+    .reviews-link { display: inline-block; margin-top: 1.6rem; color: #4d9fff; font-size: .9rem; text-decoration: none; }
+    .reviews-link:hover { text-decoration: underline; }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="container">
-    <h1>Building Analysis Tool</h1>
-    <h2>Made for <img src="/static/images/Parity-Logo.png" alt="Parity Icon" width="42"> by <a href="https://github.com/mahkuhse">Max Chen</a></h2>
-    <p class="blurb">
-        Upload a CSV or Excel file with a list of addresses to begin analyzing.
-    </p>
-    <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" required accept=".csv,.xlsx,.xls">
-        <input type="submit" value="Start Analysis">
+    <img class="logo" src="/static/images/Parity-Logo.png" alt="Parity">
+    <h1>Cooling Tower Analyzer</h1>
+    <p class="blurb">Paste your building list's Google Sheet link — the answers get written back into your sheet.</p>
+    <ol class="steps">
+        <li>Paste the link to your Google Sheet below and hit <strong>Analyze</strong>.</li>
+        <li>Wait a few minutes (about 10&ndash;15 seconds per building).</li>
+        <li>Open the review page it gives you, click what you see on each building — every Submit fills in <em>your</em> sheet, live.</li>
+    </ol>
+    <form class="sheet" action="{{ url_for('upload_sheet') }}" method="post">
+        <input type="url" name="sheet_link" required
+               placeholder="https://docs.google.com/spreadsheets/d/…">
+        <button class="go" type="submit">Analyze my sheet</button>
+        <div class="hint">First time with a new sheet? Share it with
+            <strong>sheet-writer@gen-lang-client-0702830838.iam.gserviceaccount.com</strong> as Editor first.</div>
     </form>
+    <details>
+        <summary>Have a .xlsx/.csv file instead of a Google Sheet?</summary>
+        <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" required accept=".csv,.xlsx,.xls">
+            <input type="submit" value="Upload &amp; analyze file">
+        </form>
+        <div class="hint">File uploads create a new results sheet in the Shared Drive instead of writing back in place.</div>
+    </details>
+    <a class="reviews-link" href="/reviews">View all past batches &rarr;</a>
 </div>
 {% endblock %}

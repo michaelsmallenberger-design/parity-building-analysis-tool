@@ -42,14 +42,17 @@ def list_batches() -> list:
 
 
 def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
-               table_headers: list = None, table_rows: list = None) -> None:
+               table_headers: list = None, table_rows: list = None,
+               sheet_binding: dict = None) -> None:
     """Persist a batch's web_entries (with images) for the review page, plus the
     ORIGINAL uploaded table (headers + rows, all the user's columns) so the finished
-    Google Sheet can be assembled from the human picks later."""
+    Google Sheet can be assembled from the human picks later. sheet_binding is set
+    for run-in-place batches: decisions write into the team's own sheet."""
     write_json(_path(job_id), {
         "job_id": job_id,
         "title": title,
         "sheet_url": sheet_url,
+        "sheet_binding": sheet_binding,
         "created": datetime.utcnow().isoformat(),
         "table_headers": table_headers or [],
         "table_rows": table_rows or [],
