@@ -147,6 +147,9 @@ class BackgroundWorker:
                     if table_df is not None:
                         headers, rows = _table_from_df(table_df)
                     title = Path(csv_path).stem or job_id
+                    if result.get("sheet_tab"):
+                        # Multi-tab workbook: make WHICH tab ran unmissable.
+                        title = f"{title} — {result['sheet_tab']}"
                     _bid, review_url, sheet_url = _finalize_batch(
                         web_results, title, headers, rows)
                     result["review_url"] = review_url
