@@ -18,8 +18,14 @@ HVAC_SYSTEMS = ["Cooling Tower", "Chiller", "Exhaust Fan", "RTU", "AHU", "PTAC",
 # Reviewers sometimes see no relevant HVAC at all; "None" is a submittable answer,
 # mutually exclusive with the systems above. Not part of the taxonomy itself.
 NONE_OPTION = "None"
-# Separate fit/status classification (single choice) — the sheet's second dropdown.
-FIT_OPTIONS = ["Optimizer", "Periscope", "Unclear", "Bad"]
+# Two per-product fit classifications (single choice each) — the sheet's
+# "Optimizer Fit" and "Periscope Fit" dropdowns, mirroring the team's TAM
+# sheet format (2026-07-13 directive; replaces the old single Fit column).
+FIT_COLUMNS = ["Optimizer Fit", "Periscope Fit"]
+FIT_OPTIONS = ["Good", "Bad", "Not Sure"]
+# Vocabulary of the RETIRED single Fit column — still needed to recognize a
+# legacy fit column in re-uploaded sheets (so it isn't mistaken for HVAC).
+LEGACY_FIT_VALUES = ["Optimizer", "Periscope", "Unclear", "Bad"]
 # AI verdicts that mean "cooling tower present" -> pre-check Cooling Tower for the reviewer.
 _AI_POSITIVE = {"confirmed", "registry_confirmed", "likely", "cooling_tower_present"}
 _IMG_SLOTS = [
@@ -105,15 +111,24 @@ def _card(e):
         else:
             pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
         chips += f'<button type="button" class="chip{pre}"{dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
-    fitchips = ""
-    for fo in FIT_OPTIONS:
-        pre = " sel" if (reviewed and fo == human.get("fit")) else ""
-        fitchips += f'<button type="button" class="fitchip{pre}"{dis} data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>'
+    fit_keys = {"Optimizer Fit": "optimizer_fit", "Periscope Fit": "periscope_fit"}
+    fitrows = ""
+    for col in FIT_COLUMNS:
+        picked_fit = human.get(fit_keys[col], "") if reviewed else ""
+        chips_f = ""
+        for fo in FIT_OPTIONS:
+            pre = " sel" if fo == picked_fit else ""
+            chips_f += (f'<button type="button" class="fitchip{pre}"{dis} '
+                        f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>')
+        fitrows += (f'<div class="label">{_html.escape(col)}:</div>'
+                    f'<div class="fitchips" data-col="{fit_keys[col]}">{chips_f}</div>')
 
     if reviewed:
         saved = "✓ saved: " + str(human.get("hvac_systems", ""))
-        if human.get("fit"):
-            saved += " · " + str(human["fit"])
+        for col in FIT_COLUMNS:
+            v = human.get(fit_keys[col])
+            if v:
+                saved += f" · {col.split()[0]}: {v}"
         status = f'<span class="status ok">{_html.escape(saved)}</span>'
     else:
         status = '<span class="status"></span>'
@@ -134,8 +149,7 @@ def _card(e):
   <div class="review">
     <div class="label">HVAC systems you see (check all):</div>
     <div class="chips">{chips}</div>
-    <div class="label">Fit:</div>
-    <div class="fitchips">{fitchips}</div>
+    {fitrows}
     <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}">
     <button type="button" class="submit"{dis} onclick="submitCard(this)">Submit</button>
     {status}
@@ -219,15 +233,17 @@ async function submitCard(btn){{
   const sys=[...card.querySelectorAll('.chip.sel')].map(c=>c.dataset.sys);
   const status=card.querySelector('.status');
   if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return;}}
-  const fitEl=card.querySelector('.fitchip.sel');
+  const fits={{}};
+  card.querySelectorAll('.fitchips').forEach(g=>{{const s=g.querySelector('.fitchip.sel');fits[g.dataset.col]=s?s.dataset.fit:'';}});
   const payload={{job_id:JOB,row_id:card.dataset.rid,address:card.dataset.addr,ai_verdict:card.dataset.ai,
-    hvac_systems:sys.join(', '),fit:fitEl?fitEl.dataset.fit:'',note:card.querySelector('.note').value}};
+    hvac_systems:sys.join(', '),optimizer_fit:fits.optimizer_fit||'',periscope_fit:fits.periscope_fit||'',
+    note:card.querySelector('.note').value}};
   btn.disabled=true;status.textContent='saving…';status.className='status';
   try{{
     if(WEBHOOK){{const r=await fetch(WEBHOOK,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
       if(!r.ok)throw new Error('HTTP '+r.status);}}
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
-    status.textContent='✓ saved: '+payload.hvac_systems+(payload.fit?' · '+payload.fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
+    status.textContent='✓ saved: '+payload.hvac_systems+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
     card.classList.add('done');card.querySelectorAll('.chip,.fitchip').forEach(c=>c.disabled=true);
     done++;document.getElementById('done').textContent=done;
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
