@@ -1500,5 +1500,9 @@ def process_address_list(
 
     return {
         "web_results": web_results,
-        "html_url": html_url
+        "html_url": html_url,
+        # The parsed upload (post dropna, address column normalized), 1:1 and
+        # in order with web_results — the caller finalizes it into the review
+        # batch + Google Sheet. Not JSON-serializable; pop before write_result.
+        "table_df": df,
     }
