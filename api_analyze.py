@@ -21,6 +21,7 @@ those become inline `data:image/jpeg;base64,...` URIs — the returned web_entry
 fully self-contained and report_audit embeds it directly. No object storage.
 """
 import base64
+import csv
 import logging
 import os
 import re
@@ -32,12 +33,16 @@ from pathlib import Path
 import pandas as pd
 import requests
 from flask import Blueprint, jsonify, request, Response
+from werkzeug.utils import secure_filename
 
-from tasks_local import _process_one_address, _build_web_entry, ADDRESS_VARIANTS
+from job_queue import batch_size_limit, reserve_usage_limit
+from tasks_local import (_process_one_address, _build_web_entry, ADDRESS_VARIANTS,
+                         _pick_excel_tab)
 from report_audit import build_audit_report
 from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS, LEGACY_FIT_VALUES
 import review_store
 import sheets_writer
+import intake_resolver
 
 log = logging.getLogger("api")
 
@@ -57,6 +62,54 @@ ADDRESS_COLUMNS = [
 ]
 BORO_COLUMNS = ["Boro_Area", "boro_area", "Borough", "borough", "City", "city"]
 ZIP_COLUMNS = ["Zip", "ZIP", "zip", "Zip Code", "zip code", "Postal Code", "postal code"]
+
+
+class MappingConfirmationRequired(ValueError):
+    """An automated file source was intentionally stopped before analysis."""
+
+    def __init__(self, resolution):
+        super().__init__(resolution.get("reason") or "address-column mapping needs confirmation")
+        self.resolution = resolution
+
+
+def _file_row_limit() -> int:
+    """Honor the legacy file limit without allowing it above the global batch cap."""
+    try:
+        configured = max(1, int(os.environ.get("ANALYZE_FILE_MAX_ROWS", batch_size_limit())))
+    except ValueError:
+        configured = batch_size_limit()
+    return min(configured, batch_size_limit())
+
+
+def _batch_limit_error(count: int):
+    limit = batch_size_limit()
+    if count > limit:
+        return jsonify({
+            "error": f"Batch has {count} rows, above the safety limit of {limit}.",
+            "max_batch_rows": limit,
+        }), 400
+    return None
+
+
+def _reserve_api_quota(address_count: int):
+    """Reserve capacity before an in-request endpoint starts paid analysis."""
+    allowed, current_usage, message = reserve_usage_limit(address_count)
+    if not allowed:
+        return jsonify({
+            "error": message,
+            "current_usage": current_usage,
+            "retryable": False,
+        }), 429
+    return None
+
+
+def _entry_is_failure(entry: dict) -> bool:
+    return bool(entry.get("error") or "(no address in row)" in (entry.get("notes") or ""))
+
+
+def _result_counts(results: list) -> tuple[int, int]:
+    failed = sum(1 for entry in results if _entry_is_failure(entry))
+    return len(results) - failed, failed
 
 
 class Base64Sink:
@@ -99,7 +152,24 @@ def require_key(fn):
 
 @api.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    required = ["GOOGLE_MAPS_API_KEY", "MAPBOX_API_KEY", "GEMINI_API_KEY", "ANALYZE_API_KEY"]
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    # This endpoint is Render's liveness probe, so keep it HTTP 200. The body
+    # tells operators whether a live process is actually ready to analyze.
+    try:
+        from vlm import metrics_snapshot as _vlm_metrics_snapshot
+        vlm_metrics = _vlm_metrics_snapshot()
+    except Exception:  # Health must remain a liveness probe if optional VLM deps are unavailable.
+        vlm_metrics = {}
+    return jsonify({
+        "status": "ok" if not missing else "degraded",
+        "pipeline_ready": not missing,
+        "missing_configuration": missing,
+        "grok_exception_paths_available": bool(os.environ.get("XAI_API_KEY", "").strip()),
+        "intake_metrics": intake_resolver.metrics_snapshot(),
+        "review_metrics": vlm_metrics,
+        "max_batch_rows": batch_size_limit(),
+    })
 
 
 def _analyze_one(address, boro_area=None, zip_code=None, total=1):
@@ -163,17 +233,93 @@ def _read_csv_with_fallback(path):
     last_error = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return pd.read_csv(path, encoding=encoding, sep=None, engine="python")
+            # Restrict delimiter detection to actual CSV-like separators. Pandas'
+            # unrestricted ``sep=None`` can mistake a character in a one-column
+            # header (for example the "s" in "Address") for the delimiter.
+            with open(path, "r", encoding=encoding, newline="") as f:
+                sample = f.read(4096)
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+            except csv.Error:
+                delimiter = ","
+            return pd.read_csv(path, encoding=encoding, sep=delimiter)
         except Exception as e:
             last_error = e
     raise last_error
+
+
+def _read_excel_with_worker_tab_selection(path, suffix):
+    """Use the exact same leftmost-address-tab rule as queued browser jobs."""
+    engine = "openpyxl" if suffix == ".xlsx" else None
+    all_sheets = pd.read_excel(path, sheet_name=None, engine=engine)
+    _tab, df = _pick_excel_tab(all_sheets)
+    if df is None:
+        raise ValueError("Excel file has no non-empty worksheet")
+    return df
+
+
+def _read_excel_tabs(path, suffix):
+    """Return non-empty workbook tabs in source order for shared intake resolution."""
+    engine = "openpyxl" if suffix == ".xlsx" else None
+    all_sheets = pd.read_excel(path, sheet_name=None, engine=engine)
+    tabs = [(str(name), df) for name, df in all_sheets.items()
+            if df is not None and len(df.columns) and len(df)]
+    if not tabs:
+        raise ValueError("Excel file has no non-empty worksheet")
+    return tabs
+
+
+def _resolver_tab_from_dataframe(df, tab="Uploaded file"):
+    headers = [str(column).strip() for column in df.columns]
+    rows = []
+    for values in df.head(intake_resolver.sample_row_limit()).itertuples(index=False, name=None):
+        rows.append(["" if pd.isna(value) else str(value).strip() for value in values])
+    return {"tab": tab, "headers": headers, "rows": rows}
+
+
+def _resolve_dataframe_columns(df):
+    """Return an analysis copy, preserving the original frame for output Sheets."""
+    return _resolve_dataframe_tabs([("Uploaded file", df)])
+
+
+def _resolve_dataframe_tabs(frames):
+    """Resolve a selected workbook tab and its address columns once, safely."""
+    resolver_tabs = [_resolver_tab_from_dataframe(df, tab=name) for name, df in frames]
+    resolution = intake_resolver.resolve_schema(resolver_tabs, ADDRESS_VARIANTS)
+    if resolution["status"] == "deterministic":
+        mapping = resolution["mapping"]
+        selected = next((df for name, df in frames if str(name) == mapping["tab"]), None)
+        if selected is None:
+            raise MappingConfirmationRequired({"reason": "Selected workbook tab disappeared"})
+        return (selected, mapping["address_column"], mapping.get("city_column"),
+                mapping.get("zip_column"))
+    if resolution["status"] != "suggested" or not resolution.get("auto_approved"):
+        raise MappingConfirmationRequired(resolution)
+
+    mapping = resolution["mapping"]
+    df = next((frame for name, frame in frames if str(name) == mapping["tab"]), None)
+    if df is None:
+        raise MappingConfirmationRequired({"reason": "Suggested workbook tab disappeared"})
+    # Compose all rows, not only the bounded Grok sample. This field is internal
+    # and the original DataFrame remains attached for the created result Sheet.
+    all_rows = [["" if pd.isna(value) else str(value).strip() for value in values]
+                for values in df.itertuples(index=False, name=None)]
+    all_addresses = intake_resolver.compose_addresses(list(df.columns), all_rows, mapping)
+    internal_col = "__parity_analysis_address"
+    analysis_df = df.copy()
+    analysis_df[internal_col] = all_addresses
+    analysis_df.attrs["parity_source_df"] = df
+    analysis_df.attrs["parity_intake_mapping"] = mapping
+    # The internal address already contains city/state/ZIP.  Returning source
+    # columns here would make tasks_local append them a second time.
+    return analysis_df, internal_col, None, None
 
 
 def _read_uploaded_address_file(uploaded_file):
     """Read uploaded CSV/XLS/XLSX and return /api/run-compatible address items."""
     filename = uploaded_file.filename or "addresses"
     suffix = Path(filename).suffix.lower()
-    max_rows = int(os.environ.get("ANALYZE_FILE_MAX_ROWS", "250"))
+    max_rows = _file_row_limit()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".xlsx") as tmp:
         uploaded_file.save(tmp.name)
@@ -182,14 +328,14 @@ def _read_uploaded_address_file(uploaded_file):
     try:
         try:
             if suffix in {".xlsx", ".xls"}:
-                df = pd.read_excel(tmp_path)
+                frames = _read_excel_tabs(tmp_path, suffix)
             elif suffix == ".csv":
-                df = _read_csv_with_fallback(tmp_path)
+                frames = [("Uploaded file", _read_csv_with_fallback(tmp_path))]
             elif not suffix:
                 try:
-                    df = pd.read_excel(tmp_path)
+                    frames = _read_excel_tabs(tmp_path, ".xlsx")
                 except Exception:
-                    df = _read_csv_with_fallback(tmp_path)
+                    frames = [("Uploaded file", _read_csv_with_fallback(tmp_path))]
             else:
                 raise ValueError("Upload must be an .xlsx, .xls, or .csv file")
         except ValueError:
@@ -202,8 +348,12 @@ def _read_uploaded_address_file(uploaded_file):
         except OSError:
             pass
 
-    if df.empty:
+    if not frames:
         raise ValueError("Uploaded file has no rows")
+
+    # Legacy helper retained for callers outside /api/run-file. It predates
+    # multi-tab mapping and continues to use the first non-empty tab.
+    df = frames[0][1]
 
     address_col = _first_present(df.columns, ADDRESS_COLUMNS)
     if not address_col:
@@ -244,21 +394,21 @@ def _read_uploaded_dataframe(uploaded_file):
     Returns (df, address_col, boro_col, zip_col)."""
     filename = uploaded_file.filename or "upload"
     suffix = Path(filename).suffix.lower()
-    max_rows = int(os.environ.get("ANALYZE_FILE_MAX_ROWS", "250"))
+    max_rows = _file_row_limit()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".xlsx") as tmp:
         uploaded_file.save(tmp.name)
         tmp_path = tmp.name
     try:
         try:
             if suffix in {".xlsx", ".xls"}:
-                df = pd.read_excel(tmp_path)
+                frames = _read_excel_tabs(tmp_path, suffix)
             elif suffix == ".csv":
-                df = _read_csv_with_fallback(tmp_path)
+                frames = [("Uploaded file", _read_csv_with_fallback(tmp_path))]
             elif not suffix:
                 try:
-                    df = pd.read_excel(tmp_path)
+                    frames = _read_excel_tabs(tmp_path, ".xlsx")
                 except Exception:
-                    df = _read_csv_with_fallback(tmp_path)
+                    frames = [("Uploaded file", _read_csv_with_fallback(tmp_path))]
             else:
                 raise ValueError("Upload must be an .xlsx, .xls, or .csv file")
         except ValueError:
@@ -270,20 +420,13 @@ def _read_uploaded_dataframe(uploaded_file):
             os.remove(tmp_path)
         except OSError:
             pass
-    if df.empty:
+    if not frames:
         raise ValueError("Uploaded file has no rows")
-    address_col = _first_present(df.columns, ADDRESS_COLUMNS)
-    if not address_col:
+    if any(len(df) > max_rows for _name, df in frames):
         raise ValueError(
-            "Uploaded file must include an address column (e.g. Address, Property "
-            f"Address, Street Address). Found columns: {list(df.columns)}")
-    if len(df) > max_rows:
-        raise ValueError(
-            f"Uploaded file has {len(df)} rows, above the safety limit of {max_rows}. "
+            f"Uploaded file has more than {max_rows} rows in a worksheet, above the safety limit. "
             "Split the file or raise ANALYZE_FILE_MAX_ROWS on the server.")
-    boro_col = _first_present(df.columns, BORO_COLUMNS)
-    zip_col = _first_present(df.columns, ZIP_COLUMNS)
-    return df, address_col, boro_col, zip_col
+    return _resolve_dataframe_tabs(frames)
 
 
 @api.route("/analyze", methods=["POST"])
@@ -296,6 +439,9 @@ def analyze():
     address = (body.get("address") or "").strip()
     if not address:
         return jsonify({"error": "missing 'address'"}), 400
+    quota_error = _reserve_api_quota(1)
+    if quota_error:
+        return quota_error
     return jsonify(_analyze_one(address, body.get("boro_area"), body.get("zip")))
 
 
@@ -512,20 +658,35 @@ def run():
     addresses = body.get("addresses")
     if not isinstance(addresses, list) or not addresses:
         return jsonify({"error": "'addresses' must be a non-empty list"}), 400
+    limit_error = _batch_limit_error(len(addresses))
+    if limit_error:
+        return limit_error
     title = (body.get("title") or "Cooling Tower Analysis").strip()
 
-    results = []
-    total = len(addresses)
+    usable_addresses = []
     for item in addresses:
         addr, boro, zc = _coerce_address_item(item)
-        if not addr:
-            continue
+        if addr:
+            usable_addresses.append((addr, boro, zc))
+    if not usable_addresses:
+        return jsonify({"error": "'addresses' contains no usable addresses"}), 400
+    quota_error = _reserve_api_quota(len(usable_addresses))
+    if quota_error:
+        return quota_error
+
+    results = []
+    total = len(usable_addresses)
+    for addr, boro, zc in usable_addresses:
         results.append(_analyze_one(addr, boro, zc, total=total))
 
     batch_id, review_url, sheet_url = _finalize_batch(results, title)
     html_str = build_audit_report(results, title=title)
+    successful, failed = _result_counts(results)
     response = Response(html_str, mimetype="text/html")
     response.headers["X-Address-Count"] = str(total)
+    response.headers["X-Success-Count"] = str(successful)
+    response.headers["X-Failure-Count"] = str(failed)
+    response.headers["X-Completion-Status"] = "completed_with_errors" if failed else "completed"
     response.headers["X-Review-URL"] = review_url
     if sheet_url:
         response.headers["X-Sheet-URL"] = sheet_url
@@ -546,10 +707,29 @@ def run_file():
 
     try:
         df, addr_col, boro_col, zip_col = _read_uploaded_dataframe(uploaded)
+    except MappingConfirmationRequired as e:
+        # n8n/API sources can auto-run only a locally validated high-confidence
+        # mapping.  Returning a clear non-2xx result prevents a guessed column
+        # from ever starting paid address processing.
+        return jsonify({
+            "ok": False,
+            "status": "mapping_confirmation_required",
+            "error": str(e),
+            "mapping": e.resolution.get("mapping"),
+        }), 409
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    title = (request.form.get("title") or Path(uploaded.filename).stem or "Cooling Tower Analysis").strip()
+    usable_addresses = sum(
+        1 for value in df[addr_col]
+        if pd.notna(value) and str(value).strip() and str(value).strip().lower() != "nan"
+    )
+    quota_error = _reserve_api_quota(usable_addresses)
+    if quota_error:
+        return quota_error
+
+    uploaded_name = secure_filename(uploaded.filename or "") or "upload"
+    title = (request.form.get("title") or Path(uploaded_name).stem or "Cooling Tower Analysis").strip()
     results = []
     total = len(df)
     for _, row in df.iterrows():
@@ -564,13 +744,29 @@ def run_file():
         zc = str(row.get(zip_col)).strip() if zip_col and pd.notna(row.get(zip_col)) else None
         results.append(_analyze_one(addr, boro, zc, total=total))
 
-    headers, rows = _table_from_df(df)
+    # A Grok-assisted file may have an internal derived address field.  The
+    # result Sheet always receives the untouched original table.
+    source_df = df.attrs.get("parity_source_df", df)
+    headers, rows = _table_from_df(source_df)
     batch_id, review_url, sheet_url = _finalize_batch(results, title, headers, rows)
-    resp = jsonify({"ok": True, "count": total, "review_url": review_url, "sheet_url": sheet_url})
+    successful, failed = _result_counts(results)
+    completion_status = "completed_with_errors" if failed else "completed"
+    resp = jsonify({
+        "ok": True,
+        "status": completion_status,
+        "count": total,
+        "success_count": successful,
+        "failure_count": failed,
+        "review_url": review_url,
+        "sheet_url": sheet_url,
+    })
     resp.headers["X-Review-URL"] = review_url
+    resp.headers["X-Success-Count"] = str(successful)
+    resp.headers["X-Failure-Count"] = str(failed)
+    resp.headers["X-Completion-Status"] = completion_status
     if sheet_url:
         resp.headers["X-Sheet-URL"] = sheet_url
-    resp.headers["X-Uploaded-Filename"] = uploaded.filename
+    resp.headers["X-Uploaded-Filename"] = uploaded_name
     return resp
 
 
@@ -655,12 +851,30 @@ def batch_rerun(batch_id):
     if not b:
         return jsonify({"error": "batch not found"}), 404
     body = request.get_json(silent=True) or {}
-    rows_req = body.get("rows") or [{"row_id": f["row_id"]} for f in _entry_failures(b)]
+    explicit_rows = body.get("rows")
+    if explicit_rows is not None and not isinstance(explicit_rows, list):
+        return jsonify({"error": "'rows' must be a list when provided"}), 400
+    rows_req = explicit_rows or [{"row_id": f["row_id"]} for f in _entry_failures(b)]
     if not rows_req:
         return jsonify({"ok": True, "batch_id": batch_id, "rerun": [],
                         "remaining_failures": 0})
+    limit_error = _batch_limit_error(len(rows_req))
+    if limit_error:
+        return limit_error
+    if any(not isinstance(row, dict) for row in rows_req):
+        return jsonify({"error": "every item in 'rows' must be an object"}), 400
 
     by_rid = {review_store._rid(e): e for e in b.get("entries", [])}
+    chargeable = 0
+    for r in rows_req:
+        old = by_rid.get(str(r.get("row_id", "")).strip())
+        addr = (r.get("address") or (old or {}).get("address") or "").strip()
+        if old and addr:
+            chargeable += 1
+    quota_error = _reserve_api_quota(chargeable)
+    if quota_error:
+        return quota_error
+
     headers = b.get("table_headers", [])
     addr_header = _first_present(headers, ADDRESS_COLUMNS)
     fresh, statuses, table_updates = {}, [], {}

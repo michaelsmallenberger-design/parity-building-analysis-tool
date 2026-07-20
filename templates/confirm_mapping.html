@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<main class="container" style="max-width:720px;margin:48px auto;padding:0 20px;">
+  <h1>Confirm the building-address setup</h1>
+  <p>Parity could not find a standard address header, so it used Grok to suggest this setup. No buildings have been analyzed and nothing has been written to your Sheet yet.</p>
+  <dl style="display:grid;grid-template-columns:180px 1fr;gap:12px 18px;background:#f5f7f8;padding:20px;border-radius:12px;">
+    <dt><strong>Sheet tab</strong></dt><dd>{{ mapping.tab }}</dd>
+    <dt><strong>Address / street</strong></dt><dd>{{ mapping.address_column }}</dd>
+    {% if mapping.city_column %}<dt><strong>City</strong></dt><dd>{{ mapping.city_column }}</dd>{% endif %}
+    {% if mapping.state_column %}<dt><strong>State</strong></dt><dd>{{ mapping.state_column }}</dd>{% endif %}
+    {% if mapping.zip_column %}<dt><strong>ZIP</strong></dt><dd>{{ mapping.zip_column }}</dd>{% endif %}
+  </dl>
+  <p>Parity will use these columns only to build an internal analysis address. It will not rename, move, or overwrite your original data, formatting, or existing dropdowns.</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="go" type="submit">Use this setup and analyze the Sheet</button>
+  </form>
+</main>
+{% endblock %}

@@ -464,7 +464,10 @@
     cancelButton.textContent = 'Cancel Job';
     cancelButton.className = 'cancel-button';
     cancelButton.onclick = function() {
-        fetch(`/cancel/${jobId}`, { method: 'POST' })
+        fetch(`/cancel/${jobId}`, {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': '{{ csrf_token }}' }
+        })
             .then(response => response.json())
             .then(data => {
                 if (data.status === 'cancelled') {

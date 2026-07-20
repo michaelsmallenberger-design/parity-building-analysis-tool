@@ -353,6 +353,8 @@ def _build_web_entry(
         grok_is_house = grok.get('is_house')
         gemini_reasoning = gemini.get('reasoning', '')
         grok_reasoning = grok.get('reasoning', '')
+        model_path = consensus_dict.get('model_path', '')
+        grok_fallback_used = bool(consensus_dict.get('grok_fallback_used', False))
     else:
         confidence_score = None
         reasoning = ''
@@ -366,6 +368,8 @@ def _build_web_entry(
         grok_is_house = None
         gemini_reasoning = ''
         grok_reasoning = ''
+        model_path = ''
+        grok_fallback_used = False
 
     entry = {
         "address": full_address,
@@ -385,6 +389,8 @@ def _build_web_entry(
         "grok_verdict": grok_verdict,
         "grok_confidence": grok_confidence,
         "grok_reasoning": grok_reasoning,
+        "model_path": model_path,
+        "grok_fallback_used": grok_fallback_used,
         "is_house": is_house,
         "gemini_is_house": gemini_is_house,
         "grok_is_house": grok_is_house,

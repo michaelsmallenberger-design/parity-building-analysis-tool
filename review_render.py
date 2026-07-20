@@ -48,8 +48,7 @@ def _fmt_conf(c):
 
 
 def _model_boxes(e, reasoning):
-    """Gemini (green) + Grok (black) reasoning boxes; fall back to the combined
-    consensus string for rows with no per-model split (registry / area-gate)."""
+    """Show Gemini and only show Grok when the emergency fallback actually ran."""
     gv = _html.escape(str(e.get("gemini_verdict") or "").strip())
     gr = _html.escape(str(e.get("gemini_reasoning") or "").strip())
     kv = _html.escape(str(e.get("grok_verdict") or "").strip())
@@ -63,6 +62,9 @@ def _model_boxes(e, reasoning):
     if kr or kv:
         out += (f'<div class="mbox grok"><div class="mh">Grok · {kv or "—"} '
                 f'{_fmt_conf(e.get("grok_confidence"))}</div>{kr or "(no detail)"}</div>')
+    path = _html.escape(str(e.get("model_path") or "").replace("_", " "))
+    if path:
+        out += f'<div class="model-path">Model path: {path}</div>'
     return out
 
 
@@ -157,12 +159,13 @@ def _card(e):
 </article>'''
 
 
-def build_review_page(entries, job_id, webhook_url="", title="Cooling Tower Review"):
+def build_review_page(entries, job_id, webhook_url="", title="Cooling Tower Review", csrf_token=""):
     cards = "\n".join(_card(e) for e in entries)
     total = len(entries)
     done0 = sum(1 for e in entries if e.get("human"))
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
+    csrf = json.dumps(str(csrf_token))
     return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)}</title>
@@ -206,15 +209,25 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .submit{{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 18px;cursor:pointer}}
 .submit:disabled{{background:#2a3340;color:#6b7280;cursor:not-allowed}}
 .status{{margin-left:12px;color:#9aa3ad;font-size:13px}}.status.ok{{color:#37b24d}}.status.err{{color:#ff6b6b}}
+.bulk-review{{background:#161a20;border:1px solid #2f9e44;border-radius:12px;padding:16px;margin:24px 0 8px}}
+.bulk-review .help{{color:#9aa3ad;font-size:13px;margin-bottom:10px}}
+.bulk-submit{{background:#2f9e44;color:#fff;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;font-weight:600}}
+.bulk-submit:disabled{{background:#2a3340;color:#6b7280;cursor:not-allowed}}
+.bulk-status{{margin-left:12px;color:#9aa3ad;font-size:13px}}.bulk-status.ok{{color:#37b24d}}.bulk-status.err{{color:#ff6b6b}}
 #lb{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:99;padding:24px;text-align:center;cursor:zoom-out}}
 #lb img{{max-width:96%;max-height:92vh;border:2px solid #fff;border-radius:6px}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
 <div class="sub"><span id="done">{done0}</span>/{total} reviewed · check the HVAC systems you see on each building; it writes back to the sheet</div></header>
 <div class="wrap">{cards}</div>
+<div class="bulk-review">
+  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>). Incomplete cards are skipped so nothing is guessed.</div>
+  <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed</button>
+  <span id="bulk-status" class="bulk-status"></span>
+</div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
 <script>
-const WEBHOOK={wh}, JOB={jid};let done={done0};
+const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf};let done={done0};
 function zoom(s){{document.getElementById('lbi').src=s;document.getElementById('lb').style.display='block';}}
 function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
   imgs.forEach((im,k)=>im.classList.toggle('cur',k==i));
@@ -232,7 +245,7 @@ async function submitCard(btn){{
   const card=btn.closest('.card');
   const sys=[...card.querySelectorAll('.chip.sel')].map(c=>c.dataset.sys);
   const status=card.querySelector('.status');
-  if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return;}}
+  if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return 'incomplete';}}
   const fits={{}};
   card.querySelectorAll('.fitchips').forEach(g=>{{const s=g.querySelector('.fitchip.sel');fits[g.dataset.col]=s?s.dataset.fit:'';}});
   const payload={{job_id:JOB,row_id:card.dataset.rid,address:card.dataset.addr,ai_verdict:card.dataset.ai,
@@ -240,13 +253,47 @@ async function submitCard(btn){{
     note:card.querySelector('.note').value}};
   btn.disabled=true;status.textContent='saving…';status.className='status';
   try{{
-    if(WEBHOOK){{const r=await fetch(WEBHOOK,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
-      if(!r.ok)throw new Error('HTTP '+r.status);}}
+    let reply={{}};
+    if(WEBHOOK){{const headers={{'Content-Type':'application/json'}};if(CSRF_TOKEN)headers['X-CSRF-Token']=CSRF_TOKEN;const r=await fetch(WEBHOOK,{{method:'POST',headers,body:JSON.stringify(payload)}});
+      try{{reply=await r.json();}}catch(e){{reply={{}};}}
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      if(reply.sheet==='error' || reply.sheet==='row_not_found'){{
+        status.textContent=reply.sheet==='row_not_found'
+          ? 'saved locally; Sheet row not found - retry'
+          : 'saved locally; Sheet update failed - retry';
+        status.className='status err';btn.disabled=false;return 'sheet_error';
+      }}
+    }}
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
     status.textContent='✓ saved: '+payload.hvac_systems+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
     card.classList.add('done');card.querySelectorAll('.chip,.fitchip').forEach(c=>c.disabled=true);
     done++;document.getElementById('done').textContent=done;
+    return 'saved';
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
+}}
+function setBulkStatus(message, kind){{
+  const s=document.getElementById('bulk-status');s.textContent=message;s.className='bulk-status'+(kind?' '+kind:'');
+}}
+async function submitAll(){{
+  const bulk=document.getElementById('submit-all');
+  const pending=[...document.querySelectorAll('.card')].filter(c=>!c.classList.contains('done'));
+  const ready=pending.filter(c=>c.querySelectorAll('.chip.sel').length>0);
+  const skipped=pending.length-ready.length;
+  if(!ready.length){{
+    setBulkStatus(pending.length?'Nothing submitted - choose an HVAC system or None first.':'Everything is already reviewed.','err');
+    return;
+  }}
+  bulk.disabled=true;setBulkStatus('Saving '+ready.length+' completed card'+(ready.length===1?'':'s')+'...');
+  let saved=0,failed=0;
+  for(const card of ready){{
+    const result=await submitCard(card.querySelector('.submit'));
+    if(result==='saved')saved++;else failed++;
+  }}
+  bulk.disabled=false;
+  const parts=[saved+' saved'];
+  if(skipped)parts.push(skipped+' skipped - needs a selection');
+  if(failed)parts.push(failed+' need retry');
+  setBulkStatus(parts.join(' Â· '),(skipped||failed)?'err':'ok');
 }}
 </script></body></html>'''
 

@@ -6,13 +6,14 @@ import os
 import json
 import shutil
 import logging
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
 log = logging.getLogger(__name__)
 
 # Base storage directory
-STORAGE_BASE = Path(os.getenv("STORAGE_DIR", "storage"))
+STORAGE_BASE = Path(os.getenv("STORAGE_DIR", "storage")).resolve()
 
 # Subdirectories
 UPLOADS_DIR = STORAGE_BASE / "uploads"
@@ -34,6 +35,20 @@ def init_storage():
     else:
         log.warning("No base URL detected - file URLs will be relative paths. Set APP_URL env var for absolute URLs.")
 
+
+def _storage_path(blob_path: str) -> Path:
+    """Resolve a caller-provided storage path without allowing it to escape the
+    configured storage directory.  Blob paths are persisted and later exposed by
+    /files, so this check is the common boundary for reads and writes alike."""
+    if not isinstance(blob_path, str) or not blob_path.strip():
+        raise ValueError("storage path must be a non-empty relative path")
+    candidate = (STORAGE_BASE / blob_path).resolve()
+    try:
+        candidate.relative_to(STORAGE_BASE)
+    except ValueError as e:
+        raise ValueError("storage path must stay inside STORAGE_DIR") from e
+    return candidate
+
 def upload_file(local_path: str, dest_path: str) -> str:
     """
     Upload a file to local storage.
@@ -45,10 +60,10 @@ def upload_file(local_path: str, dest_path: str) -> str:
     Returns:
         The dest_path for reference
     """
-    dest_full = STORAGE_BASE / dest_path
+    dest_full = _storage_path(dest_path)
     dest_full.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(local_path, dest_full)
-    return dest_path
+    return Path(dest_path).as_posix()
 
 def get_file_path(blob_path: str) -> Path:
     """
@@ -60,7 +75,7 @@ def get_file_path(blob_path: str) -> Path:
     Returns:
         Full local Path object
     """
-    return STORAGE_BASE / blob_path
+    return _storage_path(blob_path)
 
 def file_exists(blob_path: str) -> bool:
     """Check if a file exists in storage."""
@@ -113,8 +128,28 @@ def make_url(blob_path: str, base_url: str = None) -> str:
     return f"{base_url.rstrip('/')}/files/{blob_path}"
 
 def write_json(blob_path: str, data: dict):
-    """Write JSON data to a file."""
-    write_file(blob_path, json.dumps(data).encode('utf-8'))
+    """Atomically replace a JSON file.
+
+    A process crash or a concurrent reader must never observe a half-written
+    review/result document.  ``os.replace`` is atomic when the temporary file
+    lives beside the destination (as it does here).
+    """
+    dest_full = get_file_path(blob_path)
+    dest_full.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest_full.name}.", suffix=".tmp",
+                                   dir=dest_full.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, dest_full)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 def read_json(blob_path: str) -> dict:
     """Read JSON data from a file."""
