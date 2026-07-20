@@ -17,7 +17,10 @@ This guide will help you deploy the Building Analysis Tool to Railway (free host
 1. **Railway Account**: Sign up at https://railway.app (GitHub login recommended)
 2. **Environment Variables**: You'll need:
    - `MAPBOX_API_KEY` - Your Mapbox API token
-   - `GOOGLE_API_KEY` - Your Google Maps API key
+   - `GOOGLE_MAPS_API_KEY` - Your Google Maps Platform key (Geocoding + Static Maps + Address Validation)
+   - `GEMINI_API_KEY` - Google AI Studio key (Gemini VLM verification)
+   - `XAI_API_KEY` - xAI key (Grok VLM verification)
+   - `ANALYZE_API_KEY` - shared secret for the stateless /api/* routes (optional; n8n path)
 
 ---
 
@@ -55,7 +58,9 @@ git push -u origin main
 4. Add these variables:
    ```
    MAPBOX_API_KEY=<your-mapbox-key>
-   GOOGLE_API_KEY=<your-google-key>
+   GOOGLE_MAPS_API_KEY=<your-google-key>
+   GEMINI_API_KEY=<your-gemini-key>
+   XAI_API_KEY=<your-xai-key>
    PORT=8080
    ```
 
@@ -104,7 +109,9 @@ railway init
 
 ```bash
 railway variables set MAPBOX_API_KEY="your-key-here"
-railway variables set GOOGLE_API_KEY="your-key-here"
+railway variables set GOOGLE_MAPS_API_KEY="your-key-here"
+railway variables set GEMINI_API_KEY="your-key-here"
+railway variables set XAI_API_KEY="your-key-here"
 railway variables set PORT=8080
 ```
 
@@ -188,7 +195,7 @@ Or trigger a redeploy from the Railway dashboard (Deployments → Redeploy).
 **Error**: "Application crashed on startup"
 - Check Railway logs: `railway logs`
 - Verify environment variables are set correctly
-- Ensure MAPBOX_API_KEY and GOOGLE_API_KEY are valid
+- Ensure GOOGLE_MAPS_API_KEY, MAPBOX_API_KEY, GEMINI_API_KEY, and XAI_API_KEY are valid
 
 **Error**: "Worker not starting"
 - Check logs for database initialization errors
