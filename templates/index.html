@@ -69,19 +69,21 @@
         <li>Open the review page it gives you, click what you see on each building — every Submit fills in <em>your</em> sheet, live.</li>
     </ol>
     <form class="sheet" action="{{ url_for('upload_sheet') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="url" name="sheet_link" required
                placeholder="https://docs.google.com/spreadsheets/d/…">
         <button class="go" type="submit">Analyze my sheet</button>
         <div class="hint">First time with a new sheet? Share it with
-            <strong>sheet-writer@gen-lang-client-0702830838.iam.gserviceaccount.com</strong> as Editor first.</div>
+            <strong>sheet-writer@gen-lang-client-0702830838.iam.gserviceaccount.com</strong> as Editor first. If your headers are unusual, Parity shows you the proposed address setup before it starts.</div>
     </form>
     <details>
         <summary>Have a .xlsx/.csv file instead of a Google Sheet?</summary>
         <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="file" name="file" required accept=".csv,.xlsx,.xls">
             <input type="submit" value="Upload &amp; analyze file">
         </form>
-        <div class="hint">File uploads create a new results sheet in the Shared Drive instead of writing back in place.</div>
+        <div class="hint">File uploads create a new results sheet in the Shared Drive. Your source columns stay unchanged; unusual headers are shown for confirmation before analysis starts.</div>
     </details>
     <a class="reviews-link" href="/reviews">View all past batches &rarr;</a>
 </div>

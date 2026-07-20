@@ -6,23 +6,169 @@ import os
 import json
 import uuid
 import logging
+import threading
+import time
+import hmac
+import secrets
+from datetime import timedelta
 import pandas as pd
 from pathlib import Path
-from flask import Flask, request, render_template, redirect, url_for, jsonify, abort, Response
+from flask import Flask, request, render_template, redirect, url_for, jsonify, abort, Response, session
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
 # Local modules
-from job_queue import init_db, enqueue_job, get_job_status, cancel_job, check_usage_limit
+from job_queue import (init_db, enqueue_job, get_job_status, cancel_job,
+                       check_usage_limit, batch_size_limit)
 from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists, read_file
 from worker import start_worker
-from api_analyze import api as api_blueprint
+from api_analyze import (api as api_blueprint, _read_csv_with_fallback,
+                         _read_excel_with_worker_tab_selection, _read_excel_tabs)
 from review_render import build_review_page
 import review_store
 import sheets_writer
+import intake_resolver
 import requests
 
 # Initialize Flask app
 app = Flask(__name__)
 app.register_blueprint(api_blueprint)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a deliberately small set of common true values from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Browser access is intentionally separate from the API key used by n8n. On
+# Render it is enabled and fails closed if either secret is missing; local
+# development stays convenient unless explicitly opted in.
+_session_secret = os.getenv("SITE_SESSION_SECRET", "").strip() or secrets.token_urlsafe(48)
+app.config.update(
+    SECRET_KEY=_session_secret,
+    SITE_ACCESS_ENABLED=_env_flag("SITE_ACCESS_ENABLED"),
+    SITE_ACCESS_PASSWORD=os.getenv("SITE_ACCESS_PASSWORD", ""),
+    SITE_ACCESS_SESSION_HOURS=max(1, int(os.getenv("SITE_ACCESS_SESSION_HOURS", "12"))),
+    SESSION_COOKIE_SECURE=_env_flag("SITE_COOKIE_SECURE"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+app.permanent_session_lifetime = timedelta(hours=app.config["SITE_ACCESS_SESSION_HOURS"])
+
+_login_attempts = {}
+_login_attempts_lock = threading.Lock()
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 8
+
+
+def _browser_access_enabled() -> bool:
+    return bool(app.config.get("SITE_ACCESS_ENABLED"))
+
+
+def _browser_access_configured() -> bool:
+    return bool(app.config.get("SITE_ACCESS_PASSWORD", "").strip()
+                and os.getenv("SITE_SESSION_SECRET", "").strip())
+
+
+def _csrf_token() -> str:
+    """Issue a session-bound token for browser state-changing requests."""
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def _template_security_context():
+    return {"csrf_token": _csrf_token()}
+
+
+def _csrf_is_valid() -> bool:
+    expected = session.get("csrf_token", "")
+    supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or ""
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
+
+
+def _browser_route_is_exempt(path: str) -> bool:
+    # The stateless API remains protected by its existing X-API-Key. The review
+    # relay is browser-only and is deliberately covered by this gate.
+    return (path in {"/access", "/health", "/api/health"}
+            or path.startswith("/static/")
+            or (path.startswith("/api/") and path != "/api/review"))
+
+
+def _safe_next_url(value: str) -> str:
+    """Accept same-site relative redirects only; avoid open redirect links."""
+    if value and value.startswith("/") and not value.startswith("//"):
+        return value
+    return url_for("index")
+
+
+def _login_client_key() -> str:
+    # Do not trust a user-provided forwarded-for header as the brute-force
+    # limiter identity.
+    return request.remote_addr or "unknown"
+
+
+def _login_retry_after(client_key: str) -> int:
+    now = time.time()
+    with _login_attempts_lock:
+        attempts = [stamp for stamp in _login_attempts.get(client_key, [])
+                    if stamp > now - _LOGIN_WINDOW_SECONDS]
+        _login_attempts[client_key] = attempts
+        if len(attempts) < _LOGIN_MAX_FAILURES:
+            return 0
+        return max(1, int(_LOGIN_WINDOW_SECONDS - (now - attempts[0])))
+
+
+def _record_login_failure(client_key: str) -> None:
+    now = time.time()
+    with _login_attempts_lock:
+        attempts = [stamp for stamp in _login_attempts.get(client_key, [])
+                    if stamp > now - _LOGIN_WINDOW_SECONDS]
+        attempts.append(now)
+        _login_attempts[client_key] = attempts
+
+
+def _clear_login_failures(client_key: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(client_key, None)
+
+
+def _access_error_response(status: int, message: str):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": message}), status
+    return render_template("access.html", configured=False, error=message,
+                           next_url=_safe_next_url(request.full_path)), status
+
+
+@app.before_request
+def require_browser_password():
+    """Protect interactive routes without changing the n8n API contract."""
+    if not _browser_access_enabled() or _browser_route_is_exempt(request.path):
+        return None
+    if not _browser_access_configured():
+        return _access_error_response(503, "Site access is not configured. Contact the Parity administrator.")
+    if not session.get("browser_access_granted"):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "site password required"}), 401
+        return redirect(url_for("access", next=_safe_next_url(request.full_path)))
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _csrf_is_valid():
+        return _access_error_response(403, "Your session needs to be refreshed. Please sign in again.")
+    return None
+
+# Flask applies this before parsing multipart uploads or a large JSON body. Keep
+# it configurable: 50 MiB comfortably covers normal spreadsheets while bounding
+# memory/disk use on the single Render instance.
+try:
+    _max_request_bytes = max(1, int(os.getenv("MAX_REQUEST_BYTES", str(50 * 1024 * 1024))))
+except ValueError:
+    _max_request_bytes = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = _max_request_bytes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +178,196 @@ log = logging.getLogger("app")
 
 # Configuration
 UPLOAD_FOLDER = Path(os.getenv('UPLOAD_FOLDER', 'temp_uploads'))
-UPLOAD_FOLDER.mkdir(exist_ok=True)
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+_SHEET_PREFLIGHT_TTL_SECONDS = max(60, int(os.getenv("SHEET_INTAKE_CONFIRM_TTL_SECONDS", "900")))
+_sheet_preflights = {}
+_sheet_preflights_lock = threading.Lock()
+
+
+def _safe_upload_filename(filename: str) -> str:
+    """Return a harmless supported spreadsheet filename or reject it early."""
+    safe_name = secure_filename(filename or "")
+    if not safe_name or Path(safe_name).suffix.lower() not in {".csv", ".xlsx", ".xls"}:
+        raise ValueError("Please upload a .csv, .xlsx, or .xls file.")
+    return safe_name
+
+
+def _remember_sheet_preflight(link, resolution):
+    """Keep only mapping metadata server-side for the current browser handoff."""
+    token = uuid.uuid4().hex
+    record = {
+        "sheet_link": link,
+        "mapping": resolution["mapping"],
+        "fingerprint": resolution["fingerprint"],
+        "expires_at": time.time() + _SHEET_PREFLIGHT_TTL_SECONDS,
+    }
+    with _sheet_preflights_lock:
+        now = time.time()
+        for key, value in list(_sheet_preflights.items()):
+            if value.get("expires_at", 0) <= now:
+                _sheet_preflights.pop(key, None)
+        _sheet_preflights[token] = record
+    return token, record
+
+
+def _remember_file_preflight(local_path, filename, resolution):
+    """Keep a browser upload pending until its exceptional mapping is approved.
+
+    The upload itself is already in the app's temporary storage.  This record
+    intentionally contains only its local handle plus mapping metadata -- not
+    the sampled customer rows sent to the resolver.
+    """
+    token = uuid.uuid4().hex
+    record = {
+        "kind": "file",
+        "local_path": str(local_path),
+        "filename": filename,
+        "mapping": resolution["mapping"],
+        "fingerprint": resolution["fingerprint"],
+        "expires_at": time.time() + _SHEET_PREFLIGHT_TTL_SECONDS,
+    }
+    with _sheet_preflights_lock:
+        now = time.time()
+        for key, value in list(_sheet_preflights.items()):
+            if value.get("expires_at", 0) <= now:
+                _sheet_preflights.pop(key, None)
+        _sheet_preflights[token] = record
+    return token, record
+
+
+def _get_sheet_preflight(token):
+    with _sheet_preflights_lock:
+        record = _sheet_preflights.get(token)
+        if not record or record.get("expires_at", 0) <= time.time():
+            _sheet_preflights.pop(token, None)
+            return None
+        return dict(record)
+
+
+def _discard_sheet_preflight(token):
+    with _sheet_preflights_lock:
+        _sheet_preflights.pop(token, None)
+
+
+def _enqueue_bound_sheet(binding):
+    """Queue a live Sheet without ever rewriting its source address columns."""
+    processing_rows = binding.get("processing_rows", [])
+    total = len(processing_rows)
+    if not total:
+        return None, render_template('error.html', error_title="No rows found",
+                                     error_message=f"Tab '{binding['tab']}' has a header but no data rows."), 400
+    max_rows = batch_size_limit()
+    if total > max_rows:
+        return None, render_template('error.html', error_title="Batch too large",
+                                     error_message=(f"Tab '{binding['tab']}' has {total} rows. The per-batch "
+                                                    f"limit is {max_rows}; split it into smaller batches.")), 400
+    can_process, current_usage, error_msg = check_usage_limit(total)
+    if not can_process:
+        return None, render_template('error.html', error_title="Monthly Limit Reached",
+                                     error_message=error_msg, current_usage=current_usage), 403
+    job_id = str(uuid.uuid4())
+    local_path = UPLOAD_FOLDER / f"{job_id}.csv"
+    import csv as _csv
+    with open(local_path, 'w', newline='', encoding='utf-8') as fh:
+        writer = _csv.writer(fh)
+        writer.writerow(binding.get("processing_headers", binding["headers"]))
+        writer.writerows(processing_rows)
+    csv_blob_path = f"uploads/{job_id}/{job_id}.csv"
+    upload_file(str(local_path), csv_blob_path)
+    try:
+        enqueue_job(job_id, {
+            "job_id": job_id,
+            "csv_path": csv_blob_path,
+            "total": total,
+            "sheet_binding": binding,
+        })
+        log.info("Job %s enqueued from live sheet %s (%d rows, mapping=%s)",
+                 job_id, binding["title"], total, binding.get("intake_mapping", {}).get("method", "deterministic"))
+    except Exception as e:
+        log.error("Failed to enqueue bound sheet job: %s", e, exc_info=True)
+        return None, (f"Error enqueuing job: {e}", 500)
+    return job_id, None
+
+
+def _load_browser_dataframe(path, filename):
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        return _read_excel_with_worker_tab_selection(path, suffix)
+    return _read_csv_with_fallback(path)
+
+
+def _load_browser_frames(path, filename):
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        return _read_excel_tabs(path, suffix)
+    return [("Uploaded file", _read_csv_with_fallback(path))]
+
+
+def _dataframe_intake_tab(df, tab="Uploaded file"):
+    headers = [str(column).strip() for column in df.columns]
+    rows = []
+    for values in df.head(intake_resolver.sample_row_limit()).itertuples(index=False, name=None):
+        rows.append(["" if pd.isna(value) else str(value).strip() for value in values])
+    return {"tab": str(tab), "headers": headers, "rows": rows}
+
+
+def _selected_browser_frame(frames, mapping):
+    selected = next((df for tab, df in frames if str(tab) == str(mapping.get("tab") or "")), None)
+    if selected is None:
+        raise ValueError("The selected worksheet is no longer available")
+    return selected
+
+
+def _enqueue_file_dataframe(df, filename, mapping):
+    """Queue a derived Address-only work file while retaining the untouched table."""
+    headers = [str(column).strip() for column in df.columns]
+    rows = [["" if pd.isna(value) else str(value) for value in values]
+            for values in df.itertuples(index=False, name=None)]
+    addresses = intake_resolver.compose_addresses(headers, rows, mapping)
+    total = len(rows)
+    if not total:
+        return None, render_template('error.html', error_title="No rows found",
+                                     error_message="The uploaded file has a header but no data rows."), 400
+    max_rows = batch_size_limit()
+    if total > max_rows:
+        return None, render_template('error.html', error_title="Batch too large",
+                                     error_message=(f"This file has {total} rows. The per-batch limit is {max_rows}; "
+                                                    "split it into smaller files.")), 400
+    can_process, current_usage, error_msg = check_usage_limit(total)
+    if not can_process:
+        return None, render_template('error.html', error_title="Monthly Limit Reached",
+                                     error_message=error_msg, current_usage=current_usage), 403
+    job_id = str(uuid.uuid4())
+    local_path = UPLOAD_FOLDER / f"{job_id}.csv"
+    import csv as _csv
+    with open(local_path, 'w', newline='', encoding='utf-8') as fh:
+        writer = _csv.writer(fh)
+        writer.writerow(["Address"])
+        writer.writerows([[address] for address in addresses])
+    csv_blob_path = f"uploads/{job_id}/{job_id}.csv"
+    upload_file(str(local_path), csv_blob_path)
+    try:
+        enqueue_job(job_id, {
+            "job_id": job_id,
+            "csv_path": csv_blob_path,
+            "total": total,
+            "original_table": {"headers": headers, "rows": rows},
+            "intake_mapping": mapping,
+        })
+    except Exception as e:
+        log.error("Failed to enqueue uploaded file: %s", e, exc_info=True)
+        return None, (f"Error enqueuing job: {e}", 500)
+    return job_id, None
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_error):
+    message = (f"Request is too large. The maximum request size is "
+               f"{app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)} MiB.")
+    if request.path.startswith("/api/"):
+        return jsonify({"error": message}), 413
+    return render_template("error.html", error_title="Upload too large",
+                           error_message=message), 413
 
 # Initialize on startup
 init_db()
@@ -52,9 +387,56 @@ def index():
     """Upload form page."""
     return render_template('index.html')
 
+
+@app.route('/access', methods=['GET', 'POST'])
+def access():
+    """One shared-password entry point for the internal browser workflow."""
+    if not _browser_access_enabled():
+        return redirect(url_for("index"))
+
+    next_url = _safe_next_url(request.values.get("next", ""))
+    if not _browser_access_configured():
+        return render_template("access.html", configured=False,
+                               error="Site access is not configured. Contact the Parity administrator.",
+                               next_url=next_url), 503
+    if request.method == "GET":
+        if session.get("browser_access_granted"):
+            return redirect(next_url)
+        return render_template("access.html", configured=True, error="", next_url=next_url)
+
+    if not _csrf_is_valid():
+        return render_template("access.html", configured=True,
+                               error="Please refresh the page and try again.", next_url=next_url), 403
+    client_key = _login_client_key()
+    retry_after = _login_retry_after(client_key)
+    if retry_after:
+        return render_template("access.html", configured=True,
+                               error=f"Too many attempts. Try again in {retry_after // 60 + 1} minutes.",
+                               next_url=next_url), 429
+    submitted = request.form.get("password", "")
+    configured = app.config["SITE_ACCESS_PASSWORD"].strip()
+    if not hmac.compare_digest(submitted, configured):
+        _record_login_failure(client_key)
+        return render_template("access.html", configured=True,
+                               error="That password is not correct.", next_url=next_url), 401
+
+    _clear_login_failures(client_key)
+    session.clear()
+    session.permanent = True
+    session["browser_access_granted"] = True
+    _csrf_token()
+    return redirect(next_url)
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """End the shared browser session without touching API credentials."""
+    session.clear()
+    return redirect(url_for("access"))
+
 @app.route('/upload', methods=['POST'])
 def upload():
-    """Handle CSV upload and enqueue processing job."""
+    """Handle a browser spreadsheet without mutating its source columns."""
     if 'file' not in request.files:
         return redirect(request.url)
 
@@ -62,48 +444,55 @@ def upload():
     if not f or f.filename == '':
         return redirect(request.url)
 
-    filename = f.filename
-    local_path = UPLOAD_FOLDER / filename
+    try:
+        filename = _safe_upload_filename(f.filename)
+    except ValueError as e:
+        return render_template("error.html", error_title="Unsupported upload",
+                               error_message=str(e)), 400
+
+    # Keep the human-readable filename, but make the local path unique even
+    # when two people upload a same-named CSV at the same time.
+    upload_token = str(uuid.uuid4())
+    local_path = UPLOAD_FOLDER / f"{upload_token}-{filename}"
     f.save(local_path)
 
-    # Count rows for progress tracking
+    # Parse before taking a quota or queueing work.  This accepts the same
+    # CSV/XLSX/XLS formats as /api/run-file and runs the shared resolver first.
     try:
-        df = pd.read_csv(local_path)
-        total = len(df)
+        frames = _load_browser_frames(local_path, filename)
     except Exception as e:
-        log.warning(f"Could not count CSV rows: {e}")
-        total = 0
+        log.warning(f"Could not read browser upload: {e}")
+        local_path.unlink(missing_ok=True)
+        return render_template("error.html", error_title="Can't read spreadsheet",
+                               error_message="The uploaded file is not a readable CSV or Excel workbook."), 400
 
-    # Check monthly usage limit
-    can_process, current_usage, error_msg = check_usage_limit(total)
-    if not can_process:
-        log.warning(f"Usage limit check failed: {error_msg}")
-        local_path.unlink(missing_ok=True)  # Clean up uploaded file
-        return render_template('error.html',
-                             error_title="Monthly Limit Reached",
-                             error_message=error_msg,
-                             current_usage=current_usage), 403
+    if not frames:
+        local_path.unlink(missing_ok=True)
+        return render_template("error.html", error_title="No rows found",
+                               error_message="The upload has a header but no data rows."), 400
 
-    # Create job ID
-    job_id = str(uuid.uuid4())
+    from tasks_local import ADDRESS_VARIANTS
+    tabs = [_dataframe_intake_tab(df, tab) for tab, df in frames]
+    resolution = intake_resolver.resolve_schema(tabs, ADDRESS_VARIANTS)
+    if resolution["status"] == "suggested":
+        token, _record = _remember_file_preflight(local_path, filename, resolution)
+        return redirect(url_for('confirm_sheet_mapping', token=token))
+    if resolution["status"] != "deterministic":
+        local_path.unlink(missing_ok=True)
+        return render_template(
+            'error.html', error_title="We couldn't identify the address column",
+            error_message=(resolution.get("reason") or
+                           "Use an Address, Property Address, Street Address, or Building Address column and try again.")), 400
 
-    # Upload CSV to storage
-    csv_blob_path = f"uploads/{job_id}/{filename}"
-    upload_file(str(local_path), csv_blob_path)
-
-    # Enqueue job for background processing
     try:
-        enqueue_job(job_id, {
-            "job_id": job_id,
-            "csv_path": csv_blob_path,
-            "total": total
-        })
-        log.info(f"Job {job_id} enqueued with {total} addresses")
-    except Exception as e:
-        log.error(f"Failed to enqueue job: {e}", exc_info=True)
-        return f"Error enqueuing job: {e}", 500
-
-    return redirect(url_for('results', job_id=job_id, total=total))
+        df = _selected_browser_frame(frames, resolution["mapping"])
+    except ValueError as e:
+        return render_template('error.html', error_title="Can't use that workbook",
+                               error_message=str(e)), 400
+    job_id, error_response = _enqueue_file_dataframe(df, filename, resolution["mapping"])
+    if error_response:
+        return error_response
+    return redirect(url_for('results', job_id=job_id, total=len(df)))
 
 
 @app.route('/upload-sheet', methods=['POST'])
@@ -119,7 +508,20 @@ def upload_sheet():
                                error_message="The server has no Google credential."), 500
     from tasks_local import ADDRESS_VARIANTS
     try:
-        binding, headers, data_rows = sheets_writer.read_bound_sheet(link, ADDRESS_VARIANTS)
+        inspected = sheets_writer.inspect_bound_sheet(link)
+        resolution = intake_resolver.resolve_schema(inspected["tabs"], ADDRESS_VARIANTS)
+        if resolution["status"] == "deterministic":
+            binding, _headers, _data_rows = sheets_writer.read_bound_sheet(link, ADDRESS_VARIANTS)
+        elif resolution["status"] == "suggested":
+            # Browser users always approve a Grok suggestion before any quota,
+            # queue, review-column, or Sheet write action can happen.
+            token, _record = _remember_sheet_preflight(link, resolution)
+            return redirect(url_for('confirm_sheet_mapping', token=token))
+        else:
+            return render_template(
+                'error.html', error_title="We couldn't identify the address column",
+                error_message=(resolution.get("reason") or
+                               "Rename the address column to Address, Property Address, Street Address, or Building Address and try again.")), 400
     except ValueError as e:
         return render_template('error.html', error_title="Can't use that link",
                                error_message=str(e)), 400
@@ -131,35 +533,50 @@ def upload_sheet():
                            "the analyzer robot as Editor: sheet-writer@gen-lang-client-0702830838"
                            ".iam.gserviceaccount.com — then paste the link again.")), 400
 
-    total = len(data_rows)
-    if not total:
-        return render_template('error.html', error_title="No rows found",
-                               error_message=f"Tab '{binding['tab']}' has a header but no data rows."), 400
-    can_process, current_usage, error_msg = check_usage_limit(total)
-    if not can_process:
-        return render_template('error.html', error_title="Monthly Limit Reached",
-                               error_message=error_msg, current_usage=current_usage), 403
+    job_id, error_response = _enqueue_bound_sheet(binding)
+    if error_response:
+        return error_response
+    return redirect(url_for('results', job_id=job_id, total=len(binding.get("processing_rows", []))))
 
-    job_id = str(uuid.uuid4())
-    local_path = UPLOAD_FOLDER / f"{job_id}.csv"
-    import csv as _csv
-    with open(local_path, 'w', newline='', encoding='utf-8') as fh:
-        w = _csv.writer(fh)
-        w.writerow(binding["headers"])
-        w.writerows(data_rows)
-    csv_blob_path = f"uploads/{job_id}/{job_id}.csv"
-    upload_file(str(local_path), csv_blob_path)
+
+@app.route('/confirm-sheet-mapping/<token>', methods=['GET', 'POST'])
+def confirm_sheet_mapping(token):
+    """Browser-only confirmation for an exceptional Grok sheet mapping."""
+    record = _get_sheet_preflight(token)
+    if not record:
+        return render_template('error.html', error_title="Mapping confirmation expired",
+                               error_message="Open the Sheet through Parity again to create a fresh mapping."), 410
+    if request.method == 'GET':
+        return render_template('confirm_mapping.html', mapping=record["mapping"])
     try:
-        enqueue_job(job_id, {
-            "job_id": job_id,
-            "csv_path": csv_blob_path,
-            "total": total,
-            "sheet_binding": binding,
-        })
-        log.info(f"Job {job_id} enqueued from live sheet '{binding['title']}' ({total} rows)")
+        if record.get("kind") == "file":
+            source_path = Path(record["local_path"])
+            if not source_path.is_file():
+                raise ValueError("The temporary upload is no longer available")
+            frames = _load_browser_frames(source_path, record["filename"])
+            tabs = [_dataframe_intake_tab(frame, tab) for tab, frame in frames]
+            fingerprint = intake_resolver.schema_fingerprint(tabs)
+            if fingerprint != record["fingerprint"]:
+                raise ValueError("The uploaded file changed before confirmation")
+            valid, _reason, _ratio = intake_resolver.validate_mapping(
+                tabs, record["mapping"])
+            if not valid:
+                raise ValueError("The suggested columns are no longer usable")
+            df = _selected_browser_frame(frames, record["mapping"])
+            job_id, error_response = _enqueue_file_dataframe(
+                df, record["filename"], record["mapping"])
+        else:
+            binding, _headers, _rows = sheets_writer.read_bound_sheet_mapping(
+                record["sheet_link"], record["mapping"], record["fingerprint"])
+            job_id, error_response = _enqueue_bound_sheet(binding)
     except Exception as e:
-        log.error(f"Failed to enqueue sheet job: {e}", exc_info=True)
-        return f"Error enqueuing job: {e}", 500
+        log.warning("Sheet mapping confirmation failed: %s", e)
+        return render_template('error.html', error_title="Mapping needs another look",
+                               error_message="The Sheet changed or the suggested columns are no longer usable. Start again from the Sheet link."), 409
+    if error_response:
+        return error_response
+    _discard_sheet_preflight(token)
+    total = len(df) if record.get("kind") == "file" else len(binding.get("processing_rows", []))
     return redirect(url_for('results', job_id=job_id, total=total))
 
 @app.route('/results/<job_id>')
@@ -259,6 +676,16 @@ def reviews_index():
     unguessable elsewhere but this page trades that for accessibility."""
     import html as _h
     rows = ""
+    try:
+        from drive_inbox import pending_mappings
+        for item in pending_mappings():
+            title = _h.escape(item.get("name") or "Incoming Sheet")
+            reason = _h.escape(item.get("reason") or "Address column needs setup")
+            rows += (f'<div class="row"><div class="meta"><div class="t">Needs setup: {title}</div>'
+                     f'<div class="s">{reason}. Paste the Sheet link into Parity to review the suggested mapping.</div>'
+                     '</div></div>')
+    except Exception as e:
+        log.warning("Could not read pending Drive mappings: %s", e)
     for b in review_store.list_batches():
         title = _h.escape(b.get("title") or b["batch_id"])
         created = _h.escape((b.get("created") or "")[:10])
@@ -307,6 +734,7 @@ def review_page(job_id):
         job_id=job_id,
         webhook_url="/api/review",  # same-origin relay -> no browser CORS
         title=batch.get("title", "Cooling Tower Review"),
+        csrf_token=_csrf_token(),
     )
     return Response(html, mimetype="text/html")
 
@@ -360,7 +788,10 @@ def api_review():
         except Exception as e:
             log.error(f"Sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)
             sheet = "error"
-    return jsonify({"ok": True, "sheet": sheet})
+    # The local decision is saved even when the live Sheet write fails. Keep
+    # that distinction explicit so the review page cannot report a false
+    # "saved" state to the operator.
+    return jsonify({"ok": True, "local_saved": True, "sheet": sheet})
 
 
 # -----------------------------------------------------------------------------
@@ -368,10 +799,24 @@ def api_review():
 # -----------------------------------------------------------------------------
 @app.route('/health')
 def health():
-    """Health check endpoint for Render."""
+    """Liveness plus the two local dependencies the browser flow needs.
+
+    Keep HTTP 200 for Render's liveness probe; callers can use ``status`` and
+    the component flags to distinguish a merely-running process from a ready
+    one without exposing any secret configuration.
+    """
+    worker_thread = getattr(worker, "thread", None)
+    worker_running = bool(getattr(worker, "running", False)
+                          and worker_thread and worker_thread.is_alive())
+    try:
+        storage_ready = get_file_path("results").is_dir()
+    except Exception:
+        storage_ready = False
+    ready = worker_running and storage_ready
     return jsonify({
-        "status": "healthy",
-        "worker_running": worker is not None
+        "status": "healthy" if ready else "degraded",
+        "worker_running": worker_running,
+        "storage_ready": storage_ready,
     })
 
 # -----------------------------------------------------------------------------

@@ -4,6 +4,7 @@ Stores job metadata and status for background processing.
 """
 import sqlite3
 import json
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +139,19 @@ def get_job_payload(job_id: str):
 
 MONTHLY_ADDRESS_LIMIT = 2500  # Conservative limit to stay under $5/month
 
+
+def batch_size_limit() -> int:
+    """Maximum number of addresses accepted in one interactive/API batch.
+
+    Keep this configurable so an operator can raise it deliberately, while a
+    malformed or accidentally huge upload cannot monopolize the single worker.
+    """
+    raw = os.environ.get("ANALYZE_MAX_BATCH_ROWS", "250")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 250
+
 def get_current_month() -> str:
     """Get current month in YYYY-MM format."""
     return datetime.utcnow().strftime("%Y-%m")
@@ -168,6 +182,50 @@ def check_usage_limit(requested_addresses: int) -> tuple[bool, int, str]:
     if requested_addresses > remaining:
         return False, current_usage, f"Batch size ({requested_addresses}) exceeds remaining monthly quota ({remaining}). Try a smaller batch."
 
+    return True, current_usage, ""
+
+
+def reserve_usage_limit(requested_addresses: int) -> tuple[bool, int, str]:
+    """Atomically check and reserve monthly capacity for an in-request API run.
+
+    Browser jobs retain their existing "count on successful completion" behavior.
+    Stateless API calls have no worker to do that accounting later, so reserving
+    immediately prevents concurrent API calls from bypassing the monthly cap.
+    """
+    requested_addresses = int(requested_addresses)
+    if requested_addresses < 0:
+        raise ValueError("requested_addresses must be non-negative")
+    if requested_addresses == 0:
+        return True, get_monthly_usage(), ""
+
+    current_month = get_current_month()
+    now = datetime.utcnow().isoformat()
+    with _lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT addresses_processed FROM monthly_usage WHERE year_month = ?",
+                (current_month,),
+            ).fetchone()
+            current_usage = row[0] if row else 0
+            remaining = MONTHLY_ADDRESS_LIMIT - current_usage
+            if current_usage >= MONTHLY_ADDRESS_LIMIT:
+                return (False, current_usage,
+                        f"Monthly limit of {MONTHLY_ADDRESS_LIMIT} addresses reached. "
+                        "Resets on 1st of next month.")
+            if requested_addresses > remaining:
+                return (False, current_usage,
+                        f"Batch size ({requested_addresses}) exceeds remaining monthly quota "
+                        f"({remaining}). Try a smaller batch.")
+
+            conn.execute(
+                """INSERT INTO monthly_usage (year_month, addresses_processed, last_updated)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(year_month) DO UPDATE SET
+                     addresses_processed = monthly_usage.addresses_processed + excluded.addresses_processed,
+                     last_updated = excluded.last_updated""",
+                (current_month, requested_addresses, now),
+            )
+            conn.commit()
     return True, current_usage, ""
 
 def increment_usage(addresses_processed: int):

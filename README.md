@@ -94,7 +94,7 @@ For each address:
 6. Run YOLO detections. `MODEL_PATHS` can enable an ensemble; if unset, only `MODEL_PATH` is used.
 7. Convert detections into geo-space and filter them against the footprint.
 8. Render marked detail/wide imagery and a close-up.
-9. Call `vlm.verify_address()` once for the address. Gemini and Grok run in parallel and are combined by consensus.
+9. Call `vlm.verify_address()` once for the address. Gemini is the normal reviewer; Grok is allowed one emergency request only after a technical Gemini failure.
 10. Emit CSV-compatible data plus audit-card web entries.
 
 The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functions still exist in `vlm.py` for compatibility/testing, but the active per-address pipeline uses `verify_address()`.
@@ -104,7 +104,7 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `GOOGLE_MAPS_API_KEY`: Google geocoding, Static Maps imagery, and Address Validation
 - `MAPBOX_API_KEY`: Mapbox fallback geocoding/imagery and dense-core imagery
 - `GEMINI_API_KEY`: Gemini verification
-- `XAI_API_KEY`: Grok verification
+- `XAI_API_KEY` (optional): enables exceptional Grok Sheet mapping and the one-request Gemini emergency fallback; normal analysis and health do not require it
 - `ANALYZE_API_KEY`: required for `/api/analyze`, `/api/run`, `/api/run-file`, `/api/report`, and `/api/batch/*`
 - `GOOGLE_SERVICE_ACCOUNT_JSON` (optional): service-account key enabling `sheets_writer.py` — sheet created at run time, review Submits written live; without it `sheet_url` stays empty
 - `SHEET_SHARE_WITH` (optional): comma-separated emails granted writer access to created sheets
@@ -122,11 +122,14 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MAPBOX_SIZE`: default `768x768`
 - `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
 - `VLM_TIMEOUT_SECONDS`: default `120`
-- `VLM_CONSENSUS_THRESHOLD`: default `0.7`
 - `GEMINI_MODEL`: default `gemini-3.5-flash`
 - `GROK_MODEL`: default `grok-4.3`
 - `GEMINI_THINKING_LEVEL`: default `high`
 - `GROK_REASONING_EFFORT`: default `high`
+- `SHEET_INTAKE_GROK_ENABLED`: default `true` when `XAI_API_KEY` is configured
+- `SHEET_INTAKE_GROK_SAMPLE_ROWS`: capped at `25`, default `25`
+- `SHEET_INTAKE_GROK_AUTO_CONFIDENCE`: Drive/API auto-run threshold, default `0.90`
+- `GEMINI_GROK_EMERGENCY_FALLBACK_ENABLED`: default `true`; limits a technical Gemini fallback to one Grok request
 
 ## Local Development
 
@@ -158,13 +161,14 @@ Render builds from `Dockerfile.railway`. Keep both production model weights comm
 
 ## Render
 
-Render deployment is configured by `render.yaml`. Create a new Render Blueprint from this repo/branch, then fill the five secret values Render asks for:
+Render deployment is configured by `render.yaml`. Create a new Render Blueprint from this repo/branch, then fill the required secret values:
 
 - `GOOGLE_MAPS_API_KEY`
 - `MAPBOX_API_KEY`
 - `GEMINI_API_KEY`
-- `XAI_API_KEY`
 - `ANALYZE_API_KEY`
+
+`XAI_API_KEY` is optional and is only needed for exceptional Grok Sheet mapping or emergency fallback.
 
 See `RENDER_DEPLOYMENT.md` for the exact dashboard steps and smoke test.
 
@@ -174,7 +178,8 @@ These are not pure unit tests; most call external services, use model weights, o
 
 - `python -m compileall app_railway.py api_analyze.py tasks_local.py utils.py geometry.py vlm.py pipeline_render.py report_audit.py job_queue.py worker.py storage_helpers.py`
 - `python test_pipeline_no_vlm.py`: geocoding, imagery, footprints, YOLO; no VLM spend
-- `python test_vlm.py`: legacy VLM harness using real Gemini/Grok calls
+- `python test_vlm.py`: fixture harness (uses Gemini; Grok only after a technical Gemini failure)
+- `python test_intake_vlm_fallback.py`: mocked no-spend coverage for Sheet mapping and Gemini-first fallback
 - `python test_geometry_math.py`: geometry/image diagnostic, not a normal unit test
 
 ## Active Runtime Files

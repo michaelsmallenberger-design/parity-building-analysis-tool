@@ -92,6 +92,79 @@ def _norm(h) -> str:
     return re.sub(r"\s+", " ", str(h)).strip().lower()
 
 
+def inspect_bound_sheet(sheet_url):
+    """Read tab metadata plus bounded samples without creating or editing a Sheet."""
+    from intake_resolver import sample_row_limit
+
+    sid = sheet_id_from_url(sheet_url)
+    if not sid:
+        raise ValueError("That doesn't look like a Google Sheets link.")
+    sheets, _ = _get_services()
+    ss = sheets.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="properties.title,sheets.properties(sheetId,title)").execute()
+    tabs = []
+    for item in ss.get("sheets", []):
+        props = item["properties"]
+        title = props["title"]
+        values = sheets.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"'{title}'!1:{sample_row_limit() + 1}").execute().get("values", [])
+        headers = [str(h).strip() for h in (values[0] if values else [])]
+        tabs.append({
+            "tab": title,
+            "grid_id": props["sheetId"],
+            "headers": headers,
+            "rows": [[str(cell).strip() for cell in row] for row in values[1:]],
+        })
+    return {
+        "spreadsheet_id": sid,
+        "title": ss.get("properties", {}).get("title", ""),
+        "tabs": tabs,
+    }
+
+
+def read_bound_sheet_mapping(sheet_url, mapping, expected_fingerprint=None):
+    """Open one explicitly validated tab and build an internal Address-only feed.
+
+    The returned binding retains the original headers and physical row numbers
+    for live write-back; ``processing_*`` is only the temporary queue input.
+    """
+    from intake_resolver import compose_addresses, schema_fingerprint, validate_mapping
+
+    inspected = inspect_bound_sheet(sheet_url)
+    current_fingerprint = schema_fingerprint(inspected["tabs"])
+    if expected_fingerprint and current_fingerprint != expected_fingerprint:
+        raise ValueError("The Sheet changed after mapping. Review its columns and try again.")
+    valid, reason, normalized = validate_mapping(inspected["tabs"], mapping)
+    if not valid or normalized is None:
+        raise ValueError(f"Can't use the suggested Sheet mapping: {reason}.")
+    selected = next(tab for tab in inspected["tabs"] if tab["tab"] == normalized["tab"])
+    sheets, _ = _get_services()
+    values = sheets.spreadsheets().values().get(
+        spreadsheetId=inspected["spreadsheet_id"], range=f"'{selected['tab']}'").execute().get("values", [])
+    headers = [str(h).strip() for h in (values[0] if values else [])]
+    source_rows, row_numbers = [], []
+    for rn, row in enumerate(values[1:], start=2):
+        cells = [str(cell).strip() for cell in row]
+        if any(cells):
+            source_rows.append(cells + [""] * (len(headers) - len(cells)))
+            row_numbers.append(rn)
+    addresses = compose_addresses(headers, source_rows, normalized)
+    binding = {
+        "spreadsheet_id": inspected["spreadsheet_id"],
+        "grid_id": selected["grid_id"],
+        "tab": selected["tab"],
+        "headers": headers,
+        "row_numbers": row_numbers,
+        "title": f"{inspected['title']} — {selected['tab']}" if inspected["title"] else selected["tab"],
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{inspected['spreadsheet_id']}/edit#gid={selected['grid_id']}",
+        "processing_headers": ["Address"],
+        "processing_rows": [[address] for address in addresses],
+        "intake_mapping": normalized,
+    }
+    return binding, headers, source_rows
+
+
 def read_bound_sheet(sheet_url, address_variants):
     """Open the team's live Google Sheet for run-in-place mode. Picks the
     leftmost tab whose header row has an address column (sales workbooks lead
@@ -139,6 +212,10 @@ def read_bound_sheet(sheet_url, address_variants):
         "row_numbers": row_numbers,
         "title": f"{ss_title} — {props['title']}" if ss_title else props["title"],
         "sheet_url": f"https://docs.google.com/spreadsheets/d/{sid}/edit#gid={props['sheetId']}",
+        # Queue input is separate so Grok-assisted mappings can preserve the
+        # source schema while using a derived internal Address field.
+        "processing_headers": headers,
+        "processing_rows": data_rows,
     }
     return binding, headers, data_rows
 
@@ -166,6 +243,10 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
             missing.append(canon)
         else:
             colmap[canon] = idx
+    # Existing customer columns -- including their validation, colors, widths,
+    # formulas, and custom multi-select dropdowns -- are never reformatted or
+    # revalidated here. We only format/validate columns that Parity appends.
+    created_columns = set(missing)
     next_idx = len(headers)
     if missing:
         start = _col_letter(next_idx)
@@ -182,34 +263,32 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
             body={"values": [[f'=HYPERLINK("{review_url}", "▸ Open review page")']]}).execute()
 
     last_row = max(binding["row_numbers"]) if binding["row_numbers"] else 1
-    hvac_from_template = False
-    template_id = os.environ.get("SHEET_TEMPLATE_ID", "").strip()
-    if template_id:
-        try:
-            tgrid = sheets.spreadsheets().get(
-                spreadsheetId=template_id, fields="sheets.properties.sheetId"
-            ).execute()["sheets"][0]["properties"]["sheetId"]
-            copied = sheets.spreadsheets().sheets().copyTo(
-                spreadsheetId=template_id, sheetId=tgrid,
-                body={"destinationSpreadsheetId": sid}).execute()["sheetId"]
-            c = colmap[HVAC_COL]
-            sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [
-                {"copyPaste": {
-                    "source": {"sheetId": copied, "startRowIndex": 1, "endRowIndex": 2,
-                               "startColumnIndex": 0, "endColumnIndex": 1},
-                    "destination": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": last_row,
-                                    "startColumnIndex": c, "endColumnIndex": c + 1},
-                    "pasteType": "PASTE_DATA_VALIDATION"}},
-                {"deleteSheet": {"sheetId": copied}},
-            ]}).execute()
-            hvac_from_template = True
-        except Exception as e:
-            log.warning("Template validation copy failed (%s); single-select fallback", e)
+    if missing and headers:
+        # Match the team's existing visual treatment without copying any cells,
+        # formulas, or validation from their data. This is format-only and only
+        # targets the new columns to the right of the source table.
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [{
+            "copyPaste": {
+                "source": {"sheetId": grid, "startRowIndex": 0,
+                           "endRowIndex": max(last_row, 2),
+                           "startColumnIndex": len(headers) - 1,
+                           "endColumnIndex": len(headers)},
+                "destination": {"sheetId": grid, "startRowIndex": 0,
+                                "endRowIndex": max(last_row, 2),
+                                "startColumnIndex": len(headers),
+                                "endColumnIndex": next_idx},
+                "pasteType": "PASTE_FORMAT",
+            }
+        }]}).execute()
+    # Same multi-select rule as generated batches: do not attach a single-value
+    # Sheets validation to a newly appended HVAC column. The dark reviewer is
+    # the multi-select control, and its comma-joined result must not be shown
+    # as invalid in the Sheet. Existing customer HVAC dropdowns remain intact.
     reqs = []
     rules = [(OPT_FIT_COL, fit_options), (PERI_FIT_COL, fit_options)]
-    if not hvac_from_template:
-        rules.append((HVAC_COL, hvac_options))
     for canon, options in rules:
+        if canon not in created_columns:
+            continue
         c = colmap[canon]
         reqs.append({"setDataValidation": {
             "range": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": last_row,
@@ -254,8 +333,14 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
     review page submits comma-joined multi-selects. When review_url is given,
     an "Open review page" link is written next to the header row so the sheet
     itself leads back to the review. Returns the sheet URL."""
-    sheets, drive = _get_services()
     folder = os.environ.get("SHEET_PARENT_FOLDER_ID", "").strip()
+    emails = [e.strip() for e in os.environ.get("SHEET_SHARE_WITH", "").split(",") if e.strip()]
+    if not folder and not emails:
+        raise RuntimeError(
+            "Refusing to create a writable Sheet without a parent folder or explicit "
+            "SHEET_SHARE_WITH recipients. Configure one of those settings first."
+        )
+    sheets, drive = _get_services()
     if folder:
         sid = drive.files().create(
             body={"name": title,
@@ -287,30 +372,12 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
     # SHEET_TEMPLATE_ID names a spreadsheet whose first tab holds a multi-select
     # HVAC validation cell (A2, checkbox ticked once by hand), copy that
     # validation onto the HVAC column instead of building a single-select rule.
-    hvac_from_template = False
-    template_id = os.environ.get("SHEET_TEMPLATE_ID", "").strip()
-    if template_id and HVAC_COL in headers and n:
-        try:
-            tgrid = sheets.spreadsheets().get(
-                spreadsheetId=template_id, fields="sheets.properties.sheetId"
-            ).execute()["sheets"][0]["properties"]["sheetId"]
-            copied = sheets.spreadsheets().sheets().copyTo(
-                spreadsheetId=template_id, sheetId=tgrid,
-                body={"destinationSpreadsheetId": sid}).execute()["sheetId"]
-            c = headers.index(HVAC_COL)
-            sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": [
-                {"copyPaste": {
-                    "source": {"sheetId": copied, "startRowIndex": 1, "endRowIndex": 2,
-                               "startColumnIndex": 0, "endColumnIndex": 1},
-                    "destination": {"sheetId": grid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                    "startColumnIndex": c, "endColumnIndex": c + 1},
-                    "pasteType": "PASTE_DATA_VALIDATION"}},
-                {"deleteSheet": {"sheetId": copied}},
-            ]}).execute()
-            hvac_from_template = True
-        except Exception as e:
-            log.warning("Template validation copy failed (%s); falling back to "
-                        "single-select HVAC dropdown", e)
+    # The review page supports multiple HVAC choices and writes them as a
+    # comma-separated human decision. Google Sheets' API cannot create the UI
+    # multi-select dropdown, while a normal ONE_OF_LIST rule marks that valid
+    # combined decision as "Invalid". Keep HVAC unvalidated on generated
+    # output sheets; existing live-sheet formatting/dropdowns are preserved by
+    # ensure_review_columns and are never changed here.
     reqs = [
         {"repeatCell": {"range": {"sheetId": grid, "startRowIndex": 0, "endRowIndex": 1},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
@@ -322,7 +389,7 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
     for col_name, options in ((HVAC_COL, hvac_options), (OPT_FIT_COL, fit_options),
                               (PERI_FIT_COL, fit_options)):
         if col_name in headers and n:
-            if col_name == HVAC_COL and hvac_from_template:
+            if col_name == HVAC_COL:
                 continue
             c = headers.index(col_name)
             reqs.append({"setDataValidation": {
@@ -339,7 +406,6 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
             "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}})
     sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
 
-    emails = [e.strip() for e in os.environ.get("SHEET_SHARE_WITH", "").split(",") if e.strip()]
     for email in emails:
         try:
             drive.permissions().create(fileId=sid, sendNotificationEmail=False,
@@ -348,10 +414,6 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
                                              "emailAddress": email}).execute()
         except Exception as e:  # e.g. email is already the folder owner
             log.warning("Could not share sheet with %s: %s", email, e)
-    if not emails and not folder:
-        log.warning("SHEET_SHARE_WITH unset — granting anyone-with-link writer access")
-        drive.permissions().create(fileId=sid, supportsAllDrives=True,
-                                   body={"type": "anyone", "role": "writer"}).execute()
     return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
 
 

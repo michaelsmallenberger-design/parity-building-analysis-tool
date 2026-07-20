@@ -17,8 +17,26 @@ services:
         sync: false
       - key: XAI_API_KEY
         sync: false
+      - key: SHEET_INTAKE_GROK_ENABLED
+        value: "true"
+      - key: SHEET_INTAKE_GROK_SAMPLE_ROWS
+        value: "25"
+      - key: SHEET_INTAKE_GROK_AUTO_CONFIDENCE
+        value: "0.90"
+      - key: SHEET_INTAKE_RESOLUTION_CACHE_SECONDS
+        value: "86400"
+      - key: GEMINI_GROK_EMERGENCY_FALLBACK_ENABLED
+        value: "true"
       - key: ANALYZE_API_KEY
         sync: false
+      - key: SITE_ACCESS_ENABLED
+        value: "true"
+      - key: SITE_ACCESS_PASSWORD
+        sync: false
+      - key: SITE_SESSION_SECRET
+        generateValue: true
+      - key: SITE_COOKIE_SECURE
+        value: "true"
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: SHEET_PARENT_FOLDER_ID
@@ -27,6 +45,10 @@ services:
         sync: false
       - key: ANALYZE_FILE_MAX_ROWS
         value: "250"
+      - key: ANALYZE_MAX_BATCH_ROWS
+        value: "250"
+      - key: MAX_REQUEST_BYTES
+        value: "52428800"
       - key: GEOCODER_PROVIDER
         value: google
       - key: IMAGERY_PROVIDER

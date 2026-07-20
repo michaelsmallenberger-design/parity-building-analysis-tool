@@ -6,11 +6,11 @@ Any change that drops a required element MUST fail this test. Run before deploy.
 
 Guarantees every review page contains:
   - the full 9-item HVAC Systems taxonomy from the Washington Gas sheet
-  - the 4 Fit options (Optimizer / Periscope / Unclear / Bad)
+  - the current Fit options (Good / Bad / Not Sure) in both product columns
   - all three map services (Google Maps, Google Earth, Bing Maps)
   - the split model reasoning boxes (Gemini = green, Grok = black)
   - the ‹ › image carousel
-  - the HVAC multi-select, single-select Fit, note, and Submit controls
+  - the HVAC multi-select, two Fit pickers, note, per-card Submit, and bulk Submit controls
 """
 from review_render import build_review_page, HVAC_SYSTEMS, FIT_OPTIONS, FIT_COLUMNS
 
@@ -55,9 +55,12 @@ def test_review_contract():
     assert 'class="carousel"' in html and "nav prev" in html and "nav next" in html, "missing image carousel"
 
     assert 'onclick="submitCard' in html, "missing Submit"
+    assert 'id="submit-all"' in html and 'onclick="submitAll()"' in html, "missing bulk Submit"
+    assert "saved locally; Sheet update failed" in html, "missing truthful Sheet failure state"
+    assert "Sheet row not found" in html, "missing truthful missing-row state"
     assert "hvac_systems:" in html and "optimizer_fit:" in html and "periscope_fit:" in html, \
         "payload must carry hvac_systems + optimizer_fit + periscope_fit"
-    print("OK: review-page contract holds — 9 HVAC systems, 4 fit options, 3 map services, "
+    print("OK: review-page contract holds — 9 HVAC systems, 3 fit options, 3 map services, "
           "Gemini/Grok split boxes, carousel, and full controls.")
 
 

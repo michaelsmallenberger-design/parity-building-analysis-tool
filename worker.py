@@ -144,7 +144,14 @@ class BackgroundWorker:
                 try:
                     from api_analyze import _finalize_batch, _table_from_df
                     headers = rows = None
-                    if table_df is not None:
+                    # Browser intake may derive a private Address-only work
+                    # file from split columns.  The review surface must still
+                    # show (and write against) the untouched uploaded table.
+                    source_table = payload.get("original_table") or {}
+                    if source_table.get("headers") is not None and source_table.get("rows") is not None:
+                        headers = source_table["headers"]
+                        rows = source_table["rows"]
+                    elif table_df is not None:
                         headers, rows = _table_from_df(table_df)
                     binding = payload.get('sheet_binding')
                     if binding:
