@@ -128,6 +128,11 @@ Replace `YOUR-SERVICE` with the Render service URL:
 curl https://YOUR-SERVICE.onrender.com/api/health
 ```
 
+The response reports ordinary `pipeline_ready` separately from
+`large_workbook_approval_ready`. The latter remains false—and approval of
+workbooks above the automatic threshold fails closed—until both measured cost
+rate variables are present, finite, non-negative, and ordered minimum-to-maximum.
+
 Expected:
 
 ```json

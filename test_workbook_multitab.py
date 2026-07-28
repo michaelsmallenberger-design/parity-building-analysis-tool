@@ -534,6 +534,54 @@ def test_queue_chunking_duplicate_reuse_and_atomic_approval(root):
                     os.environ[name] = value
 
 
+def test_cost_configuration_fails_closed():
+    old_values = {
+        name: os.environ.get(name)
+        for name in (
+            "ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS",
+            "ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS",
+        )
+    }
+    try:
+        os.environ.pop("ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS", None)
+        os.environ.pop("ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS", None)
+        status = workbook_runs.cost_configuration_status()
+        assert status["configured"] is False
+        assert len(status["missing_configuration"]) == 2
+        assert workbook_runs._cost_estimate(300) is None
+
+        for low, high in (
+            ("nan", "0.02"),
+            ("0.01", "inf"),
+            ("-0.01", "0.02"),
+            ("0.03", "0.02"),
+        ):
+            os.environ["ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS"] = low
+            os.environ["ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS"] = high
+            status = workbook_runs.cost_configuration_status()
+            assert status["configured"] is False
+            assert len(status["invalid_configuration"]) == 2
+            assert workbook_runs._cost_estimate(300) is None
+
+        os.environ["ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS"] = "0.01"
+        os.environ["ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS"] = "0.02"
+        status = workbook_runs.cost_configuration_status()
+        assert status["configured"] is True
+        assert status["_rates"] == (0.01, 0.02)
+        assert workbook_runs._cost_estimate(300) == {
+            "currency": "USD",
+            "minimum": 3.0,
+            "maximum": 6.0,
+            "basis": "configured_per_unique_address",
+        }
+    finally:
+        for name, value in old_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_default_hundred_address_chunks(root):
     with IsolatedState(root):
         original_read = sheets_writer.read_bound_sheet_mappings
@@ -882,6 +930,7 @@ if __name__ == "__main__":
         test_range_dropdown_values_and_unsupported_rules(temp_dir)
         test_conversion_mismatch_trashes_before_queue(temp_dir)
         test_queue_chunking_duplicate_reuse_and_atomic_approval(temp_dir)
+        test_cost_configuration_fails_closed()
         test_default_hundred_address_chunks(temp_dir)
         test_resume_skips_checkpointed_rows(temp_dir)
         test_corrected_rerun_uses_exact_multitab_source(temp_dir)

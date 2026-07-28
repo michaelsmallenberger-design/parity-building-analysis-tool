@@ -46,7 +46,8 @@ External automations can call the app without the queue or local result storage.
 - `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — the fallback for building the final Google Sheet by hand
 - `GET /api/batch/<batch_id>/failures`: the rows that failed analysis (imagery/geocode/analyzer errors) for the cleanup skill
 - `POST /api/batch/<batch_id>/rerun`: re-run failed rows in place (optionally with corrected addresses) and merge fresh results into the same review page/sheet
-- `GET /api/health`: API health check
+- `GET /api/health`: API health check, including separate
+  `large_workbook_approval_ready` cost-configuration status
 
 Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
 
