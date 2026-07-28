@@ -4,10 +4,15 @@ Repository guidance for Claude Code and other coding agents.
 
 ## Project Reality
 
-This repository is the Parity cooling-tower analyzer. It is currently a Render-hosted Flask app with two front doors:
+This repository is the Parity cooling-tower analyzer. It is currently a
+Render-hosted Flask app with three workbook-capable front doors:
 
-1. Browser UI: CSV upload -> SQLite queue -> background worker -> results page/files.
-2. Stateless API: `/api/run` accepts a batch of addresses and returns self-contained audit-card HTML for n8n.
+1. Browser `.xlsx`/CSV upload or live Google Sheet link.
+2. Shared Drive inbox.
+3. Versioned asynchronous API/n8n intake through `/api/v2/workbook-runs`.
+
+All three use one resumable, fail-closed workbook engine. `/api/run` and
+`/api/run-file` remain legacy single-table compatibility routes.
 
 The active pipeline is the Phase 4 shape on branch `piece4-concurrency`: Google defaults for geocoding/imagery, Mapbox fallback and dense-core imagery, OSM -> NYC -> Microsoft footprint fallback, two zoom levels, optional YOLO model ensemble through `MODEL_PATHS`, and one address-level `vlm.verify_address()` call.
 
@@ -22,6 +27,10 @@ Runtime:
 - `worker.py`
 - `job_queue.py`
 - `storage_helpers.py`
+- `workbook_runs.py`
+- `intake_resolver.py`
+- `sheets_writer.py`
+- `drive_inbox.py`
 - `tasks_local.py`
 - `utils.py`
 - `geometry.py`
@@ -46,6 +55,7 @@ Assets/config:
 - `requirements_railway.txt`
 - `n8n/README.md`
 - `n8n/parity_cooling_tower.workflow.json`
+- `n8n/parity_workbook_async.workflow.json`
 
 ## Current Pipeline
 
@@ -69,8 +79,12 @@ Required for production:
 - `GOOGLE_MAPS_API_KEY`
 - `MAPBOX_API_KEY`
 - `GEMINI_API_KEY`
-- `XAI_API_KEY`
 - `ANALYZE_API_KEY` for stateless API routes
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
+- `SHEET_PARENT_FOLDER_ID`
+
+`XAI_API_KEY` is optional. It is used only for ambiguous redacted workbook
+schema assistance and the one-request emergency VLM fallback.
 
 Optional (live review-to-sheet loop; without them `sheet_url` stays empty and the
 operator/skill flow is the fallback):
@@ -93,6 +107,12 @@ Important defaults:
 - `MAPBOX_ZOOM=19`
 - `MAPBOX_ZOOM_WIDE=18`
 - `VLM_ADDRESS_CONCURRENCY=5`
+- `MULTI_TAB_WORKBOOK_ENABLED=true`
+- `MULTI_TAB_BROWSER_ENABLED=true`
+- `MULTI_TAB_DRIVE_ENABLED=true`
+- `MULTI_TAB_API_ENABLED=true`
+- `WORKBOOK_CHUNK_ROWS=100`
+- `WORKBOOK_AUTO_APPROVAL_ROWS=250`
 - `GEMINI_MODEL=gemini-3.6-flash`
 - `GROK_MODEL=grok-4.3`
 
@@ -112,7 +132,8 @@ Important defaults:
 Cheap syntax check:
 
 ```bash
-python -m compileall app_railway.py api_analyze.py tasks_local.py utils.py geometry.py vlm.py pipeline_render.py report_audit.py job_queue.py worker.py storage_helpers.py
+python -m compileall app_railway.py api_analyze.py workbook_runs.py intake_resolver.py sheets_writer.py drive_inbox.py tasks_local.py utils.py geometry.py vlm.py pipeline_render.py report_audit.py job_queue.py worker.py storage_helpers.py
+python test_workbook_multitab.py
 ```
 
 Run spend/network tests only when the user asks for them or provides explicit approval/context.

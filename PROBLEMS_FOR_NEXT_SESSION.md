@@ -3,6 +3,12 @@
 _Written 2026-07-09, after the live team demo. Alex's feedback: the process isn't
 streamlined enough. This is the talk-through list for next time._
 
+> Historical snapshot: the current workbook path is now the versioned,
+> resumable multi-tab engine documented in `README.md` and
+> `docs/SALES_SHEET_RUNBOOK.md`. References below to dropping n8n, ephemeral
+> storage, or a single-sheet flow describe the July 9 state and are not current
+> operating instructions.
+
 ---
 
 ## STATUS UPDATE — built later the same day (2026-07-09)

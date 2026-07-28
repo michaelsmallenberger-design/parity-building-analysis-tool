@@ -22,6 +22,7 @@ fully self-contained and report_audit embeds it directly. No object storage.
 """
 import base64
 import csv
+import hmac
 import logging
 import os
 import re
@@ -166,7 +167,7 @@ def require_key(fn):
         if not configured:
             return jsonify({"error": "ANALYZE_API_KEY not configured on server"}), 503
         provided = (request.headers.get("X-API-Key") or "").strip()
-        if provided != configured:
+        if not provided or not hmac.compare_digest(provided, configured):
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -653,11 +654,19 @@ def _finalize_batch(
         prepared = []
         for multi_binding in sheet_bindings:
             try:
-                sheets_writer.ensure_review_columns(
-                    multi_binding, multi_binding.get("headers", []),
-                    HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
-                    review_url=review_url if base else "",
-                )
+                required = {
+                    sheets_writer.HVAC_COL,
+                    sheets_writer.OPT_FIT_COL,
+                    sheets_writer.PERI_FIT_COL,
+                    sheets_writer.NOTES_COL,
+                }
+                if not required.issubset(
+                    set((multi_binding.get("colmap") or {}).keys())
+                ):
+                    sheets_writer.ensure_review_columns(
+                        multi_binding, multi_binding.get("headers", []),
+                        HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                    )
                 multi_binding.pop("writeback_error", None)
             except Exception as e:
                 log.error(
@@ -1087,6 +1096,7 @@ def batch_rerun(batch_id):
     headers = b.get("table_headers", [])
     addr_header = _first_present(headers, ADDRESS_COLUMNS)
     fresh, statuses, table_updates = {}, [], {}
+    source_address_updates = {}
     for r in rows_req:
         rid = str(r.get("row_id", "")).strip()
         old = by_rid.get(rid)
@@ -1113,6 +1123,7 @@ def batch_rerun(batch_id):
                          "error": entry.get("error") or ""})
         if (r.get("address") or "").strip() and addr_header:
             table_updates[rid] = {addr_header: addr}
+            source_address_updates[rid] = addr
 
     if fresh:
         entries = b.get("entries", [])
@@ -1131,10 +1142,46 @@ def batch_rerun(batch_id):
         if b.get("sheet_url") and sheets_writer.enabled():
             for rid, upd in table_updates.items():
                 try:
-                    sheets_writer.write_row_values(
-                        b["sheet_url"], headers, b.get("table_rows", []), rid, upd)
+                    if b.get("sheet_bindings"):
+                        source_entry = by_rid.get(rid) or {}
+                        source_binding = next(
+                            (
+                                item for item in b["sheet_bindings"]
+                                if (
+                                    str(item.get("grid_id"))
+                                    == str(source_entry.get("source_grid_id"))
+                                    and item.get("tab")
+                                    == source_entry.get("source_tab")
+                                )
+                            ),
+                            None,
+                        )
+                        source_header = (
+                            (source_binding or {}).get("intake_mapping") or {}
+                        ).get("address_column")
+                        if (
+                            not source_binding
+                            or not source_header
+                            or rid not in source_address_updates
+                            or not sheets_writer.write_source_values(
+                                source_binding,
+                                source_entry.get("source_row"),
+                                {source_header: source_address_updates[rid]},
+                            )
+                        ):
+                            raise ValueError(
+                                "Exact source tab/row address write-back failed"
+                            )
+                    else:
+                        sheets_writer.write_row_values(
+                            b["sheet_url"], headers, b.get("table_rows", []),
+                            rid, upd,
+                        )
                 except Exception as e:
-                    log.error("Sheet address update failed for %s/%s: %s", batch_id, rid, e)
+                    log.error(
+                        "Sheet address update failed for %s/%s: %s",
+                        batch_id, rid, e,
+                    )
 
     remaining = len(_entry_failures(b))
     if b.get("run_id"):

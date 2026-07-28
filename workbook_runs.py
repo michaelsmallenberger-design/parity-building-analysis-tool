@@ -225,21 +225,54 @@ def _normalized_range_formula(value: str | None) -> str:
     return re.sub(r"[\s$']", "", text).casefold()
 
 
-def _resolved_list_options(workbook, current_sheet, formula: str | None):
+def _direct_range_reference(
+    formula: str | None, current_tab: str,
+) -> tuple[str, str] | None:
     text = str(formula or "").strip().lstrip("=")
-    if not text or _inline_list(formula) is not None:
+    if not text:
         return None
     match = re.fullmatch(
         r"(?:(?:'((?:[^']|'')+)'|([^!]+))!)?"
-        r"(\$?[A-Z]{1,3}\$?\d+:\$?[A-Z]{1,3}\$?\d+)",
+        r"(\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)",
         text,
     )
     if not match:
         return None
-    tab_name = (match.group(1) or match.group(2) or current_sheet.title).replace("''", "'")
+    tab_name = (match.group(1) or match.group(2) or current_tab).replace("''", "'")
+    return tab_name, match.group(3).replace("$", "")
+
+
+def _resolved_list_source(workbook, current_sheet, formula: str | None):
+    """Resolve one static Excel list source into a tab, range, and exact values.
+
+    Dynamic formulas and multi-area names cannot be proven equivalent after
+    Excel-to-Sheets conversion, so callers fail closed on those rules.
+    """
+    text = str(formula or "").strip().lstrip("=")
+    if not text or _inline_list(formula) is not None:
+        return None
+    reference = _direct_range_reference(formula, current_sheet.title)
+    if reference is None:
+        defined = workbook.defined_names.get(text)
+        if defined is None:
+            return None
+        try:
+            destinations = list(defined.destinations)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if len(destinations) != 1:
+            return None
+        tab_name, coordinate = destinations[0]
+        tab_name = str(tab_name).replace("''", "'")
+        coordinate = str(coordinate).replace("$", "")
+        try:
+            range_boundaries(coordinate)
+        except ValueError:
+            return None
+        reference = tab_name, coordinate
+    tab_name, coordinate = reference
     if tab_name not in workbook.sheetnames:
         return None
-    coordinate = match.group(3).replace("$", "")
     min_col, min_row, max_col, max_row = range_boundaries(coordinate)
     cell_count = (max_col - min_col + 1) * (max_row - min_row + 1)
     source_limit = max(
@@ -253,9 +286,19 @@ def _resolved_list_options(workbook, current_sheet, formula: str | None):
     values = []
     for row in cells:
         for cell in row:
+            if getattr(cell, "data_type", "") == "f":
+                raise ValueError(
+                    f"Dropdown source '{tab_name}!{coordinate}' contains formulas "
+                    "whose displayed values cannot be safely fingerprinted"
+                )
             if cell.value is not None:
                 values.append(str(cell.value).strip())
-    return values
+    return {
+        "tab": tab_name,
+        "range": coordinate,
+        "formula": f"{_quoted_tab(tab_name)}!{coordinate}",
+        "options": values,
+    }
 
 
 def inspect_xlsx(path: str | Path) -> dict[str, Any]:
@@ -333,13 +376,31 @@ def inspect_xlsx(path: str | Path) -> dict[str, Any]:
             for validation in validations:
                 if str(validation.type or "").lower() != "list":
                     continue
+                inline_options = _inline_list(validation.formula1)
+                resolved_source = _resolved_list_source(
+                    workbook, sheet, validation.formula1,
+                )
+                if inline_options is None and resolved_source is None:
+                    raise ValueError(
+                        f"Dropdown on tab '{sheet.title}' uses a dynamic or unsupported "
+                        "list source that Parity cannot safely verify after conversion"
+                    )
                 dropdowns.append({
                     "tab": sheet.title,
                     "ranges": str(validation.sqref).split(),
                     "formula1": str(validation.formula1 or ""),
-                    "inline_options": _inline_list(validation.formula1),
-                    "resolved_options": _resolved_list_options(
-                        workbook, sheet, validation.formula1,
+                    "inline_options": inline_options,
+                    "resolved_options": (
+                        resolved_source["options"] if resolved_source else None
+                    ),
+                    "source_tab": (
+                        resolved_source["tab"] if resolved_source else None
+                    ),
+                    "source_range": (
+                        resolved_source["range"] if resolved_source else None
+                    ),
+                    "resolved_formula": (
+                        resolved_source["formula"] if resolved_source else None
                     ),
                     "allow_blank": validation.allowBlank,
                     "show_error": validation.showErrorMessage,
@@ -505,13 +566,40 @@ def verify_converted_sheet(sheet_id: str, snapshot: dict[str, Any]) -> dict[str,
                                 f"Google conversion changed dropdown values on tab '{expected['tab']}'"
                             )
                     elif condition_type == "ONE_OF_RANGE":
+                        allowed_references = {
+                            _normalized_range_formula(expected.get("formula1")),
+                            _normalized_range_formula(expected.get("resolved_formula")),
+                        }
+                        allowed_references.discard("")
                         if (
                             not actual_values
                             or _normalized_range_formula(actual_values[0])
-                            != _normalized_range_formula(expected.get("formula1"))
+                            not in allowed_references
                         ):
                             raise ValueError(
                                 f"Google conversion changed a dropdown source range on "
+                                f"tab '{expected['tab']}'"
+                            )
+                        source_tab = expected.get("source_tab")
+                        source_range = expected.get("source_range")
+                        if not source_tab or not source_range or resolved_options is None:
+                            raise ValueError(
+                                f"Dropdown source values on tab '{expected['tab']}' "
+                                "could not be verified"
+                            )
+                        converted_source = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id,
+                            range=f"{_quoted_tab(source_tab)}!{source_range}",
+                        ).execute().get("values", [])
+                        converted_options = [
+                            str(value).strip()
+                            for row in converted_source
+                            for value in row
+                            if value is not None
+                        ]
+                        if converted_options != resolved_options:
+                            raise ValueError(
+                                f"Google conversion changed dropdown source values on "
                                 f"tab '{expected['tab']}'"
                             )
                 if expected.get("show_error") is not None:
@@ -625,15 +713,6 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
     if not mappings:
         raise ValueError("Workbook has no selected address tabs")
     bindings = sheets_writer.read_bound_sheet_mappings(run["sheet_url"], mappings)
-    base = (
-        os.environ.get("APP_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
-        or ""
-    ).rstrip("/")
-    review_url = (
-        f"{base}/review/{run['run_id']}"
-        if base else f"/review/{run['run_id']}"
-    )
     from review_render import FIT_OPTIONS, HVAC_SYSTEMS, NONE_OPTION
     for binding in bindings:
         sheets_writer.ensure_review_columns(
@@ -641,7 +720,6 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
             binding.get("headers", []),
             HVAC_SYSTEMS + [NONE_OPTION],
             FIT_OPTIONS,
-            review_url=review_url if base else "",
         )
     tab_counts = collections.Counter()
     grouped: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()

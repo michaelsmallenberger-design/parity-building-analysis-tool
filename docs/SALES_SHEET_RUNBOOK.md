@@ -5,14 +5,14 @@ cooling-tower opportunities and finish the same Google Sheet.
 
 ## What Sales Sends
 
-Ask Sales for the **Google Sheet link**, not a downloaded copy, whenever possible.
-The Sheet needs one column containing the building location. A normal header such
-as `Address`, `Property Address`, `Street Address`, or `Building Address` is best.
+Sales can send one `.xlsx` workbook containing several regional tabs or a live
+Google Sheet link. A normal header such as `Address`, `Property Address`,
+`Street Address`, or `Building Address` is best.
 
 Sales does **not** need to add formulas, change rows, or format anything for
 Parity. Keep their original columns and row order intact.
 
-Before the first run on a particular Sheet, its owner shares it as **Editor** with:
+For a live Google Sheet, its owner shares it as **Editor** with:
 
 `sheet-writer@gen-lang-client-0702830838.iam.gserviceaccount.com`
 
@@ -30,30 +30,36 @@ workday.
 Only use the public link after the password protection has been activated in
 Render. Do not send the team password outside the approved internal team.
 
-### 2. Paste the Sheet Link
+### 2. Upload the Workbook or Paste the Sheet Link
 
 On the first screen:
 
-1. Paste the Google Sheet link from Sales.
-2. Click **Analyze my sheet**.
+1. Upload Sales's `.xlsx` workbook, or paste the live Google Sheet link.
+2. Start the analysis.
 
-Do not upload a copy of the Sheet when the goal is to finish Sales's original
-Sheet. File upload is only for an Excel/CSV file and creates a separate output
-Sheet.
+An `.xlsx` upload is converted into one new Google Sheet containing every
+eligible regional tab. The Excel source is left unchanged. Legacy `.xls` files
+must first be saved as `.xlsx`.
 
 ### 3. Confirm the Address Column, Only if Asked
 
 For normal Sheets, Parity recognizes the address column and starts automatically.
 
-If Sales uses unusual headers, Parity shows a short confirmation screen. Check:
+Normal same-format regional tabs are included automatically. If Sales uses
+unusual headers, a hidden address tab, or an ambiguous non-empty tab, Parity
+stops the entire workbook on one confirmation screen before any paid analysis.
+Check:
 
-- the correct Sheet tab;
+- every listed tab;
 - the street/address column; and
 - city, state, and ZIP columns if they are shown.
 
-Click **Use this setup and analyze the Sheet** only when the fields are correct.
-At this point nothing has been analyzed and nothing has been written to the
-Sheet. If the setup is wrong, go back rather than guessing.
+Confirm only when every address tab is accounted for. Empty instruction tabs
+may be ignored. If the setup is wrong, go back rather than guessing.
+
+Parity also verifies every existing Excel dropdown after conversion. If tab
+structure, dropdown coverage, allowed values/ranges, or reject/warn behavior
+changed, the converted copy is trashed and the run stops before analysis.
 
 ### 4. Let Parity Analyze the Buildings
 
@@ -63,8 +69,8 @@ and rooftop imagery to prepare a review card for each building.
 The progress screen gives a link to the dark **Review Page**. You can keep that
 link and return later through the Reviews page; progress is saved.
 
-Do not move, delete, sort, or insert rows in the Sales Sheet while its batch is
-running. This keeps every result connected to the correct original row.
+Do not move, delete, sort, or insert rows in the live Google Sheet while its
+batch is running. Every result is tied to its original tab and physical row.
 
 ### 5. Review Each Building
 
@@ -75,7 +81,7 @@ For each building:
 
 1. Look at the imagery and map links.
 2. Select every HVAC system you can actually see, or select **None**.
-3. Choose the team's Fit result.
+3. Choose both **Optimizer Fit** and **Periscope Fit**.
 4. Add a note only when it would help the next person.
 5. Click **Submit**.
 
@@ -85,36 +91,37 @@ customer-facing Sheet column.
 
 ## Fit Standard
 
-Use one Fit answer per building:
+Each building requires two separate decisions: **Optimizer Fit** and
+**Periscope Fit**. Each uses the current review choices:
 
-- `Optimizer`
-- `Periscope`
-- `None`
-- `Not Clear`
-
-Do not use the older `Good / Bad / Not Sure` choices. The review screen and Sheet
-must be aligned to these four values before the first live Sales run.
+- `Good`
+- `Bad`
+- `Not Sure`
 
 ## What Changes in the Sales Sheet
 
 Parity never renames, rearranges, deletes, or overwrites the original Sales
 columns. It also keeps existing formatting and existing dropdown rules.
 
-If the Sheet already has the review columns, Parity fills only the matching cells
-on the original rows. If required review columns are missing, Parity adds them at
-the far right; it does not alter the existing layout.
+If the Sheet already has the review columns, Parity fills only the matching
+cells on the original rows. Missing Parity review columns are appended at the
+far right of each selected tab. Existing columns, formatting, and dropdown rules
+are not reformatted or replaced.
 
 ## When the Work Is Complete
 
-The run is complete when the Review Page count says every building has been
-reviewed. Open the original Google Sheet and spot-check a few rows:
+The run is complete only when every eligible row has a terminal machine result,
+both Fit decisions and an HVAC decision have been submitted, and no Sheet
+write-back remains failed. Open the resulting Google Sheet and spot-check rows
+on several tabs:
 
 - the original Sales data is still present;
-- HVAC/Fit/Notes appear on the intended rows; and
+- HVAC/Optimizer Fit/Periscope Fit/Notes appear on the intended rows; and
 - the Sheet still looks like Sales's Sheet.
 
-There is no second Sheet to merge or copy back when the Google Sheet link was
-used. The Sales Sheet is the final output.
+There is no second Sheet to merge. A live Google Sheet input is updated in
+place; an Excel input uses the one verified converted Google Sheet as its
+canonical output.
 
 ## If Something Does Not Look Right
 

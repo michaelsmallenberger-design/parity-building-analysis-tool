@@ -86,7 +86,8 @@ The Blueprint mounts `/var/data` as a persistent disk. `STORAGE_DIR` and
 `JOBS_DB_PATH` must stay on that disk or workbook checkpoints and review
 decisions will not survive a redeploy.
 
-The multi-tab rollout is staged:
+The multi-tab rollout was staged and the repository now records the enabled
+target state:
 
 1. Deploy with `MULTI_TAB_WORKBOOK_ENABLED=false`.
 2. Configure measured
@@ -98,6 +99,11 @@ The multi-tab rollout is staged:
 5. After browser/Drive metrics are clean, enable
    `MULTI_TAB_API_ENABLED` and switch n8n to
    `n8n/parity_workbook_async.workflow.json`.
+
+The current Blueprint has the master, browser, Drive, and API flags enabled.
+Large-workbook approval still fails closed unless both measured/configured cost
+rate secrets are present. Importing and activating the n8n workflow is a
+separate n8n-account action; the Render API does not auto-approve spend.
 
 `ANALYZE_FILE_MAX_ROWS=250` remains only for legacy synchronous file calls.
 The workbook engine uses 250 as an approval threshold, not a truncation limit,
@@ -142,12 +148,16 @@ curl -X POST "https://YOUR-SERVICE.onrender.com/api/run" \
 
 The primary operator path is the Claude skill `.claude/skills/parity-cooling-tower`, not n8n.
 
-For a scheduled/triggered n8n run, import `n8n/parity_cooling_tower.workflow.json` (reads addresses from a Google Sheet) and update the analyzer HTTP node:
+For a scheduled/triggered workbook run, import
+`n8n/parity_workbook_async.workflow.json` and update its Create Workbook Run
+HTTP node:
 
-- URL: `https://YOUR-SERVICE.onrender.com/api/run`
+- URL: `https://YOUR-SERVICE.onrender.com/api/v2/workbook-runs`
 - Header: `X-API-Key: <same ANALYZE_API_KEY from Render>`
 
-The workflow also needs its own Google Sheets, xAI, Gmail, and optional Slack credentials. See `n8n/README.md`.
+The workflow uploads the workbook and polls the returned status URL. It does not
+send raw customer addresses to Grok. Attach the desired Gmail, Slack, or Teams
+notification after the final-state node. See `n8n/README.md`.
 
 ## Verify the API key
 

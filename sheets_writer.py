@@ -466,6 +466,39 @@ def write_decision_source(binding, source_row, hvac, optimizer_fit="",
     return True
 
 
+def write_source_values(binding, source_row, mapping) -> bool:
+    """Write explicit existing source columns on one exact workbook tab/row."""
+    try:
+        row = int(source_row)
+    except (TypeError, ValueError):
+        return False
+    if row < 2:
+        return False
+    headers = [str(value).strip() for value in binding.get("headers", [])]
+    normalized = {}
+    for index, header in enumerate(headers):
+        normalized.setdefault(_norm(header), index)
+    data = []
+    for requested, value in (mapping or {}).items():
+        index = normalized.get(_norm(requested))
+        if index is None:
+            continue
+        data.append({
+            "range": _tab_range(
+                binding["tab"], f"{_col_letter(index)}{row}",
+            ),
+            "values": [[value]],
+        })
+    if not data:
+        return False
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute()
+    return True
+
+
 def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
                        review_url="") -> str:
     """Create the output Sheet: user's table + bold frozen header, HVAC/Fit

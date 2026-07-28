@@ -6,18 +6,20 @@ Run with ``python test_workbook_multitab.py``.
 from __future__ import annotations
 
 import io
+import json
 import os
 import tempfile
 from pathlib import Path
 
 from flask import Flask
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 
 import api_analyze
 import intake_resolver
 import job_queue
 import review_render
+import review_store
 import sheets_writer
 import storage_helpers
 import tasks_local
@@ -87,6 +89,24 @@ def test_inventory_and_grok_guardrails(root):
         assert [tab["row_count"] for tab in resolution["tabs"]] == [2, 2, 2]
         assert snapshot["dropdowns"][0]["inline_options"] == ["New", "Done"]
 
+        mixed_path = Path(root) / "mixed.xlsx"
+        make_regional_workbook(mixed_path)
+        mixed_book = load_workbook(mixed_path)
+        instructions = mixed_book.create_sheet("Instructions", 0)
+        instructions.append(["Instructions"])
+        instructions.append(["Upload all regional tabs without changing formatting."])
+        mixed_book.save(mixed_path)
+        mixed_book.close()
+        mixed = intake_resolver.resolve_workbook_schema(
+            workbook_runs.inspect_xlsx(mixed_path)["tabs"],
+            tasks_local.ADDRESS_VARIANTS,
+        )
+        assert mixed["status"] == "ready"
+        assert mixed["tabs"][0]["status"] == "ignored"
+        assert [
+            tab["tab"] for tab in mixed["tabs"] if tab["status"] == "selected"
+        ] == ["Washington", "Virginia", "New York City"]
+
         hidden_path = Path(root) / "hidden.xlsx"
         make_regional_workbook(hidden_path, hidden=True)
         hidden = intake_resolver.resolve_workbook_schema(
@@ -101,6 +121,29 @@ def test_inventory_and_grok_guardrails(root):
         ambiguous_path = Path(root) / "ambiguous.xlsx"
         make_regional_workbook(ambiguous_path, ambiguous=True)
         ambiguous_tabs = workbook_runs.inspect_xlsx(ambiguous_path)["tabs"]
+        intake_resolver._grok_workbook_suggestions = lambda tabs: (
+            [{
+                "tab": tab["tab"],
+                "classification": "address",
+                "address_column": "Street",
+                "city_column": None,
+                "state_column": None,
+                "zip_column": None,
+                "confidence": 0.99,
+                "reason": "street-shaped values",
+            } for tab in tabs],
+            "",
+        )
+        suggested = intake_resolver.resolve_workbook_schema(
+            ambiguous_tabs, tasks_local.ADDRESS_VARIANTS,
+        )
+        assert suggested["status"] == "confirmation_required"
+        assert all(
+            tab["status"] == "confirmation_required"
+            and tab["suggestion"]["address_column"] == "Street"
+            for tab in suggested["tabs"]
+        ), "Valid Grok mappings must still require local human confirmation"
+
         intake_resolver._grok_workbook_suggestions = lambda tabs: (
             [{
                 "tab": tabs[0]["tab"],
@@ -121,6 +164,26 @@ def test_inventory_and_grok_guardrails(root):
         assert all(
             tab["status"] == "unresolved" for tab in unresolved["tabs"]
         ), "Grok may not omit workbook tabs"
+
+        intake_resolver._grok_workbook_suggestions = lambda _tabs: (
+            [{
+                "tab": "Invented Region",
+                "classification": "address",
+                "address_column": "Invented Address",
+                "city_column": None,
+                "state_column": None,
+                "zip_column": None,
+                "confidence": 1.0,
+                "reason": "invented",
+            }],
+            "",
+        )
+        invented = intake_resolver.resolve_workbook_schema(
+            ambiguous_tabs, tasks_local.ADDRESS_VARIANTS,
+        )
+        assert all(
+            tab["status"] == "unresolved" for tab in invented["tabs"]
+        ), "Grok may not invent tabs or columns"
     finally:
         intake_resolver._grok_workbook_suggestions = original
 
@@ -212,6 +275,174 @@ def test_dropdown_conversion_fails_closed():
         sheets_writer._get_services = original
 
 
+class FakeRangeConvertedSheets:
+    def __init__(self, changed_source=False):
+        self.changed_source = changed_source
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def get(self, **kwargs):
+        if kwargs.get("includeGridData"):
+            rule = {
+                "condition": {
+                    "type": "ONE_OF_RANGE",
+                    "values": [{"userEnteredValue": "'Options'!A1:A2"}],
+                },
+                "strict": True,
+            }
+            return FakeRequest({
+                "sheets": [{
+                    "data": [{
+                        "rowData": [
+                            {"values": [{"dataValidation": rule}]},
+                            {"values": [{"dataValidation": rule}]},
+                        ]
+                    }]
+                }]
+            })
+        if kwargs.get("fields", "").startswith("sheets.properties"):
+            return FakeRequest({
+                "sheets": [
+                    {"properties": {
+                        "sheetId": 10, "title": "Washington", "hidden": False,
+                    }},
+                    {"properties": {
+                        "sheetId": 20, "title": "Options", "hidden": True,
+                    }},
+                ]
+            })
+        range_name = kwargs.get("range", "")
+        if range_name == "'Washington'!1:1":
+            return FakeRequest({"values": [["Property Address", "Status"]]})
+        if range_name == "'Options'!1:1":
+            return FakeRequest({"values": [["New"]]})
+        if range_name == "'Options'!A1:A2":
+            return FakeRequest({
+                "values": [["New"], ["Changed" if self.changed_source else "Done"]]
+            })
+        return FakeRequest({"values": []})
+
+
+def test_range_dropdown_values_and_unsupported_rules(root):
+    snapshot = {
+        "sheet_states": [
+            {"tab": "Washington", "hidden": False},
+            {"tab": "Options", "hidden": True},
+        ],
+        "tabs": [
+            {
+                "tab": "Washington", "hidden": False,
+                "headers": ["Property Address", "Status"], "row_count": 2,
+            },
+            {
+                "tab": "Options", "hidden": True,
+                "headers": ["New"], "row_count": 1,
+            },
+        ],
+        "dropdowns": [{
+            "tab": "Washington",
+            "ranges": ["B2:B3"],
+            "formula1": "'Options'!$A$1:$A$2",
+            "inline_options": None,
+            "resolved_options": ["New", "Done"],
+            "source_tab": "Options",
+            "source_range": "A1:A2",
+            "resolved_formula": "'Options'!A1:A2",
+            "show_error": True,
+            "error_style": "stop",
+            "source_max_row": 3,
+            "source_max_col": 2,
+        }],
+    }
+    original = sheets_writer._get_services
+    try:
+        sheets_writer._get_services = lambda: (FakeRangeConvertedSheets(), None)
+        assert workbook_runs.verify_converted_sheet("sheet", snapshot)[
+            "dropdown_cells"
+        ] == 2
+        sheets_writer._get_services = lambda: (
+            FakeRangeConvertedSheets(changed_source=True), None,
+        )
+        try:
+            workbook_runs.verify_converted_sheet("sheet", snapshot)
+            raise AssertionError("changed range-backed dropdown values were accepted")
+        except ValueError as exc:
+            assert "source values" in str(exc)
+    finally:
+        sheets_writer._get_services = original
+
+    path = Path(root) / "unsupported-dropdown.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Washington"
+    sheet.append(["Property Address", "Status"])
+    sheet.append(["1 Main St", "New"])
+    validation = DataValidation(
+        type="list", formula1='INDIRECT("A1:A2")',
+        showErrorMessage=True, errorStyle="stop",
+    )
+    sheet.add_data_validation(validation)
+    validation.add("B2")
+    workbook.save(path)
+    workbook.close()
+    try:
+        workbook_runs.inspect_xlsx(path)
+        raise AssertionError("unsupported dropdown source was accepted")
+    except ValueError as exc:
+        assert "cannot safely verify" in str(exc)
+
+
+def test_conversion_mismatch_trashes_before_queue(root):
+    with IsolatedState(root):
+        calls = []
+        originals = {
+            "convert": workbook_runs._convert_local_xlsx,
+            "verify": workbook_runs.verify_converted_sheet,
+            "trash": workbook_runs._trash_sheet,
+            "build": workbook_runs._build_queue,
+        }
+        try:
+            workbook_runs._convert_local_xlsx = (
+                lambda *_args, **_kwargs: calls.append("convert") or "converted-sheet"
+            )
+            workbook_runs.verify_converted_sheet = (
+                lambda *_args, **_kwargs: (
+                    calls.append("verify"),
+                    (_ for _ in ()).throw(ValueError("dropdown mismatch")),
+                )[1]
+            )
+            workbook_runs._trash_sheet = (
+                lambda sheet_id: calls.append(f"trash:{sheet_id}") or True
+            )
+            workbook_runs._build_queue = lambda _run: (
+                calls.append("queue"),
+                (_ for _ in ()).throw(AssertionError("queue must not start")),
+            )[1]
+            run = {
+                "schema_version": 2,
+                "run_id": "w-mismatch",
+                "source_name": "regions.xlsx",
+                "source_blob": "workbook_runs/w-mismatch/source.xlsx",
+                "xlsx_snapshot": {},
+                "created_at": "now",
+            }
+            stopped = workbook_runs._convert_and_prepare(run)
+            assert stopped["status"] == "needs_attention"
+            assert stopped["preflight_failed"] is True
+            assert stopped["converted_copy_trashed"] is True
+            assert calls == ["convert", "verify", "trash:converted-sheet"]
+            assert job_queue.get_job_status("w-mismatch") is None
+        finally:
+            workbook_runs._convert_local_xlsx = originals["convert"]
+            workbook_runs.verify_converted_sheet = originals["verify"]
+            workbook_runs._trash_sheet = originals["trash"]
+            workbook_runs._build_queue = originals["build"]
+
+
 def test_queue_chunking_duplicate_reuse_and_atomic_approval(root):
     with IsolatedState(root):
         old_threshold = os.environ.get("WORKBOOK_AUTO_APPROVAL_ROWS")
@@ -301,6 +532,60 @@ def test_queue_chunking_duplicate_reuse_and_atomic_approval(root):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
+
+
+def test_default_hundred_address_chunks(root):
+    with IsolatedState(root):
+        original_read = sheets_writer.read_bound_sheet_mappings
+        original_columns = sheets_writer.ensure_review_columns
+        old_chunk = os.environ.get("WORKBOOK_CHUNK_ROWS")
+        try:
+            os.environ["WORKBOOK_CHUNK_ROWS"] = "100"
+            sheets_writer.ensure_review_columns = (
+                lambda binding, *_args, **_kwargs:
+                binding.update({"colmap": {"HVAC Systems": 1}}) or binding
+            )
+            targets = [
+                {
+                    "source_key": f"sabc:g10:r{row}",
+                    "grid_id": 10,
+                    "tab": "Washington",
+                    "source_row": row,
+                    "address": f"{row} Main St",
+                }
+                for row in range(2, 207)
+            ]
+            sheets_writer.read_bound_sheet_mappings = lambda *_args, **_kwargs: [{
+                "spreadsheet_id": "sheet",
+                "grid_id": 10,
+                "tab": "Washington",
+                "headers": ["Address"],
+                "row_numbers": list(range(2, 207)),
+                "targets": targets,
+            }]
+            run = {
+                "run_id": "w-chunks",
+                "sheet_url": "https://docs.google.com/spreadsheets/d/sheet/edit",
+                "tabs": [{
+                    "tab": "Washington",
+                    "status": "selected",
+                    "mapping": {
+                        "tab": "Washington", "address_column": "Address",
+                    },
+                }],
+                "created_at": "now",
+            }
+            built = workbook_runs._build_queue(run)
+            assert built["row_count"] == 205
+            assert built["analysis_count"] == 205
+            assert [len(chunk["items"]) for chunk in built["chunks"]] == [100, 100, 5]
+        finally:
+            sheets_writer.read_bound_sheet_mappings = original_read
+            sheets_writer.ensure_review_columns = original_columns
+            if old_chunk is None:
+                os.environ.pop("WORKBOOK_CHUNK_ROWS", None)
+            else:
+                os.environ["WORKBOOK_CHUNK_ROWS"] = old_chunk
 
 
 def test_resume_skips_checkpointed_rows(root):
@@ -396,8 +681,97 @@ def test_grouped_review_and_exact_tab_writeback():
         ]
         assert any("'Washington'!C2" == value for value in ranges)
         assert any("'Virginia'!C2" == value for value in ranges)
+        assert sheets_writer.write_source_values(
+            {
+                "spreadsheet_id": "sheet", "grid_id": 20, "tab": "Virginia",
+                "headers": ["Property Address"],
+            },
+            2,
+            {"Property Address": "Corrected Virginia Address"},
+        )
+        assert any(
+            item["range"] == "'Virginia'!A2"
+            for update in fake.updates
+            for item in update["body"]["data"]
+        )
     finally:
         sheets_writer._get_services = original
+
+
+def test_corrected_rerun_uses_exact_multitab_source(root):
+    with IsolatedState(root):
+        batch_id = "w-rerun-source"
+        entry = {
+            "row_id": "sabc:g20:r2",
+            "i": "sabc:g20:r2",
+            "source_grid_id": 20,
+            "source_tab": "Virginia",
+            "source_row": 2,
+            "address": "Bad Address",
+            "error": "geocode failed",
+        }
+        review_store.save_batch(
+            batch_id,
+            "Regions",
+            [entry],
+            sheet_url="https://docs.google.com/spreadsheets/d/sheet/edit",
+            table_headers=["Address", "Row_ID"],
+            table_rows=[["Bad Address", "sabc:g20:r2"]],
+            sheet_bindings=[{
+                "spreadsheet_id": "sheet",
+                "grid_id": 20,
+                "tab": "Virginia",
+                "headers": ["Property Address"],
+                "intake_mapping": {"address_column": "Property Address"},
+            }],
+            schema_version=2,
+        )
+        old_key = os.environ.get("ANALYZE_API_KEY")
+        original_analyze = api_analyze._analyze_one
+        original_enabled = sheets_writer.enabled
+        original_source_write = sheets_writer.write_source_values
+        original_legacy_write = sheets_writer.write_row_values
+        writes = []
+        try:
+            os.environ["ANALYZE_API_KEY"] = "test"
+            api_analyze._analyze_one = lambda address, **_kwargs: {
+                "address": address,
+                "verdict": "not_detected",
+                "error": "",
+            }
+            sheets_writer.enabled = lambda: True
+            sheets_writer.write_source_values = (
+                lambda binding, row, values:
+                writes.append((binding["tab"], row, values)) or True
+            )
+            sheets_writer.write_row_values = lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(AssertionError("legacy first-tab writer must not run"))
+            app = Flask("workbook-rerun-source-test")
+            app.register_blueprint(api_analyze.api)
+            response = app.test_client().post(
+                f"/api/batch/{batch_id}/rerun",
+                json={"rows": [{
+                    "row_id": "sabc:g20:r2",
+                    "address": "2 Corrected Virginia Ave",
+                }]},
+                headers={"X-API-Key": "test"},
+            )
+            assert response.status_code == 200
+            assert writes == [(
+                "Virginia",
+                2,
+                {"Property Address": "2 Corrected Virginia Ave"},
+            )]
+        finally:
+            api_analyze._analyze_one = original_analyze
+            sheets_writer.enabled = original_enabled
+            sheets_writer.write_source_values = original_source_write
+            sheets_writer.write_row_values = original_legacy_write
+            if old_key is None:
+                os.environ.pop("ANALYZE_API_KEY", None)
+            else:
+                os.environ["ANALYZE_API_KEY"] = old_key
 
 
 def test_legacy_run_file_fails_closed_on_multiple_tabs(root):
@@ -477,13 +851,43 @@ def test_versioned_async_api_contract():
                 os.environ[name] = value
 
 
+def test_n8n_async_workflow_contract():
+    workflow = json.loads(
+        Path("n8n/parity_workbook_async.workflow.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    nodes = {node["name"]: node for node in workflow["nodes"]}
+    create = nodes["Create Workbook Run"]
+    poll = nodes["Poll Workbook Status"]
+    assert create["parameters"]["url"].endswith("/api/v2/workbook-runs")
+    assert create["parameters"]["authentication"] == "genericCredentialType"
+    assert poll["parameters"]["authentication"] == "genericCredentialType"
+    assert "headerParameters" not in create["parameters"]
+    assert "headerParameters" not in poll["parameters"]
+    assert create["credentials"]["httpHeaderAuth"]["name"] == (
+        "Parity Render API Key"
+    )
+    assert workflow["connections"]["Poll Workbook Status"]["main"][0][0][
+        "node"
+    ] == "Still Running?"
+    serialized = json.dumps(workflow)
+    assert "REPLACE_WITH_ANALYZE_API_KEY" not in serialized
+    assert "Grok normalize" not in serialized
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp_dir:
         test_inventory_and_grok_guardrails(temp_dir)
+        test_range_dropdown_values_and_unsupported_rules(temp_dir)
+        test_conversion_mismatch_trashes_before_queue(temp_dir)
         test_queue_chunking_duplicate_reuse_and_atomic_approval(temp_dir)
+        test_default_hundred_address_chunks(temp_dir)
         test_resume_skips_checkpointed_rows(temp_dir)
+        test_corrected_rerun_uses_exact_multitab_source(temp_dir)
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()
     test_grouped_review_and_exact_tab_writeback()
     test_versioned_async_api_contract()
+    test_n8n_async_workflow_contract()
     print("OK: multi-tab workbook contracts hold without paid or network calls.")

@@ -31,16 +31,9 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://REPLACE-WITH-RENDER-SERVICE.onrender.com/api/v2/workbook-runs",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-API-Key",
-              "value": "REPLACE_WITH_ANALYZE_API_KEY"
-            }
-          ]
-        },
+        "url": "https://building-analyzer.onrender.com/api/v2/workbook-runs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "contentType": "multipart-form-data",
         "bodyParameters": {
@@ -67,7 +60,13 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [-140, 240],
-      "notes": "Creates one durable workbook run. A 409 response intentionally means tab confirmation or another preflight stop is required; configure this node to continue on error if your n8n version treats 409 as fatal."
+      "notes": "Creates one durable workbook run. A 409 response intentionally means tab confirmation or another preflight stop is required; configure this node to continue on error if your n8n version treats 409 as fatal.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_N8N_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Parity Render API Key"
+        }
+      }
     },
     {
       "parameters": {
@@ -115,15 +114,8 @@
     {
       "parameters": {
         "url": "={{ $('Create Workbook Run').item.json.status_url }}",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-API-Key",
-              "value": "REPLACE_WITH_ANALYZE_API_KEY"
-            }
-          ]
-        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "options": {
           "timeout": 30000,
           "response": {
@@ -138,7 +130,13 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [580, 160],
-      "notes": "Polls the durable run. It never repeats completed source keys after a Render restart."
+      "notes": "Polls the durable run. It never repeats completed source keys after a Render restart.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_N8N_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Parity Render API Key"
+        }
+      }
     },
     {
       "parameters": {
