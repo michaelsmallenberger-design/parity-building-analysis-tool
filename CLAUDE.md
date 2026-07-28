@@ -57,7 +57,7 @@ Assets/config:
 6. Run YOLO detections via `_get_models()`. `MODEL_PATHS` controls whether this is single-model or ensemble.
 7. Filter detections in geo-space against the target footprint.
 8. Render marked tiles and a close-up.
-9. Call `verify_address()` once. Gemini and Grok run in parallel and combine by consensus.
+9. Call `verify_address()` once. Gemini is the normal reviewer; Grok is limited to one emergency request after a technical Gemini failure.
 10. Produce CSV rows plus audit-card web entries.
 
 The older `verify_detection()` and `verify_rooftop()` functions remain in `vlm.py`, but they are not the active per-address path in `tasks_local.py`.
@@ -93,7 +93,7 @@ Important defaults:
 - `MAPBOX_ZOOM=19`
 - `MAPBOX_ZOOM_WIDE=18`
 - `VLM_ADDRESS_CONCURRENCY=5`
-- `GEMINI_MODEL=gemini-3.5-flash`
+- `GEMINI_MODEL=gemini-3.6-flash`
 - `GROK_MODEL=grok-4.3`
 
 ## Development Notes
