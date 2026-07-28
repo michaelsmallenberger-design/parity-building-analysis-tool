@@ -58,13 +58,13 @@ services:
       - key: ANALYZE_MONTHLY_ADDRESS_LIMIT
         value: "2500"
       - key: MULTI_TAB_WORKBOOK_ENABLED
-        value: "false"
+        value: "true"
       - key: MULTI_TAB_BROWSER_ENABLED
         value: "true"
       - key: MULTI_TAB_DRIVE_ENABLED
         value: "true"
       - key: MULTI_TAB_API_ENABLED
-        value: "false"
+        value: "true"
       - key: WORKBOOK_AUTO_APPROVAL_ROWS
         value: "250"
       - key: WORKBOOK_CHUNK_ROWS

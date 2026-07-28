@@ -9,7 +9,7 @@ Internal cooling-tower analysis tool for building address lists. The app geocode
 - Runtime: single-process Flask app with one Gunicorn worker and threaded request handling
 - Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
 - Current report format: audit-card HTML from `report_audit.py`; interactive dark review page from `review_render.py`
-- Current automation paths: the browser and Drive inbox use the durable workbook engine behind feature flags; n8n can switch to `POST /api/workbook-runs` after browser/Drive verification
+- Current automation paths: browser, Drive inbox, and the versioned API use the durable workbook engine; the n8n workbook workflow targets `POST /api/v2/workbook-runs`
 - Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC/Fit picks into a Google Sheet
 
 Presentation material is in `docs/presentation/`.
@@ -62,6 +62,7 @@ Primary files:
 - `report_audit.py`
 - `n8n/README.md`
 - `n8n/parity_cooling_tower.workflow.json`
+- `n8n/parity_workbook_async.workflow.json`
 
 ### Team Review + Google Sheet
 
