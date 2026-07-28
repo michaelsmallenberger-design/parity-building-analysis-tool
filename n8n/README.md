@@ -1,9 +1,13 @@
 # n8n Orchestration
 
-n8n is one way to start and monitor the cooling-tower analyzer. The primary
-operator path is the Claude skill (`.claude/skills/parity-cooling-tower`), which
-runs a batch, hands the team a review page, and writes reviewed picks into a
-Google Sheet.
+> Inactive reference only. Parity does not currently deploy or require n8n.
+> Browser upload, Drive inbox, and the versioned API call the durable workbook
+> engine directly.
+
+The exports below are retained only in case an external orchestrator is added
+later. The primary operator path is the Claude skill
+(`.claude/skills/parity-cooling-tower`), which runs a batch, hands the team a
+review page, and writes reviewed picks into a Google Sheet.
 
 ## Multi-Tab Workbook Flow
 
@@ -26,7 +30,7 @@ credential store, not in the workflow JSON.
 
 An `approval_required` or `confirmation_required` result is a deliberate stop,
 not a failed analysis. Use the returned `approval_url` or `setup_url`, then keep
-polling the same `status_url`. Do not make n8n auto-approve spend.
+polling the same `status_url`.
 
 ## Retired Legacy Single-Table Workflow
 

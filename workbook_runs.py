@@ -835,12 +835,6 @@ def _enqueue(run: dict[str, Any], *, approved: bool) -> dict[str, Any]:
         return run
     if run.get("analysis_count", 0) <= 0:
         raise ValueError("Workbook has no usable addresses")
-    if approved and run.get("row_count", 0) > auto_approval_threshold():
-        if not run.get("cost_estimate"):
-            raise ValueError(
-                "Large-workbook cost rates are not configured; set the per-address "
-                "estimate before approval"
-            )
     payload = {
         "job_id": run["run_id"],
         "kind": "workbook",

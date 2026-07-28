@@ -26,7 +26,7 @@ Current as of the `piece4-concurrency` branch.
 ## Follow-Ups Worth Considering
 
 - Add a current `verify_address()` integration harness.
-- Migrate any remaining legacy n8n consumer from synchronous `/api/run` to the
-  asynchronous `/api/v2/workbook-runs` workflow.
-- Return tabular data from `/api/run` if n8n needs an Excel/CSV attachment.
 - Add negative reference images under `reference_images/negative/`.
+
+The repository retains old n8n workflow exports as inactive reference
+artifacts. There is no current n8n deployment or migration requirement.

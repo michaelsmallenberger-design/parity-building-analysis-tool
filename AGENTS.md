@@ -11,7 +11,7 @@ engine where applicable:
 
 1. Browser `.xlsx`/CSV upload and live Google Sheet intake.
 2. Drive inbox intake.
-3. API/n8n intake through `POST /api/v2/workbook-runs`.
+3. Versioned API intake through `POST /api/v2/workbook-runs`.
 
 `POST /api/run` and `/api/run-file` remain legacy single-table compatibility
 paths. Multi-tab workbooks fail closed there instead of selecting one tab.
@@ -45,10 +45,10 @@ Keep and treat as active:
 - `static/images/`
 - `Dockerfile.railway`
 - `requirements_railway.txt`
-- `n8n/README.md`
-- `n8n/parity_cooling_tower.workflow.json`
-- `n8n/parity_workbook_async.workflow.json`
 - `.claude/skills/parity-cooling-tower/SKILL.md`
+
+The `n8n/` directory is retained as inactive reference material. There is no
+deployed n8n service or active n8n runtime dependency.
 
 Presentation docs live in `docs/presentation/`.
 
