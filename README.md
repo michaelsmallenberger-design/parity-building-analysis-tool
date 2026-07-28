@@ -1,6 +1,6 @@
 # Parity Building Analysis Tool
 
-Internal cooling-tower analysis tool for building address lists. The app geocodes each address, fetches roof-centered satellite imagery, runs a cooling-tower YOLO detector, filters candidates against the target building footprint, and asks Gemini + Grok to verify the final address-level result.
+Internal cooling-tower analysis tool for building address lists. The app geocodes each address, fetches roof-centered satellite imagery, runs a cooling-tower YOLO detector, filters candidates against the target building footprint, and asks Gemini to verify the final address-level result. Grok is limited to one emergency request after a technical Gemini failure.
 
 ## Current Status
 
@@ -122,7 +122,7 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MAPBOX_SIZE`: default `768x768`
 - `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
 - `VLM_TIMEOUT_SECONDS`: default `120`
-- `GEMINI_MODEL`: default `gemini-3.5-flash`
+- `GEMINI_MODEL`: default `gemini-3.6-flash`
 - `GROK_MODEL`: default `grok-4.3`
 - `GEMINI_THINKING_LEVEL`: default `high`
 - `GROK_REASONING_EFFORT`: default `high`

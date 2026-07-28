@@ -8,7 +8,9 @@ os.environ["SITE_ACCESS_PASSWORD"] = "test-only-password"
 os.environ["SITE_SESSION_SECRET"] = "test-only-session-secret"
 os.environ["SITE_COOKIE_SECURE"] = "false"
 
-from app_railway import app
+import app_railway
+
+app = app_railway.app
 
 
 def _csrf(response) -> str:
@@ -24,6 +26,9 @@ def run():
     blocked = client.get("/")
     assert blocked.status_code == 302
     assert "/access" in blocked.headers["Location"]
+    blocked_file = client.get("/files/results/private.jpg")
+    assert blocked_file.status_code == 302
+    assert "/access" in blocked_file.headers["Location"]
 
     access = client.get("/access")
     assert access.status_code == 200
@@ -43,6 +48,23 @@ def run():
     home = client.get("/")
     assert home.status_code == 200
     token = _csrf(home)
+
+    original_exists = app_railway.file_exists
+    original_read = app_railway.read_file
+    try:
+        app_railway.file_exists = lambda _path: True
+        app_railway.read_file = lambda _path: b"private customer artifact"
+        private_file = client.get("/files/results/private.jpg")
+        assert private_file.status_code == 200
+        cache_control = private_file.headers.get("Cache-Control", "")
+        assert "private" in cache_control
+        assert "no-store" in cache_control
+        assert "public" not in cache_control
+        assert private_file.headers.get("Pragma") == "no-cache"
+        assert private_file.headers.get("Expires") == "0"
+    finally:
+        app_railway.file_exists = original_exists
+        app_railway.read_file = original_read
 
     no_csrf_review = client.post("/api/review", json={"job_id": "missing", "row_id": 1})
     assert no_csrf_review.status_code == 403

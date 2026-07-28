@@ -156,7 +156,7 @@ def test_multi_tab_file_resolution():
 
 
 def test_existing_sheet_dropdowns_are_untouched():
-    """Live-sheet formatting safety: existing review columns are never reset."""
+    """Live-sheet safety: no existing customer validation range is changed."""
     class FakeSheets:
         def __init__(self):
             self.requests = []
@@ -177,16 +177,35 @@ def test_existing_sheet_dropdowns_are_untouched():
     original_services = sheets_writer._get_services
     try:
         sheets_writer._get_services = lambda: (fake, None)
-        headers = ["Property Address", "HVAC Systems", "Optimizer Fit", "Periscope Fit", "Notes"]
+        # Sales Stage represents an unrelated dropdown supplied by the customer.
+        # HVAC Systems represents an existing Parity-facing multi-select. Both
+        # validation rules must survive while missing review columns are appended.
+        headers = ["Property Address", "Sales Stage", "HVAC Systems"]
         binding = {"spreadsheet_id": "test", "grid_id": 1, "tab": "Buildings",
                    "row_numbers": [2, 3]}
         sheets_writer.ensure_review_columns(
             binding, headers, ["Cooling Tower"], ["Good", "Bad", "Not Sure"])
-        set_validation = [request for kind, request in fake.requests
+        batch_requests = [item for kind, request in fake.requests
                           if kind == "batchUpdate"
-                          for item in request["body"]["requests"]
+                          for item in request["body"]["requests"]]
+        set_validation = [item["setDataValidation"] for item in batch_requests
                           if "setDataValidation" in item]
-        assert not set_validation, "existing customer dropdowns must not be replaced"
+        assert set_validation, "new fit columns should receive Parity dropdowns"
+        assert all(rule["range"]["startColumnIndex"] >= len(headers)
+                   for rule in set_validation), (
+            "Parity must never replace a dropdown on an existing customer column"
+        )
+        copy_pastes = [item["copyPaste"] for item in batch_requests if "copyPaste" in item]
+        assert all(item["destination"]["startColumnIndex"] >= len(headers)
+                   for item in copy_pastes), (
+            "formatting for appended columns must not target existing customer columns"
+        )
+        value_updates = [request for kind, request in fake.requests if kind == "values.update"]
+        assert all(request["range"].split("!")[1][0] >= sheets_writer._col_letter(len(headers))
+                   for request in value_updates), (
+            "header/link writes must stay to the right of the incoming Sheet"
+        )
+        assert binding["colmap"]["HVAC Systems"] == 2
     finally:
         sheets_writer._get_services = original_services
 

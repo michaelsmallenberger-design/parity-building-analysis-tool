@@ -66,7 +66,7 @@ Important defaults:
 - `MAPBOX_ZOOM=19`
 - `MAPBOX_ZOOM_WIDE=18`
 - `VLM_ADDRESS_CONCURRENCY=5`
-- `GEMINI_MODEL=gemini-3.5-flash`
+- `GEMINI_MODEL=gemini-3.6-flash`
 - `GROK_MODEL=grok-4.3`
 
 ## Working Rules

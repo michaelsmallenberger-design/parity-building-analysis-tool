@@ -38,7 +38,7 @@ _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
 
-_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 _DEFAULT_GROK_MODEL = "grok-4.3"
 _GROK_BASE_URL = "https://api.x.ai/v1"
 # Reasoning depth. Grok 4.3 defaults to "low" if unset; Gemini 3.x to "medium".

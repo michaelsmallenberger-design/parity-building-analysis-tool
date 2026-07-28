@@ -654,7 +654,14 @@ def serve_file(blob_name):
             mimetype = 'application/octet-stream'
 
         resp = Response(data, mimetype=mimetype)
-        resp.headers['Cache-Control'] = 'public, max-age=604800'
+        # These files can contain customer addresses, roof imagery, and review
+        # reports. Even though the browser password protects this route, marking
+        # a response ``public`` allows shared proxies/CDNs to retain it outside
+        # the authenticated session. Keep every stored artifact private and
+        # prevent browser or intermediary reuse after logout.
+        resp.headers['Cache-Control'] = 'private, no-store, max-age=0'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
 
         # Force download for CSV and ZIP files
         if lower.endswith('.csv') or lower.endswith('.zip'):
