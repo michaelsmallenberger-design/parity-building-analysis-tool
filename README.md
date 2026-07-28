@@ -9,7 +9,7 @@ Internal cooling-tower analysis tool for building address lists. The app geocode
 - Runtime: single-process Flask app with one Gunicorn worker and threaded request handling
 - Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
 - Current report format: audit-card HTML from `report_audit.py`; interactive dark review page from `review_render.py`
-- Current automation paths: n8n calls `POST /api/run-file` for Excel upload or `POST /api/run` for address lists
+- Current automation paths: the browser and Drive inbox use the durable workbook engine behind feature flags; n8n can switch to `POST /api/workbook-runs` after browser/Drive verification
 - Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC/Fit picks into a Google Sheet
 
 Presentation material is in `docs/presentation/`.
@@ -18,7 +18,8 @@ Presentation material is in `docs/presentation/`.
 
 ### Browser UI
 
-CSV upload -> SQLite job queue -> background worker -> results page and downloadable files.
+`.xlsx`/CSV upload -> tab/dropdown preflight -> one converted Google Sheet ->
+durable 100-address chunks -> grouped review and exact-tab write-back.
 
 Primary files:
 
@@ -34,6 +35,11 @@ External automations can call the app without the queue or local result storage.
 
 - `POST /api/run`: list of addresses -> finished self-contained audit HTML (also persists a review batch; returns its `/review/<batch_id>` URL in the `X-Review-URL` header and, when the Sheets credential is configured, the live sheet link in `X-Sheet-URL`)
 - `POST /api/run-file`: uploaded Excel/CSV file -> JSON `{review_url, sheet_url, count}` (all original columns preserved; `sheet_url` is the live Google Sheet created at run time when `GOOGLE_SERVICE_ACCOUNT_JSON` is configured, else `""`)
+- `POST /api/v2/workbook-runs`: asynchronous `.xlsx`/CSV/Google-Sheet intake -> durable run metadata, tab inventory, approval/status links, Sheet link, and eventual grouped review link
+- `GET /api/v2/workbook-runs/<run_id>`: current workbook state and exact overall/tab denominators
+- `POST /api/v2/workbook-runs/<run_id>/confirmation`: confirm all exceptional tab mappings before spend
+- `POST /api/v2/workbook-runs/<run_id>/approval`: record one whole-workbook cost approval when the eligible row count exceeds the automatic threshold
+- `POST /api/v2/workbook-runs/<run_id>/retry`: resume a failed/cancelled analysis from durable row checkpoints without a second reservation
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
 - `GET /review/<batch_id>`: interactive dark review page for the team (imagery carousel + AI guidance, HVAC multi-select + Fit single-select, Submit per building; each Submit is recorded server-side AND written live into the batch's Google Sheet row when one exists)
@@ -44,7 +50,11 @@ External automations can call the app without the queue or local result storage.
 
 Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
 
-For the Excel upload flow, send a multipart form upload to `/api/run-file` with a `file` field containing `.xlsx`, `.xls`, or `.csv`. The file must have an address column such as `Address`, `Property Address`, `Street Address`, or `Building Address`.
+Use `/api/v2/workbook-runs` for multi-tab `.xlsx` files. Legacy `.xls` is rejected
+with a Save As `.xlsx` instruction because its dropdown behavior cannot be
+guaranteed. `/api/run-file` remains compatible for CSV and one eligible Excel
+address tab, but fails closed instead of silently choosing one tab from a
+multi-tab workbook.
 
 Primary files:
 
@@ -108,6 +118,7 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `ANALYZE_API_KEY`: required for `/api/analyze`, `/api/run`, `/api/run-file`, `/api/report`, and `/api/batch/*`
 - `GOOGLE_SERVICE_ACCOUNT_JSON` (optional): service-account key enabling `sheets_writer.py` — sheet created at run time, review Submits written live; without it `sheet_url` stays empty
 - `SHEET_SHARE_WITH` (optional): comma-separated emails granted writer access to created sheets
+- `SHEET_PARENT_FOLDER_ID`: Shared Drive/folder receiving the converted workbook copy
 
 ## Important Optional Environment Variables
 
@@ -121,6 +132,12 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MAPBOX_ZOOM_WIDE`: wide/context tile zoom, default `18`
 - `MAPBOX_SIZE`: default `768x768`
 - `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
+- `MULTI_TAB_WORKBOOK_ENABLED`: master workbook-engine feature flag
+- `MULTI_TAB_BROWSER_ENABLED`, `MULTI_TAB_DRIVE_ENABLED`, `MULTI_TAB_API_ENABLED`: staged surface flags
+- `WORKBOOK_AUTO_APPROVAL_ROWS`: default `250`; larger workbooks wait for one recorded approval and are never truncated
+- `WORKBOOK_CHUNK_ROWS`: durable chunk size, default `100`
+- `ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS` / `ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS`: measured/configured rates required for large-workbook approval
+- `STORAGE_DIR` / `JOBS_DB_PATH`: point manifests, checkpoints, reviews, and SQLite at the Render persistent disk
 - `VLM_TIMEOUT_SECONDS`: default `120`
 - `GEMINI_MODEL`: default `gemini-3.6-flash`
 - `GROK_MODEL`: default `grok-4.3`

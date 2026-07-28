@@ -542,10 +542,10 @@ def _process_one_address_core(
     full_address = _compose_address(row, columns)
 
     # Geocode (+ free geocoder-agreement confidence flag, stashed into `geo`)
-    log.info(f"Row {i+1}/{total}: Geocoding '{full_address}'")
+    log.info(f"Row {i+1}/{total}: Geocoding source address")
     geo_lat, geo_lon, geo["confidence"], geo["divergence_m"] = geocode_with_confidence(full_address)
     if geo_lat is None:
-        log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
+        log.warning(f"Row {i+1}/{total}: Geocoding failed")
         notes = _build_notes({'geocode_failed': True})
         return (
             _build_web_entry(
@@ -1221,6 +1221,7 @@ def process_address_list(
     make_signed_url: Callable[[str], str],        # (blob_path) -> url
     write_partial_result: Callable[[Dict[str, Any]], None] = None,  # Optional callback for streaming results
     concurrency: int = None,  # addresses processed at once; None → VLM_ADDRESS_CONCURRENCY env (default 5)
+    resume_results: Dict[int, Any] = None,
 ) -> Dict[str, Any]:
     """
     Process a CSV of addresses through the geometry + dual-VLM pipeline.
@@ -1377,19 +1378,50 @@ def process_address_list(
 
     columns = df.columns
     results_by_index = {}   # i -> (web_entry, csv_row)
+    for raw_index, stored in (resume_results or {}).items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(stored, dict):
+            web_entry = stored.get("web_entry")
+            csv_row = stored.get("csv_row")
+        elif isinstance(stored, (list, tuple)) and len(stored) == 2:
+            web_entry, csv_row = stored
+        else:
+            continue
+        if isinstance(web_entry, dict) and isinstance(csv_row, dict):
+            results_by_index[index] = (web_entry, csv_row)
     last_seen = {}          # i -> last (web_entry, csv_row) for transient-VLM rows
     commit_lock = threading.Lock()
-    done = 0
+    done = len(results_by_index)
+    if done:
+        progress_cb(done, total, f"Resumed {done} checkpointed address(es)")
 
     def _commit(i, web_entry, csv_row):
         nonlocal done
         with commit_lock:
-            results_by_index[i] = (web_entry, csv_row)
+            index = int(i)
+            if index in results_by_index:
+                return
+            results_by_index[index] = (web_entry, csv_row)
             done += 1
             progress_cb(done, total, None)
             if write_partial_result:
                 snapshot = [results_by_index[k][0] for k in sorted(results_by_index)]
-                write_partial_result({"web_results": snapshot})
+                row_results = [
+                    {
+                        "index": int(k),
+                        "web_entry": results_by_index[k][0],
+                        "csv_row": results_by_index[k][1],
+                    }
+                    for k in sorted(results_by_index)
+                ]
+                write_partial_result({
+                    "schema_version": 2,
+                    "web_results": snapshot,
+                    "row_results": row_results,
+                })
             if done % 50 == 0 and total > 100:
                 import gc
                 gc.collect()
@@ -1427,7 +1459,10 @@ def process_address_list(
                 _commit(i, web_entry, csv_row)
         return retry
 
-    pending = list(df.iterrows())
+    pending = [
+        (i, row) for i, row in df.iterrows()
+        if int(i) not in results_by_index
+    ]
     for round_num in range(MAX_RETRY_ROUNDS + 1):
         if not pending:
             break

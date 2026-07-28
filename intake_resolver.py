@@ -3,8 +3,8 @@
 Deterministic header matching stays the normal path.  Grok is used only when
 there is no recognizable address header, and it returns a *suggestion* that is
 validated locally before an interactive user or an automation path may use it.
-Raw spreadsheet samples are sent to Grok only for that exceptional call and are
-never logged or persisted by this module.
+Grok receives header names plus locally derived value-shape counts, never raw
+customer cell values.
 """
 from __future__ import annotations
 
@@ -59,7 +59,9 @@ def schema_fingerprint(tabs: list[dict[str, Any]]) -> str:
     for tab in tabs:
         compact.append({
             "tab": str(tab.get("tab") or ""),
+            "hidden": bool(tab.get("hidden")),
             "headers": [str(h) for h in tab.get("headers", [])],
+            "row_count": int(tab.get("row_count") or len(tab.get("rows", []))),
             "sample": [[str(c) for c in row] for row in tab.get("rows", [])[:sample_row_limit()]],
         })
     return hashlib.sha256(json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -125,6 +127,218 @@ def deterministic_mapping(tabs: list[dict[str, Any]], address_variants: list[str
                 "method": "deterministic",
             }
     return None
+
+
+_ADDRESS_VALUE_RE = re.compile(
+    r"^\s*\d+[A-Za-z-]*\s+.+(?:\b(?:st|street|ave|avenue|rd|road|blvd|boulevard|"
+    r"dr|drive|ln|lane|ct|court|way|pl|place|pkwy|parkway|hwy|highway)\b|,\s*[A-Z]{2}\b)",
+    re.IGNORECASE,
+)
+_ZIP_RE = re.compile(r"^\s*\d{5}(?:-\d{4})?\s*$")
+_STATE_RE = re.compile(r"^\s*[A-Z]{2}\s*$", re.IGNORECASE)
+
+
+def _value_shape(value: Any) -> str:
+    """Return a non-sensitive type label for one spreadsheet cell."""
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return "empty"
+    if _ZIP_RE.match(text):
+        return "zip"
+    if _STATE_RE.match(text):
+        return "state_code"
+    if _ADDRESS_VALUE_RE.match(text):
+        return "street_address"
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return "number"
+    if "@" in text and "." in text:
+        return "email_like"
+    return "text"
+
+
+def redacted_tab_profile(tab: dict[str, Any]) -> dict[str, Any]:
+    """Describe a tab for an LLM without disclosing any source cell values."""
+    headers = [str(header).strip() for header in tab.get("headers", [])]
+    rows = tab.get("rows", [])[:sample_row_limit()]
+    columns = []
+    for index, header in enumerate(headers):
+        shapes = collections.Counter(
+            _value_shape(row[index] if index < len(row) else "") for row in rows
+        )
+        columns.append({
+            "header": header,
+            "nonempty": sum(count for shape, count in shapes.items() if shape != "empty"),
+            "shapes": dict(sorted(shapes.items())),
+        })
+    return {
+        "tab": str(tab.get("tab") or ""),
+        "hidden": bool(tab.get("hidden")),
+        "sample_row_count": len(rows),
+        "columns": columns,
+    }
+
+
+def _has_address_shaped_values(tab: dict[str, Any]) -> bool:
+    profile = redacted_tab_profile(tab)
+    for column in profile["columns"]:
+        nonempty = int(column["nonempty"])
+        address_like = int(column["shapes"].get("street_address", 0))
+        if nonempty and address_like / nonempty >= 0.25:
+            return True
+    return False
+
+
+def _grok_workbook_suggestions(
+    tabs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """Suggest a classification/mapping for every ambiguous tab in one call."""
+    if not _grok_enabled():
+        return None, "Grok sheet assistance is unavailable"
+    _metric("grok_workbook_intake_used")
+    prompt = (
+        "Classify every supplied workbook tab. Return JSON only as "
+        "{\"tabs\":[...]}. Each item must contain tab, classification "
+        "(\"address\" or \"ignore\"), address_column, city_column, state_column, "
+        "zip_column, confidence (0-1), and reason. Use exact supplied tab/header "
+        "names and never invent or omit a tab. Value shapes are aggregate labels, "
+        "not customer values.\n\n"
+        + json.dumps([redacted_tab_profile(tab) for tab in tabs],
+                     ensure_ascii=False, separators=(",", ":"))
+    )
+    try:
+        client = OpenAI(api_key=os.environ["XAI_API_KEY"], base_url="https://api.x.ai/v1")
+        response = client.chat.completions.create(
+            model=os.getenv("SHEET_INTAKE_GROK_MODEL") or os.getenv("GROK_MODEL") or "grok-4.3",
+            messages=[
+                {"role": "system", "content": "You are a spreadsheet schema mapper. Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            reasoning_effort="low",
+            timeout=int(os.getenv("SHEET_INTAKE_GROK_TIMEOUT_SECONDS", "30")),
+        )
+        payload = json.loads(response.choices[0].message.content or "")
+        suggestions = payload.get("tabs")
+        if not isinstance(suggestions, list):
+            raise ValueError("tabs was not a list")
+        return suggestions, ""
+    except Exception as exc:
+        log.warning("Grok workbook mapping unavailable: %s", type(exc).__name__)
+        return None, "Grok could not classify the workbook tabs"
+
+
+def resolve_workbook_schema(
+    tabs: list[dict[str, Any]], address_variants: list[str],
+) -> dict[str, Any]:
+    """Inventory every tab; never collapse a workbook to its first address tab.
+
+    Visible tabs with recognized address columns are selected automatically.
+    Empty/non-address tabs are ignored. Hidden address tabs and every LLM-assisted
+    decision require one workbook-level confirmation before analysis.
+    """
+    fingerprint = schema_fingerprint(tabs)
+    inventory: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    for tab in tabs:
+        name = str(tab.get("tab") or "")
+        populated = [
+            row for row in tab.get("rows", [])
+            if any(str(cell).strip() and str(cell).strip().lower() != "nan" for cell in row)
+        ]
+        base = {
+            "tab": name,
+            "hidden": bool(tab.get("hidden")),
+            "headers": [str(header).strip() for header in tab.get("headers", [])],
+            "row_count": int(tab.get("row_count") or len(populated)),
+            "sample_rows": len(populated),
+        }
+        if not populated:
+            inventory.append({**base, "status": "ignored", "reason": "no populated data rows"})
+            continue
+        mapping = deterministic_mapping([tab], address_variants)
+        if mapping:
+            address_shaped = _has_address_shaped_values(tab)
+            status = (
+                "confirmation_required"
+                if base["hidden"] or not address_shaped
+                else "selected"
+            )
+            if base["hidden"]:
+                reason = "hidden address-bearing tab"
+            elif not address_shaped:
+                reason = "recognized address header but sample values need confirmation"
+            else:
+                reason = "recognized address header"
+            inventory.append({**base, "status": status, "reason": reason, "mapping": mapping})
+            continue
+        if not _has_address_shaped_values(tab):
+            inventory.append({**base, "status": "ignored",
+                              "reason": "no recognized or address-shaped column"})
+            continue
+        ambiguous.append(tab)
+        inventory.append({**base, "status": "ambiguous",
+                          "reason": "address-shaped values need column confirmation"})
+
+    if ambiguous:
+        suggestions, error = _grok_workbook_suggestions(ambiguous)
+        by_name = {}
+        if suggestions is not None:
+            supplied = {str(tab.get("tab") or "") for tab in ambiguous}
+            names = [str(item.get("tab") or "") for item in suggestions if isinstance(item, dict)]
+            if len(names) == len(set(names)) and set(names) == supplied:
+                by_name = {str(item["tab"]): item for item in suggestions}
+        for item in inventory:
+            if item["status"] != "ambiguous":
+                continue
+            suggestion = by_name.get(item["tab"])
+            if not suggestion:
+                item["status"] = "unresolved"
+                item["reason"] = error or "Grok did not account for this tab"
+                continue
+            classification = str(suggestion.get("classification") or "").strip().lower()
+            if classification == "ignore":
+                try:
+                    confidence = float(suggestion.get("confidence"))
+                except (TypeError, ValueError):
+                    confidence = -1
+                if 0 <= confidence <= 1:
+                    item["status"] = "confirmation_required"
+                    item["suggestion"] = {
+                        "tab": item["tab"], "classification": "ignore",
+                        "confidence": confidence,
+                        "reason": str(suggestion.get("reason") or "Grok suggested ignoring this tab"),
+                    }
+                    continue
+            if classification == "address":
+                valid, reason, mapping = validate_mapping(tabs, suggestion)
+                if valid and mapping is not None:
+                    item["status"] = "confirmation_required"
+                    item["suggestion"] = {
+                        **mapping, "classification": "address",
+                        "reason": str(suggestion.get("reason") or "Grok suggested these columns"),
+                    }
+                    continue
+                item["reason"] = reason
+            item["status"] = "unresolved"
+            item["reason"] = item.get("reason") or "Grok suggestion failed local validation"
+
+    requires_confirmation = any(
+        item["status"] in {"confirmation_required", "ambiguous", "unresolved"}
+        for item in inventory
+    )
+    selected = [item for item in inventory if item["status"] == "selected"]
+    _metric("multi_tab_workbook_inventory")
+    if len(selected) > 1:
+        _metric("multi_tab_workbook_detected")
+    if requires_confirmation:
+        _metric("multi_tab_workbook_confirmation_required")
+    return {
+        "status": "confirmation_required" if requires_confirmation else "ready",
+        "fingerprint": fingerprint,
+        "tabs": inventory,
+        "selected_count": len(selected),
+        "ignored_count": sum(item["status"] == "ignored" for item in inventory),
+    }
 
 
 def _tab_for_mapping(tabs: list[dict[str, Any]], mapping: dict[str, Any]) -> dict[str, Any] | None:
@@ -201,16 +415,13 @@ def _grok_suggestion(tabs: list[dict[str, Any]]) -> tuple[dict[str, Any] | None,
     if not _grok_enabled():
         return None, "Grok sheet assistance is unavailable"
     _metric("grok_sheet_intake_used")
-    payload = [{
-        "tab": str(tab.get("tab") or ""),
-        "headers": [str(h) for h in tab.get("headers", [])],
-        "first_rows": [[str(cell) for cell in row] for row in tab.get("rows", [])[:sample_row_limit()]],
-    } for tab in tabs]
+    payload = [redacted_tab_profile(tab) for tab in tabs]
     prompt = (
         "Choose the one tab and existing columns that identify a building address. "
         "Use address_column for street/full address; city/state/zip are optional. "
         "Return JSON only with tab, address_column, city_column, state_column, zip_column, "
-        "and confidence (0-1). Never invent a tab or column name.\n\n"
+        "and confidence (0-1). Never invent a tab or column name. The value shapes "
+        "are aggregate labels and contain no customer cell values.\n\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     try:

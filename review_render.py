@@ -74,8 +74,12 @@ def _card(e):
     # page mid-batch shows what's already done.
     human = e.get("human") or {}
     reviewed = bool(human)
+    writeback = e.get("writeback") or {}
+    writeback_error = writeback.get("status") == "error"
     picked = {s.strip() for s in str(human.get("hvac_systems", "")).split(",") if s.strip()}
-    rid = _html.escape(str(e.get("i") or e.get("row_id") or ""))
+    rid = _html.escape(str(
+        e.get("row_id") if e.get("row_id") is not None else e.get("i", "")
+    ))
     addr = str(e.get("address", ""))
     addr_e = _html.escape(addr)
     ai = str(e.get("verdict") or "")
@@ -105,14 +109,15 @@ def _card(e):
                     f'<div class="frame">{slides}</div>'
                     f'<div class="cap"></div></div>')
 
-    dis = " disabled" if reviewed else ""
+    controls_dis = " disabled" if reviewed else ""
+    submit_dis = " disabled" if reviewed and not writeback_error else ""
     chips = ""
     for s in HVAC_SYSTEMS + [NONE_OPTION]:
         if reviewed:
             pre = " sel" if s in picked else ""
         else:
             pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
-        chips += f'<button type="button" class="chip{pre}"{dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
+        chips += f'<button type="button" class="chip{pre}"{controls_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
     fit_keys = {"Optimizer Fit": "optimizer_fit", "Periscope Fit": "periscope_fit"}
     fitrows = ""
     for col in FIT_COLUMNS:
@@ -120,12 +125,17 @@ def _card(e):
         chips_f = ""
         for fo in FIT_OPTIONS:
             pre = " sel" if fo == picked_fit else ""
-            chips_f += (f'<button type="button" class="fitchip{pre}"{dis} '
+            chips_f += (f'<button type="button" class="fitchip{pre}"{controls_dis} '
                         f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>')
         fitrows += (f'<div class="label">{_html.escape(col)}:</div>'
                     f'<div class="fitchips" data-col="{fit_keys[col]}">{chips_f}</div>')
 
-    if reviewed:
+    if writeback_error:
+        status = (
+            '<span class="status err">saved locally; Sheet write-back failed '
+            '— retry</span>'
+        )
+    elif reviewed:
         saved = "✓ saved: " + str(human.get("hvac_systems", ""))
         for col in FIT_COLUMNS:
             v = human.get(fit_keys[col])
@@ -135,10 +145,18 @@ def _card(e):
     else:
         status = '<span class="status"></span>'
 
+    source = ""
+    if e.get("source_tab"):
+        source = (
+            f'<div class="source">Tab: {_html.escape(str(e["source_tab"]))} '
+            f'· row {_html.escape(str(e.get("source_row") or ""))}</div>'
+        )
+    button_text = "Retry Sheet write-back" if writeback_error else "Submit"
+
     return f'''
-<article class="card{' done' if reviewed else ''}" data-rid="{rid}" data-addr="{addr_e}" data-ai="{_html.escape(ai)}">
+<article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_error else ''}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-addr="{addr_e}" data-ai="{_html.escape(ai)}">
   <div class="head">
-    <div class="addr">{addr_e}</div>
+    <div><div class="addr">{addr_e}</div>{source}</div>
     <div class="ai">model: <span class="badge" style="background:{ai_color}">{_html.escape(ai) or '—'}</span></div>
   </div>
   {carousel}
@@ -152,17 +170,35 @@ def _card(e):
     <div class="label">HVAC systems you see (check all):</div>
     <div class="chips">{chips}</div>
     {fitrows}
-    <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}">
-    <button type="button" class="submit"{dis} onclick="submitCard(this)">Submit</button>
+    <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}"{controls_dis}>
+    <button type="button" class="submit"{submit_dis} onclick="submitCard(this)">{button_text}</button>
     {status}
   </div>
 </article>'''
 
 
 def build_review_page(entries, job_id, webhook_url="", title="Cooling Tower Review", csrf_token=""):
-    cards = "\n".join(_card(e) for e in entries)
+    grouped = {}
+    for entry in entries:
+        grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
+    if len(grouped) == 1 and "" in grouped:
+        cards = "\n".join(_card(e) for e in entries)
+    else:
+        sections = []
+        for tab, tab_entries in grouped.items():
+            tab_done = sum(1 for entry in tab_entries if entry.get("human"))
+            sections.append(
+                f'<section class="tab-group"><div class="tab-head">'
+                f'<h2>{_html.escape(tab or "Other")}</h2>'
+                f'<span class="tab-progress">{len(tab_entries)}/{len(tab_entries)} analyzed '
+                f'· {tab_done}/{len(tab_entries)} reviewed</span></div>'
+                + "\n".join(_card(entry) for entry in tab_entries)
+                + "</section>"
+            )
+        cards = "\n".join(sections)
     total = len(entries)
     done0 = sum(1 for e in entries if e.get("human"))
+    attention0 = sum(1 for e in entries if e.get("error") and not e.get("human"))
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
@@ -175,8 +211,12 @@ body{{margin:0;background:#0d0f12;color:#e6e8eb;font:15px/1.5 -apple-system,Sego
 header{{position:sticky;top:0;z-index:5;background:#12151a;border-bottom:1px solid #262b33;padding:14px 20px}}
 header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;margin-top:2px}}
 .wrap{{max-width:900px;margin:0 auto;padding:18px}}
+.tab-group{{margin:0 0 28px}}.tab-head{{display:flex;justify-content:space-between;align-items:center;
+ gap:12px;margin:6px 2px 12px;padding-bottom:8px;border-bottom:1px solid #333b45}}
+.tab-head h2{{margin:0;font-size:18px}}.tab-head span,.source{{color:#9aa3ad;font-size:12px}}
 .card{{background:#161a20;border:1px solid #262b33;border-radius:12px;padding:16px;margin:0 0 16px}}
 .card.done{{border-color:#2f9e44;opacity:.85}}
+.card.writeback-error{{border-color:#f59f00;opacity:1}}
 .head{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
 .addr{{font-weight:600}}.badge{{color:#0d0f12;font-weight:700;font-size:12px;padding:2px 8px;border-radius:20px}}
 .carousel{{position:relative;margin:12px 0;background:#0b0d10;border:1px solid #222833;border-radius:10px}}
@@ -218,7 +258,7 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 #lb img{{max-width:96%;max-height:92vh;border:2px solid #fff;border-radius:6px}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
-<div class="sub"><span id="done">{done0}</span>/{total} reviewed · check the HVAC systems you see on each building; it writes back to the sheet</div></header>
+<div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · {attention0} need attention · every Submit writes to the source tab</div></header>
 <div class="wrap">{cards}</div>
 <div class="bulk-review">
   <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>). Incomplete cards are skipped so nothing is guessed.</div>
@@ -248,6 +288,10 @@ async function submitCard(btn){{
   if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return 'incomplete';}}
   const fits={{}};
   card.querySelectorAll('.fitchips').forEach(g=>{{const s=g.querySelector('.fitchip.sel');fits[g.dataset.col]=s?s.dataset.fit:'';}});
+  if(!fits.optimizer_fit || !fits.periscope_fit){{
+    status.textContent='choose both Optimizer Fit and Periscope Fit';
+    status.className='status err';return 'incomplete';
+  }}
   const payload={{job_id:JOB,row_id:card.dataset.rid,address:card.dataset.addr,ai_verdict:card.dataset.ai,
     hvac_systems:sys.join(', '),optimizer_fit:fits.optimizer_fit||'',periscope_fit:fits.periscope_fit||'',
     note:card.querySelector('.note').value}};
@@ -266,8 +310,14 @@ async function submitCard(btn){{
     }}
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
     status.textContent='✓ saved: '+payload.hvac_systems+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
-    card.classList.add('done');card.querySelectorAll('.chip,.fitchip').forEach(c=>c.disabled=true);
-    done++;document.getElementById('done').textContent=done;
+    const wasReviewed=card.dataset.reviewed==='1';
+    card.classList.add('done');card.classList.remove('writeback-error');
+    card.dataset.reviewed='1';card.querySelectorAll('.chip,.fitchip,.note').forEach(c=>c.disabled=true);
+    if(!wasReviewed){{done++;document.getElementById('done').textContent=done;}}
+    const group=card.closest('.tab-group');
+    if(group){{const totalInGroup=group.querySelectorAll('.card').length;
+      const doneInGroup=group.querySelectorAll('.card[data-reviewed="1"]').length;
+      group.querySelector('.tab-progress').textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed';}}
     return 'saved';
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
 }}

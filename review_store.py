@@ -65,7 +65,9 @@ def list_batches() -> list:
 
 def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
                table_headers: list = None, table_rows: list = None,
-               sheet_binding: dict = None) -> None:
+               sheet_binding: dict = None, sheet_bindings: list = None,
+               tab_inventory: list = None, schema_version: int = 1,
+               run_id: str = None) -> None:
     """Persist a batch's web_entries (with images) for the review page, plus the
     ORIGINAL uploaded table (headers + rows, all the user's columns) so the finished
     Google Sheet can be assembled from the human picks later. sheet_binding is set
@@ -76,6 +78,10 @@ def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
             "title": title,
             "sheet_url": sheet_url,
             "sheet_binding": sheet_binding,
+            "sheet_bindings": sheet_bindings or [],
+            "tab_inventory": tab_inventory or [],
+            "schema_version": int(schema_version),
+            "run_id": run_id,
             "created": datetime.utcnow().isoformat(),
             "table_headers": table_headers or [],
             "table_rows": table_rows or [],
@@ -112,7 +118,11 @@ def save_raw(job_id: str, batch: dict) -> None:
 
 
 def _rid(entry) -> str:
-    return str(entry.get("i") if entry.get("i") is not None else entry.get("row_id", ""))
+    return str(
+        entry.get("row_id")
+        if entry.get("row_id") is not None
+        else entry.get("i", "")
+    )
 
 
 def record_decision(job_id: str, row_id, decision: dict):
@@ -133,3 +143,22 @@ def record_decision(job_id: str, row_id, decision: dict):
             return None
         write_json(_path(job_id), batch)
         return batch
+
+
+def record_writeback(job_id: str, row_id, status: str, error: str = ""):
+    """Persist whether the local decision reached its exact Sheet source row."""
+    with _lock_for(job_id):
+        batch = load_batch(job_id)
+        if not batch:
+            return None
+        for entry in batch.get("entries", []):
+            if _rid(entry) != str(row_id):
+                continue
+            entry["writeback"] = {
+                "status": str(status),
+                "error": str(error or ""),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            write_json(_path(job_id), batch)
+            return batch
+        return None

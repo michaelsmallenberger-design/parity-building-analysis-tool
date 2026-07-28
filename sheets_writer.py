@@ -92,8 +92,13 @@ def _norm(h) -> str:
     return re.sub(r"\s+", " ", str(h)).strip().lower()
 
 
+def _tab_range(tab: str, a1: str = "") -> str:
+    quoted = "'" + str(tab).replace("'", "''") + "'"
+    return f"{quoted}!{a1}" if a1 else quoted
+
+
 def inspect_bound_sheet(sheet_url):
-    """Read tab metadata plus bounded samples without creating or editing a Sheet."""
+    """Read tab metadata, exact usable-row counts, and bounded intake samples."""
     from intake_resolver import sample_row_limit
 
     sid = sheet_id_from_url(sheet_url)
@@ -102,19 +107,46 @@ def inspect_bound_sheet(sheet_url):
     sheets, _ = _get_services()
     ss = sheets.spreadsheets().get(
         spreadsheetId=sid,
-        fields="properties.title,sheets.properties(sheetId,title)").execute()
+        fields="properties.title,sheets.properties(sheetId,title,hidden)").execute()
     tabs = []
+    max_rows = max(1, int(os.getenv("WORKBOOK_MAX_ROWS_PER_TAB", "100000")))
+    max_cols = max(1, int(os.getenv("WORKBOOK_MAX_COLUMNS", "500")))
+    max_cells = max(1, int(os.getenv("WORKBOOK_MAX_USED_CELLS", "5000000")))
+    used_cells = 0
     for item in ss.get("sheets", []):
         props = item["properties"]
         title = props["title"]
         values = sheets.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"'{title}'!1:{sample_row_limit() + 1}").execute().get("values", [])
+            spreadsheetId=sid,
+            range=_tab_range(title),
+        ).execute().get("values", [])
+        if len(values) > max_rows:
+            raise ValueError(
+                f"Tab '{title}' exceeds the configured {max_rows} row limit"
+            )
+        widest = max((len(row) for row in values), default=0)
+        if widest > max_cols:
+            raise ValueError(
+                f"Tab '{title}' exceeds the configured {max_cols} column limit"
+            )
+        used_cells += sum(len(row) for row in values)
+        if used_cells > max_cells:
+            raise ValueError(
+                f"Workbook exceeds the configured {max_cells} used-cell limit"
+            )
         headers = [str(h).strip() for h in (values[0] if values else [])]
+        populated = [
+            [str(cell).strip() for cell in row]
+            for row in values[1:]
+            if any(str(cell).strip() for cell in row)
+        ]
         tabs.append({
             "tab": title,
             "grid_id": props["sheetId"],
+            "hidden": bool(props.get("hidden")),
             "headers": headers,
-            "rows": [[str(cell).strip() for cell in row] for row in values[1:]],
+            "rows": populated[:sample_row_limit()],
+            "row_count": len(populated),
         })
     return {
         "spreadsheet_id": sid,
@@ -141,7 +173,9 @@ def read_bound_sheet_mapping(sheet_url, mapping, expected_fingerprint=None):
     selected = next(tab for tab in inspected["tabs"] if tab["tab"] == normalized["tab"])
     sheets, _ = _get_services()
     values = sheets.spreadsheets().values().get(
-        spreadsheetId=inspected["spreadsheet_id"], range=f"'{selected['tab']}'").execute().get("values", [])
+        spreadsheetId=inspected["spreadsheet_id"],
+        range=_tab_range(selected["tab"]),
+    ).execute().get("values", [])
     headers = [str(h).strip() for h in (values[0] if values else [])]
     source_rows, row_numbers = [], []
     for rn, row in enumerate(values[1:], start=2):
@@ -165,6 +199,81 @@ def read_bound_sheet_mapping(sheet_url, mapping, expected_fingerprint=None):
     return binding, headers, source_rows
 
 
+def read_bound_sheet_mappings(sheet_url, mappings, expected_fingerprint=None):
+    """Bind every selected workbook tab and retain exact source row numbers.
+
+    The result is a list of ordinary single-tab bindings so legacy write helpers
+    remain usable.  A composite ``source_key`` (grid id + physical row) is the
+    collision-proof identity used by multi-tab review batches.
+    """
+    from intake_resolver import compose_addresses, schema_fingerprint, validate_mapping
+
+    inspected = inspect_bound_sheet(sheet_url)
+    current_fingerprint = schema_fingerprint(inspected["tabs"])
+    if expected_fingerprint and current_fingerprint != expected_fingerprint:
+        raise ValueError("The workbook changed after tab mapping. Review it and try again.")
+    by_name = {tab["tab"]: tab for tab in inspected["tabs"]}
+    import hashlib
+    sheet_key = hashlib.sha256(
+        inspected["spreadsheet_id"].encode("utf-8")
+    ).hexdigest()[:12]
+    sheets, _ = _get_services()
+    bindings = []
+    for proposed in mappings:
+        valid, reason, normalized = validate_mapping(inspected["tabs"], proposed)
+        if not valid or normalized is None:
+            raise ValueError(f"Can't use the mapping for tab '{proposed.get('tab', '')}': {reason}.")
+        selected = by_name[normalized["tab"]]
+        values = sheets.spreadsheets().values().get(
+            spreadsheetId=inspected["spreadsheet_id"],
+            range=_tab_range(selected["tab"]),
+        ).execute().get("values", [])
+        headers = [str(header).strip() for header in (values[0] if values else [])]
+        source_rows, row_numbers = [], []
+        for row_number, row in enumerate(values[1:], start=2):
+            cells = [str(cell).strip() for cell in row]
+            if any(cells):
+                source_rows.append(cells + [""] * (len(headers) - len(cells)))
+                row_numbers.append(row_number)
+        addresses = compose_addresses(headers, source_rows, normalized)
+        targets = []
+        kept_rows, kept_numbers, kept_addresses = [], [], []
+        for cells, row_number, address in zip(source_rows, row_numbers, addresses):
+            if not str(address).strip():
+                continue
+            kept_rows.append(cells)
+            kept_numbers.append(row_number)
+            kept_addresses.append(address)
+            targets.append({
+                "source_key": (
+                    f"s{sheet_key}:g{selected['grid_id']}:r{row_number}"
+                ),
+                "grid_id": selected["grid_id"],
+                "tab": selected["tab"],
+                "source_row": row_number,
+                "address": address,
+            })
+        bindings.append({
+            "spreadsheet_id": inspected["spreadsheet_id"],
+            "grid_id": selected["grid_id"],
+            "tab": selected["tab"],
+            "headers": headers,
+            "row_numbers": kept_numbers,
+            "source_rows": kept_rows,
+            "processing_headers": ["Address"],
+            "processing_rows": [[address] for address in kept_addresses],
+            "targets": targets,
+            "title": (f"{inspected['title']} — {selected['tab']}"
+                      if inspected["title"] else selected["tab"]),
+            "sheet_url": (
+                f"https://docs.google.com/spreadsheets/d/{inspected['spreadsheet_id']}"
+                f"/edit#gid={selected['grid_id']}"
+            ),
+            "intake_mapping": normalized,
+        })
+    return bindings
+
+
 def read_bound_sheet(sheet_url, address_variants):
     """Open the team's live Google Sheet for run-in-place mode. Picks the
     leftmost tab whose header row has an address column (sales workbooks lead
@@ -186,7 +295,8 @@ def read_bound_sheet(sheet_url, address_variants):
     for t in meta:
         title = t["properties"]["title"]
         head = sheets.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"'{title}'!1:1").execute().get("values", [[]])
+            spreadsheetId=sid, range=_tab_range(title, "1:1"),
+        ).execute().get("values", [[]])
         headers = [str(h).strip() for h in (head[0] if head else [])]
         if {_norm(h) for h in headers} & addr_norms:
             chosen = (t["properties"], headers)
@@ -197,7 +307,8 @@ def read_bound_sheet(sheet_url, address_variants):
             "(e.g. 'Property Address' or 'Address') in its first row.")
     props, headers = chosen
     vals = sheets.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"'{props['title']}'").execute().get("values", [])
+        spreadsheetId=sid, range=_tab_range(props["title"]),
+    ).execute().get("values", [])
     data_rows, row_numbers = [], []
     for rn, row in enumerate(vals[1:], start=2):
         cells = [str(c).strip() for c in row]
@@ -251,14 +362,14 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     if missing:
         start = _col_letter(next_idx)
         sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range=f"'{tab}'!{start}1", valueInputOption="RAW",
+            spreadsheetId=sid, range=_tab_range(tab, f"{start}1"), valueInputOption="RAW",
             body={"values": [missing]}).execute()
         for canon in missing:
             colmap[canon] = next_idx
             next_idx += 1
     if review_url:
         sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range=f"'{tab}'!{_col_letter(next_idx)}1",
+            spreadsheetId=sid, range=_tab_range(tab, f"{_col_letter(next_idx)}1"),
             valueInputOption="USER_ENTERED",
             body={"values": [[f'=HYPERLINK("{review_url}", "▸ Open review page")']]}).execute()
 
@@ -315,7 +426,8 @@ def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit=
     cells = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
     if note:
         cells[NOTES_COL] = note
-    data = [{"range": f"'{binding['tab']}'!{_col_letter(colmap[k])}{row}", "values": [[v]]}
+    data = [{"range": _tab_range(binding["tab"], f"{_col_letter(colmap[k])}{row}"),
+             "values": [[v]]}
             for k, v in cells.items() if k in colmap]
     if not data:
         return False
@@ -323,6 +435,34 @@ def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit=
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=binding["spreadsheet_id"],
         body={"valueInputOption": "USER_ENTERED", "data": data}).execute()
+    return True
+
+
+def write_decision_source(binding, source_row, hvac, optimizer_fit="",
+                          periscope_fit="", note="") -> bool:
+    """Write a decision to an explicit physical row in one bound workbook tab."""
+    try:
+        row = int(source_row)
+    except (TypeError, ValueError):
+        return False
+    if row < 2:
+        return False
+    colmap = binding.get("colmap") or {}
+    cells = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
+    if note:
+        cells[NOTES_COL] = note
+    data = [
+        {"range": _tab_range(binding["tab"], f"{_col_letter(colmap[key])}{row}"),
+         "values": [[value]]}
+        for key, value in cells.items() if key in colmap
+    ]
+    if not data:
+        return False
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"valueInputOption": "USER_ENTERED", "data": data},
+    ).execute()
     return True
 
 

@@ -8,7 +8,15 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     numInstances: 1
+    disk:
+      name: review-storage
+      mountPath: /var/data
+      sizeGB: 5
     envVars:
+      - key: STORAGE_DIR
+        value: /var/data/storage
+      - key: JOBS_DB_PATH
+        value: /var/data/storage/jobs.db
       - key: GOOGLE_MAPS_API_KEY
         sync: false
       - key: MAPBOX_API_KEY
@@ -47,6 +55,24 @@ services:
         value: "250"
       - key: ANALYZE_MAX_BATCH_ROWS
         value: "250"
+      - key: ANALYZE_MONTHLY_ADDRESS_LIMIT
+        value: "2500"
+      - key: MULTI_TAB_WORKBOOK_ENABLED
+        value: "false"
+      - key: MULTI_TAB_BROWSER_ENABLED
+        value: "true"
+      - key: MULTI_TAB_DRIVE_ENABLED
+        value: "true"
+      - key: MULTI_TAB_API_ENABLED
+        value: "false"
+      - key: WORKBOOK_AUTO_APPROVAL_ROWS
+        value: "250"
+      - key: WORKBOOK_CHUNK_ROWS
+        value: "100"
+      - key: ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS
+        sync: false
+      - key: ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS
+        sync: false
       - key: MAX_REQUEST_BYTES
         value: "52428800"
       - key: GEOCODER_PROVIDER
@@ -56,7 +82,7 @@ services:
       - key: MODEL_PATHS
         value: models/rooftop_model.pt,models/rooftop_model_prev.pt
       - key: VLM_ADDRESS_CONCURRENCY
-        value: "3"
+        value: "5"
       - key: VLM_TIMEOUT_SECONDS
         value: "120"
       - key: VLM_CONSENSUS_THRESHOLD

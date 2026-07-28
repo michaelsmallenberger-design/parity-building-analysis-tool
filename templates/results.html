@@ -586,6 +586,20 @@
                     statusElement.style.color = '#dc3545';
                     loaderElement.style.display = 'none';
                     cancelButton.style.display = 'none';
+                    if (jobId.startsWith('w-') && !headerElement.querySelector('.workbook-retry')) {
+                        const retryForm = document.createElement('form');
+                        retryForm.className = 'workbook-retry';
+                        retryForm.method = 'POST';
+                        retryForm.action = `/workbook/${jobId}/retry`;
+                        retryForm.innerHTML = `
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <button type="submit" class="download-button primary">
+                                Retry unfinished rows
+                            </button>
+                            <p>Completed checkpoints will be skipped and the workbook will not be reserved twice.</p>
+                        `;
+                        headerElement.appendChild(retryForm);
+                    }
                 }
             })
             .catch(err => {

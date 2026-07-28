@@ -40,6 +40,7 @@ geometry (1).py
 # Sensitive / local-only files (do not publish on public fork)
 Existing_Market_TAM.xlsx
 jobs.db
+jobs.db-*
 storage/
 temp_uploads/
 training_images/
