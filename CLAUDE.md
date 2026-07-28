@@ -9,7 +9,7 @@ Render-hosted Flask app with three workbook-capable front doors:
 
 1. Browser `.xlsx`/CSV upload or live Google Sheet link.
 2. Shared Drive inbox.
-3. Versioned asynchronous API/n8n intake through `/api/v2/workbook-runs`.
+3. Versioned asynchronous API intake through `/api/v2/workbook-runs`.
 
 All three use one resumable, fail-closed workbook engine. `/api/run` and
 `/api/run-file` remain legacy single-table compatibility routes.
@@ -53,9 +53,8 @@ Assets/config:
 - `static/images/`
 - `Dockerfile.railway`
 - `requirements_railway.txt`
-- `n8n/README.md`
-- `n8n/parity_cooling_tower.workflow.json`
-- `n8n/parity_workbook_async.workflow.json`
+The `n8n/` directory is inactive reference material. Current production does
+not use or require n8n.
 
 ## Current Pipeline
 

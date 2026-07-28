@@ -25,15 +25,15 @@
         USD for the unique addresses.
       </p>
     {% else %}
-      <p style="color:#a61b1b;">
-        Cost-rate configuration is missing. Approval will remain blocked until
-        the operator configures measured per-address minimum and maximum rates.
+      <p>
+        No cost estimate is configured. This approval records the exact workbook
+        scope shown above and allows the complete run to proceed.
       </p>
     {% endif %}
   </div>
   <form method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button class="go" type="submit" {% if not run.cost_estimate %}disabled{% endif %}>
+    <button class="go" type="submit">
       Approve and analyze the entire workbook
     </button>
   </form>

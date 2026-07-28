@@ -1,10 +1,9 @@
-"""Stateless analyzer HTTP API (Flask Blueprint).
+"""Analyzer and durable workbook HTTP API (Flask Blueprint).
 
-These endpoints exist so an external orchestrator (n8n Cloud) can drive the
-cooling-tower pipeline per address and assemble an emailed report, WITHOUT the
-SQLite job queue, background worker, or local file storage that the browser UI
-(app_railway.py) relies on. n8n cannot run the ML itself (its Python node is a
-sandboxed Pyodide runtime — no PyTorch/YOLO), so it calls these endpoints.
+External integrations can drive the cooling-tower pipeline without the browser
+UI. Legacy synchronous routes run without the SQLite job queue; versioned
+workbook routes use the same resumable engine as browser and Drive intake. All
+geocoding, imagery, YOLO, and VLM work stays on Render.
 
 Endpoints:
     POST /api/analyze  {address, boro_area?, zip?}  -> web_entry JSON (images as data: URIs)
@@ -195,7 +194,8 @@ def health():
         "review_metrics": vlm_metrics,
         "workbook_metrics": workbook_runs.metrics_snapshot(),
         "multi_tab_workbook_enabled": workbook_runs.enabled(),
-        "large_workbook_approval_ready": cost_configuration["configured"],
+        "large_workbook_approval_ready": True,
+        "large_workbook_cost_estimate_configured": cost_configuration["configured"],
         "large_workbook_cost_configuration": cost_configuration,
         "max_batch_rows": batch_size_limit(),
     })
@@ -462,7 +462,7 @@ def _read_uploaded_dataframe(uploaded_file):
 @require_key
 def analyze():
     """Analyze a single address. Always returns 200 with a web_entry (errors are
-    encoded in the entry's `error`/`verdict` fields) so an n8n per-row loop keeps
+    encoded in the entry's `error`/`verdict` fields) so an external per-row loop keeps
     going on a bad address instead of aborting the batch."""
     body = request.get_json(silent=True) or {}
     address = (body.get("address") or "").strip()
@@ -717,9 +717,8 @@ def _finalize_batch(
 @require_key
 def run():
     """Batch endpoint: analyze a whole list of addresses and return the finished
-    self-contained HTML audit report. This is the single Render call the n8n
-    workflow makes (Sheet -> normalize -> /api/run -> email), so n8n doesn't have
-    to loop per address. Body: {addresses: [str | {address,boro_area,zip}], title?}.
+    self-contained HTML audit report for legacy synchronous integrations.
+    Body: {addresses: [str | {address,boro_area,zip}], title?}.
     Returns text/html."""
     body = request.get_json(silent=True) or {}
     addresses = body.get("addresses")
@@ -882,8 +881,7 @@ def workbook_run_retry(run_id):
 def run_file():
     """Analyze an uploaded Excel/CSV file and return the finished audit report.
 
-    Intended for n8n Form/Webhook upload flows: n8n receives the file, forwards it
-    as multipart/form-data field `file`, then emails this endpoint's HTML body.
+    Intended for legacy multipart integrations that still need a review URL.
     """
     uploaded = request.files.get("file") or request.files.get("data")
     if not uploaded or uploaded.filename == "":
@@ -926,7 +924,7 @@ def run_file():
     try:
         df, addr_col, boro_col, zip_col = _read_uploaded_dataframe(uploaded)
     except MappingConfirmationRequired as e:
-        # n8n/API sources can auto-run only a locally validated high-confidence
+        # External API sources can auto-run only a locally validated high-confidence
         # mapping.  Returning a clear non-2xx result prevents a guessed column
         # from ever starting paid address processing.
         return jsonify({

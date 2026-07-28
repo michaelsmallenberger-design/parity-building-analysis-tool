@@ -69,10 +69,6 @@ services:
         value: "250"
       - key: WORKBOOK_CHUNK_ROWS
         value: "100"
-      - key: ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS
-        sync: false
-      - key: ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS
-        sync: false
       - key: MAX_REQUEST_BYTES
         value: "52428800"
       - key: GEOCODER_PROVIDER

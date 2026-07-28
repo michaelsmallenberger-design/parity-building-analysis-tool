@@ -9,7 +9,7 @@ Internal cooling-tower analysis tool for building address lists. The app geocode
 - Runtime: single-process Flask app with one Gunicorn worker and threaded request handling
 - Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
 - Current report format: audit-card HTML from `report_audit.py`; interactive dark review page from `review_render.py`
-- Current automation paths: browser, Drive inbox, and the versioned API use the durable workbook engine; the n8n workbook workflow targets `POST /api/v2/workbook-runs`
+- Current automation paths: browser, Drive inbox, and the versioned API use the durable workbook engine; there is no deployed n8n dependency
 - Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC/Fit picks into a Google Sheet
 
 Presentation material is in `docs/presentation/`.
@@ -29,16 +29,17 @@ Primary files:
 - `storage_helpers.py`
 - `tasks_local.py`
 
-### Stateless API
+### API
 
-External automations can call the app without the queue or local result storage.
+External integrations can use either legacy synchronous routes or the durable
+versioned workbook engine.
 
 - `POST /api/run`: list of addresses -> finished self-contained audit HTML (also persists a review batch; returns its `/review/<batch_id>` URL in the `X-Review-URL` header and, when the Sheets credential is configured, the live sheet link in `X-Sheet-URL`)
 - `POST /api/run-file`: uploaded Excel/CSV file -> JSON `{review_url, sheet_url, count}` (all original columns preserved; `sheet_url` is the live Google Sheet created at run time when `GOOGLE_SERVICE_ACCOUNT_JSON` is configured, else `""`)
 - `POST /api/v2/workbook-runs`: asynchronous `.xlsx`/CSV/Google-Sheet intake -> durable run metadata, tab inventory, approval/status links, Sheet link, and eventual grouped review link
 - `GET /api/v2/workbook-runs/<run_id>`: current workbook state and exact overall/tab denominators
 - `POST /api/v2/workbook-runs/<run_id>/confirmation`: confirm all exceptional tab mappings before spend
-- `POST /api/v2/workbook-runs/<run_id>/approval`: record one whole-workbook cost approval when the eligible row count exceeds the automatic threshold
+- `POST /api/v2/workbook-runs/<run_id>/approval`: acknowledge and reserve the entire workbook when the eligible row count exceeds the automatic threshold
 - `POST /api/v2/workbook-runs/<run_id>/retry`: resume a failed/cancelled analysis from durable row checkpoints without a second reservation
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
@@ -47,7 +48,7 @@ External automations can call the app without the queue or local result storage.
 - `GET /api/batch/<batch_id>/failures`: the rows that failed analysis (imagery/geocode/analyzer errors) for the cleanup skill
 - `POST /api/batch/<batch_id>/rerun`: re-run failed rows in place (optionally with corrected addresses) and merge fresh results into the same review page/sheet
 - `GET /api/health`: API health check, including separate
-  `large_workbook_approval_ready` cost-configuration status
+  optional cost-estimate configuration status
 
 Spend-incurring API routes require `X-API-Key: <ANALYZE_API_KEY>`.
 
@@ -61,9 +62,8 @@ Primary files:
 
 - `api_analyze.py`
 - `report_audit.py`
-- `n8n/README.md`
-- `n8n/parity_cooling_tower.workflow.json`
-- `n8n/parity_workbook_async.workflow.json`
+The `n8n/` directory contains inactive reference workflows only. Production
+does not deploy or require n8n.
 
 ### Team Review + Google Sheet
 
@@ -138,7 +138,7 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MULTI_TAB_BROWSER_ENABLED`, `MULTI_TAB_DRIVE_ENABLED`, `MULTI_TAB_API_ENABLED`: staged surface flags
 - `WORKBOOK_AUTO_APPROVAL_ROWS`: default `250`; larger workbooks wait for one recorded approval and are never truncated
 - `WORKBOOK_CHUNK_ROWS`: durable chunk size, default `100`
-- `ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS` / `ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS`: measured/configured rates required for large-workbook approval
+- `ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS` / `ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS`: optional display-only estimate; missing or invalid rates never block approval
 - `STORAGE_DIR` / `JOBS_DB_PATH`: point manifests, checkpoints, reviews, and SQLite at the Render persistent disk
 - `VLM_TIMEOUT_SECONDS`: default `120`
 - `GEMINI_MODEL`: default `gemini-3.6-flash`

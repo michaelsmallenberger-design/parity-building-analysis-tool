@@ -534,7 +534,7 @@ def test_queue_chunking_duplicate_reuse_and_atomic_approval(root):
                     os.environ[name] = value
 
 
-def test_cost_configuration_fails_closed():
+def test_cost_configuration_is_optional_but_validated():
     old_values = {
         name: os.environ.get(name)
         for name in (
@@ -580,6 +580,53 @@ def test_cost_configuration_fails_closed():
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def test_large_workbook_approval_without_cost_rates(root):
+    with IsolatedState(root):
+        old_threshold = os.environ.get("WORKBOOK_AUTO_APPROVAL_ROWS")
+        old_values = {
+            name: os.environ.get(name)
+            for name in (
+                "ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS",
+                "ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS",
+            )
+        }
+        try:
+            os.environ["WORKBOOK_AUTO_APPROVAL_ROWS"] = "2"
+            for name in old_values:
+                os.environ.pop(name, None)
+            run = {
+                "run_id": "w-no-cost",
+                "status": "approval_required",
+                "analysis_count": 3,
+                "row_count": 3,
+                "cost_estimate": None,
+                "created_at": "now",
+            }
+            workbook_runs.save_run(run)
+            approved = workbook_runs.approve("w-no-cost")
+            assert approved["status"] == "queued"
+            assert approved["approved_at"]
+            assert approved["reserved_address_count"] == 3
+            assert job_queue.get_job_status("w-no-cost")["total"] == 3
+        finally:
+            if old_threshold is None:
+                os.environ.pop("WORKBOOK_AUTO_APPROVAL_ROWS", None)
+            else:
+                os.environ["WORKBOOK_AUTO_APPROVAL_ROWS"] = old_threshold
+            for name, value in old_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def test_costless_approval_ui_is_enabled():
+    source = Path("templates/workbook_approval.html").read_text(encoding="utf-8")
+    assert "Approval will remain blocked" not in source
+    assert "if not run.cost_estimate %}disabled" not in source
+    assert "No cost estimate is configured" in source
 
 
 def test_default_hundred_address_chunks(root):
@@ -930,7 +977,8 @@ if __name__ == "__main__":
         test_range_dropdown_values_and_unsupported_rules(temp_dir)
         test_conversion_mismatch_trashes_before_queue(temp_dir)
         test_queue_chunking_duplicate_reuse_and_atomic_approval(temp_dir)
-        test_cost_configuration_fails_closed()
+        test_cost_configuration_is_optional_but_validated()
+        test_large_workbook_approval_without_cost_rates(temp_dir)
         test_default_hundred_address_chunks(temp_dir)
         test_resume_skips_checkpointed_rows(temp_dir)
         test_corrected_rerun_uses_exact_multitab_source(temp_dir)
@@ -938,5 +986,6 @@ if __name__ == "__main__":
     test_dropdown_conversion_fails_closed()
     test_grouped_review_and_exact_tab_writeback()
     test_versioned_async_api_contract()
+    test_costless_approval_ui_is_enabled()
     test_n8n_async_workflow_contract()
     print("OK: multi-tab workbook contracts hold without paid or network calls.")
