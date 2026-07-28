@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -51,6 +52,10 @@ _locks_guard = threading.Lock()
 _locks: dict[str, threading.RLock] = {}
 _metrics_lock = threading.Lock()
 _metrics = collections.Counter()
+_COST_RATE_ENV_NAMES = (
+    "ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS",
+    "ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS",
+)
 
 
 def enabled() -> bool:
@@ -146,14 +151,46 @@ def list_runs() -> list[dict[str, Any]]:
     return sorted(runs, key=lambda item: item.get("created_at", ""), reverse=True)
 
 
-def _cost_estimate(address_count: int) -> dict[str, Any] | None:
+def cost_configuration_status() -> dict[str, Any]:
+    """Return a non-secret readiness receipt for large-workbook approval."""
+    missing = [
+        name for name in _COST_RATE_ENV_NAMES
+        if not os.environ.get(name, "").strip()
+    ]
+    if missing:
+        return {
+            "configured": False,
+            "missing_configuration": missing,
+            "invalid_configuration": [],
+        }
     try:
-        low = float(os.environ["ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS"])
-        high = float(os.environ["ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS"])
-    except (KeyError, TypeError, ValueError):
+        low = float(os.environ[_COST_RATE_ENV_NAMES[0]])
+        high = float(os.environ[_COST_RATE_ENV_NAMES[1]])
+    except (TypeError, ValueError):
+        return {
+            "configured": False,
+            "missing_configuration": [],
+            "invalid_configuration": list(_COST_RATE_ENV_NAMES),
+        }
+    if not math.isfinite(low) or not math.isfinite(high) or low < 0 or high < low:
+        return {
+            "configured": False,
+            "missing_configuration": [],
+            "invalid_configuration": list(_COST_RATE_ENV_NAMES),
+        }
+    return {
+        "configured": True,
+        "missing_configuration": [],
+        "invalid_configuration": [],
+        "_rates": (low, high),
+    }
+
+
+def _cost_estimate(address_count: int) -> dict[str, Any] | None:
+    configuration = cost_configuration_status()
+    if not configuration["configured"]:
         return None
-    if low < 0 or high < low:
-        return None
+    low, high = configuration["_rates"]
     return {
         "currency": "USD",
         "minimum": round(address_count * low, 2),

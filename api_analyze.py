@@ -177,6 +177,8 @@ def require_key(fn):
 def health():
     required = ["GOOGLE_MAPS_API_KEY", "MAPBOX_API_KEY", "GEMINI_API_KEY", "ANALYZE_API_KEY"]
     missing = [name for name in required if not os.environ.get(name, "").strip()]
+    cost_configuration = workbook_runs.cost_configuration_status()
+    cost_configuration.pop("_rates", None)
     # This endpoint is Render's liveness probe, so keep it HTTP 200. The body
     # tells operators whether a live process is actually ready to analyze.
     try:
@@ -193,6 +195,8 @@ def health():
         "review_metrics": vlm_metrics,
         "workbook_metrics": workbook_runs.metrics_snapshot(),
         "multi_tab_workbook_enabled": workbook_runs.enabled(),
+        "large_workbook_approval_ready": cost_configuration["configured"],
+        "large_workbook_cost_configuration": cost_configuration,
         "max_batch_rows": batch_size_limit(),
     })
 

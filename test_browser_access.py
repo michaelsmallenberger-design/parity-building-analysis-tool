@@ -75,7 +75,10 @@ def run():
     assert valid_csrf_review.status_code == 404
 
     # n8n's health check remains available without the shared browser password.
-    assert client.get("/api/health").status_code == 200
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert isinstance(health.json["large_workbook_approval_ready"], bool)
+    assert "configured" in health.json["large_workbook_cost_configuration"]
 
     bad_logout = client.post("/logout")
     assert bad_logout.status_code == 403
