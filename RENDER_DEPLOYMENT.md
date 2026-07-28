@@ -73,7 +73,7 @@ review Submit into it live.
    - `SHEET_PARENT_FOLDER_ID` = the folder ID from step 5.
    - `SHEET_SHARE_WITH` = teammates' emails, comma-separated (the folder owner
      already has access).
-7. Deploy. Verify: run a small batch via `/api/run-file` — the JSON response's
+7. Deploy. Verify: run a small single-tab batch via `/api/run-file` — the JSON response's
    `sheet_url` should be a real `docs.google.com` link that opens in your Drive
    folder, and a Submit on the review page should appear in the sheet within a
    second or two.
@@ -82,7 +82,26 @@ Sheets land in (and are owned via) the parent folder's owner for consumer Gmail
 accounts — they use that owner's storage quota, which is why the shared folder is
 required.
 
-The blueprint also sets `ANALYZE_FILE_MAX_ROWS=250` for uploaded spreadsheets. Raise it only when you intentionally want larger paid batches.
+The Blueprint mounts `/var/data` as a persistent disk. `STORAGE_DIR` and
+`JOBS_DB_PATH` must stay on that disk or workbook checkpoints and review
+decisions will not survive a redeploy.
+
+The multi-tab rollout is staged:
+
+1. Deploy with `MULTI_TAB_WORKBOOK_ENABLED=false`.
+2. Configure measured
+   `ANALYZE_ESTIMATED_MIN_COST_PER_ADDRESS` and
+   `ANALYZE_ESTIMATED_MAX_COST_PER_ADDRESS`.
+3. Run the disposable conversion/dropdown smoke test.
+4. Set the master flag to `true`, with browser and Drive enabled and API/n8n
+   still disabled.
+5. After browser/Drive metrics are clean, enable
+   `MULTI_TAB_API_ENABLED` and switch n8n to
+   `n8n/parity_workbook_async.workflow.json`.
+
+`ANALYZE_FILE_MAX_ROWS=250` remains only for legacy synchronous file calls.
+The workbook engine uses 250 as an approval threshold, not a truncation limit,
+and processes approved workbooks in durable 100-address chunks.
 
 ## Dashboard Steps
 

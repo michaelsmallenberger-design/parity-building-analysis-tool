@@ -10,7 +10,7 @@ The current system has two front doors:
 
 1. Browser CSV upload through `app_railway.py`, `worker.py`, `job_queue.py`, and `tasks_local.py`.
 2. Stateless n8n/API flow through `api_analyze.py`, especially `POST /api/run`.
-3. File-upload automation through `POST /api/run-file` (accepts `.xlsx`, `.xls`, or `.csv`), which returns JSON `{review_url, count}` and drives the team review flow — this is the endpoint the Claude skill calls.
+3. Legacy single-table file automation through `POST /api/run-file` (`.xlsx` or `.csv`; `.xls` is rejected). Multi-tab workbooks use the durable `POST /api/workbook-runs` engine and grouped review flow.
 
 The active per-address pipeline uses Google geocoding/imagery by default, Mapbox fallback/dense-core imagery, OSM -> NYC -> Microsoft footprint fallback, two zoom levels, optional YOLO ensemble through `MODEL_PATHS`, and one address-level `vlm.verify_address()` call.
 
@@ -23,6 +23,7 @@ Keep and treat as active:
 - `worker.py`
 - `job_queue.py`
 - `storage_helpers.py`
+- `workbook_runs.py`
 - `tasks_local.py`
 - `utils.py`
 - `geometry.py`
@@ -66,6 +67,9 @@ Important defaults:
 - `MAPBOX_ZOOM=19`
 - `MAPBOX_ZOOM_WIDE=18`
 - `VLM_ADDRESS_CONCURRENCY=5`
+- `MULTI_TAB_WORKBOOK_ENABLED=false` until staged rollout
+- `WORKBOOK_CHUNK_ROWS=100`
+- `WORKBOOK_AUTO_APPROVAL_ROWS=250`
 - `GEMINI_MODEL=gemini-3.6-flash`
 - `GROK_MODEL=grok-4.3`
 

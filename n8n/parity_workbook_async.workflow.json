@@ -1,0 +1,181 @@
+{
+  "name": "Parity Multi-Tab Workbook - Async Upload and Poll",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "parity-workbook-run",
+        "responseMode": "onReceived",
+        "responseData": "={{ { \"status\": \"accepted\" } }}",
+        "options": {}
+      },
+      "id": "workbook-webhook",
+      "name": "Workbook Upload Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-620, 240],
+      "webhookId": "parity-workbook-run",
+      "notes": "Accepts one multipart workbook upload and responds immediately. The remaining nodes poll Render in the background."
+    },
+    {
+      "parameters": {
+        "jsCode": "const keys = Object.keys($binary || {});\nif (!keys.length) throw new Error('No uploaded workbook was found');\nreturn [{ json: $json, binary: { file: $binary[keys[0]] } }];"
+      },
+      "id": "normalize-binary",
+      "name": "Normalize File Field",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-390, 240],
+      "notes": "Normalizes any incoming binary field name to `file`, which is the Render API contract."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://REPLACE-WITH-RENDER-SERVICE.onrender.com/api/v2/workbook-runs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "REPLACE_WITH_ANALYZE_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "file"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "create-run",
+      "name": "Create Workbook Run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-140, 240],
+      "notes": "Creates one durable workbook run. A 409 response intentionally means tab confirmation or another preflight stop is required; configure this node to continue on error if your n8n version treats 409 as fatal."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "still-running-condition",
+              "leftValue": "={{ ['queued', 'analyzing'].includes($json.status) && !$json.review_url }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-running",
+      "name": "Still Running?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [100, 240]
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "wait",
+      "name": "Wait 30 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [340, 160],
+      "webhookId": "parity-workbook-poll-wait"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Create Workbook Run').item.json.status_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "REPLACE_WITH_ANALYZE_API_KEY"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "poll-status",
+      "name": "Poll Workbook Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [580, 160],
+      "notes": "Polls the durable run. It never repeats completed source keys after a Render restart."
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => ({ json: { ...item.json, notification: item.json.review_url ? 'ready_for_review' : item.json.approval_required ? 'approval_required' : item.json.confirmation_required ? 'tab_confirmation_required' : item.json.status } }));"
+      },
+      "id": "final-state",
+      "name": "Final or Action-Required State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [360, 340],
+      "notes": "Attach Gmail, Slack, Teams, or another notification node here. The item includes status_url, setup_url, approval_url, sheet_url, and review_url."
+    }
+  ],
+  "connections": {
+    "Workbook Upload Webhook": {
+      "main": [[{ "node": "Normalize File Field", "type": "main", "index": 0 }]]
+    },
+    "Normalize File Field": {
+      "main": [[{ "node": "Create Workbook Run", "type": "main", "index": 0 }]]
+    },
+    "Create Workbook Run": {
+      "main": [[{ "node": "Still Running?", "type": "main", "index": 0 }]]
+    },
+    "Still Running?": {
+      "main": [
+        [{ "node": "Wait 30 Seconds", "type": "main", "index": 0 }],
+        [{ "node": "Final or Action-Required State", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait 30 Seconds": {
+      "main": [[{ "node": "Poll Workbook Status", "type": "main", "index": 0 }]]
+    },
+    "Poll Workbook Status": {
+      "main": [[{ "node": "Still Running?", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -21,6 +21,7 @@ import threading
 
 import sheets_writer
 import intake_resolver
+import workbook_runs
 from job_queue import enqueue_job, check_usage_limit
 from storage_helpers import upload_file, write_json, read_json
 
@@ -59,7 +60,8 @@ def _record_pending(file_id, name, reason, resolution=None):
             "id": file_id,
             "name": name,
             "reason": reason,
-            "status": "needs_setup",
+            "status": (resolution or {}).get("status", "preflight"),
+            "run_id": (resolution or {}).get("run_id"),
             "schema_fingerprint": (resolution or {}).get("fingerprint"),
             "mapping": (resolution or {}).get("mapping"),
         })
@@ -70,12 +72,34 @@ def pending_mappings():
     return (read_json(_PENDING_PATH) or {"items": []}).get("items", [])
 
 
+def clear_pending_run(run_id):
+    pending = read_json(_PENDING_PATH) or {"items": []}
+    items = [
+        item for item in pending.get("items", [])
+        if str(item.get("run_id") or "") != str(run_id)
+    ]
+    if len(items) != len(pending.get("items", [])):
+        write_json(_PENDING_PATH, {"items": items})
+
+
 def enqueue_bound_sheet(sheet_url, source="drive-inbox"):
     """Read a live Google Sheet, dump its address tab to CSV, and enqueue the
     standard pipeline with a run-in-place binding. Returns (job_id, total).
     Raises on unreadable sheets / no address tab / usage limit."""
     from tasks_local import ADDRESS_VARIANTS
     inspected = sheets_writer.inspect_bound_sheet(sheet_url)
+    workbook_resolution = intake_resolver.resolve_workbook_schema(
+        inspected["tabs"], ADDRESS_VARIANTS,
+    )
+    selected_tabs = [
+        tab for tab in workbook_resolution["tabs"] if tab.get("status") == "selected"
+    ]
+    if workbook_resolution["status"] != "ready" or len(selected_tabs) > 1:
+        error = MappingNeedsSetup(
+            "Workbook has multiple or exceptional address tabs; no tab was selected"
+        )
+        error.resolution = workbook_resolution
+        raise error
     resolution = intake_resolver.resolve_schema(inspected["tabs"], ADDRESS_VARIANTS)
     if resolution["status"] == "deterministic":
         binding, _headers, _data_rows = sheets_writer.read_bound_sheet(sheet_url, ADDRESS_VARIANTS)
@@ -112,6 +136,68 @@ def enqueue_bound_sheet(sheet_url, source="drive-inbox"):
 
 def _handle_file(f, state):
     fid, name, mime = f["id"], f.get("name", "?"), f.get("mimeType", "")
+    if workbook_runs.surface_enabled("drive", default=True):
+        if mime == "application/vnd.ms-excel":
+            _record_pending(
+                fid, name,
+                "Save this legacy .xls workbook as .xlsx before analysis",
+            )
+            return
+        if mime == _SHEET_MIME:
+            run = workbook_runs.prepare_google_sheet(
+                f"https://docs.google.com/spreadsheets/d/{fid}/edit",
+                source_name=name, source_kind="drive_inbox",
+            )
+        elif mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+            run = workbook_runs.prepare_drive_xlsx(fid, name)
+            if run.get("sheet_id"):
+                _mark(state, run["sheet_id"])
+        elif mime == "text/csv":
+            fd, local = tempfile.mkstemp(prefix="parity-drive-", suffix=".csv")
+            os.close(fd)
+            try:
+                workbook_runs._download_drive_xlsx(fid, local)
+                run = workbook_runs.prepare_local_csv(
+                    local, name, source_kind="drive_inbox",
+                )
+            finally:
+                try:
+                    os.unlink(local)
+                except OSError:
+                    pass
+            if run.get("sheet_id"):
+                _mark(state, run["sheet_id"])
+        else:
+            log.info("[drive-inbox] ignoring '%s' (%s)", name, mime)
+            return
+        if (
+            run.get("confirmation_required")
+            or run.get("preflight_failed")
+            or run.get("status") == "approval_required"
+        ):
+            _record_pending(
+                fid, name,
+                run.get("error") or (
+                    "Workbook approval is required"
+                    if run.get("status") == "approval_required"
+                    else "Workbook tab confirmation is required"
+                ),
+                workbook_runs.public_summary(run),
+            )
+        log.info(
+            "[drive-inbox] workbook '%s' is %s as run %s",
+            name, run.get("status"), run.get("run_id"),
+        )
+        return
+    if mime in {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }:
+        _record_pending(
+            fid, name,
+            "Workbook conversion is waiting for the protected multi-tab engine",
+        )
+        return
     if mime == _SHEET_MIME:
         try:
             enqueue_bound_sheet(f"https://docs.google.com/spreadsheets/d/{fid}/edit",
@@ -146,10 +232,13 @@ def _scan(folder_id):
     res = drive.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         includeItemsFromAllDrives=True, supportsAllDrives=True,
-        fields="files(id,name,mimeType)").execute()
+        fields="files(id,name,mimeType,appProperties)").execute()
     state = _load_state()
     for f in res.get("files", []):
         if f["id"] in state["ids"]:
+            continue
+        if (f.get("appProperties") or {}).get("parityGenerated") == "true":
+            _mark(state, f["id"])
             continue
         # Mark BEFORE handling: a crashing file must never retry-bill forever.
         _mark(state, f["id"])

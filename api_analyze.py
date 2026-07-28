@@ -43,6 +43,7 @@ from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS, LEGACY_FIT_VAL
 import review_store
 import sheets_writer
 import intake_resolver
+import workbook_runs
 
 log = logging.getLogger("api")
 
@@ -112,6 +113,27 @@ def _result_counts(results: list) -> tuple[int, int]:
     return len(results) - failed, failed
 
 
+def _workbook_api_payload(run):
+    summary = workbook_runs.public_summary(run)
+    tabs = summary.pop("tabs")
+    base = (
+        os.environ.get("APP_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or ""
+    ).rstrip("/")
+    run_id = summary["run_id"]
+    return {
+        **summary,
+        "tab_inventory": tabs,
+        "address_count": summary["row_count"],
+        "status_url": f"{base}/api/v2/workbook-runs/{run_id}",
+        "approval_url": f"{base}/api/v2/workbook-runs/{run_id}/approval",
+        "confirmation_url": f"{base}/api/v2/workbook-runs/{run_id}/confirmation",
+        "retry_url": f"{base}/api/v2/workbook-runs/{run_id}/retry",
+        "setup_url": f"{base}/workbook/{run_id}/setup",
+    }
+
+
 class Base64Sink:
     """Drop-in replacement for storage_helpers.upload_file / make_signed_url that
     keeps annotated tiles in memory and hands them back as data: URIs, so the
@@ -168,6 +190,8 @@ def health():
         "grok_exception_paths_available": bool(os.environ.get("XAI_API_KEY", "").strip()),
         "intake_metrics": intake_resolver.metrics_snapshot(),
         "review_metrics": vlm_metrics,
+        "workbook_metrics": workbook_runs.metrics_snapshot(),
+        "multi_tab_workbook_enabled": workbook_runs.enabled(),
         "max_batch_rows": batch_size_limit(),
     })
 
@@ -599,7 +623,10 @@ def _table_from_df(df):
     return headers, rows
 
 
-def _finalize_batch(results, title, headers=None, rows=None, binding=None):
+def _finalize_batch(
+    results, title, headers=None, rows=None, binding=None, *,
+    batch_id=None, sheet_bindings=None, tab_inventory=None, run_id=None,
+):
     """Stamp row ids and persist the batch for /review, storing the ORIGINAL uploaded
     table (all the user's columns). When a Sheets service-account credential is
     configured, the output Google Sheet is created HERE, up front — each review
@@ -612,15 +639,38 @@ def _finalize_batch(results, title, headers=None, rows=None, binding=None):
         # carry the pandas index label as "i" (0-based, gappy after dropna), and
         # the review page matches sheet rows by this id against the sheet's
         # 1-based hidden Row_ID column.
-        e["row_id"] = i
-        e["i"] = i
-    batch_id = f"b-{uuid.uuid4().hex[:10]}"
+        if e.get("row_id") is None:
+            e["row_id"] = i
+        if e.get("i") is None:
+            e["i"] = e["row_id"]
+    batch_id = batch_id or f"b-{uuid.uuid4().hex[:10]}"
     if headers is None:
         headers, rows = _lean_table(results)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     review_url = f"{base}/review/{batch_id}" if base else f"/review/{batch_id}"
     sheet_url = ""
-    if binding and sheets_writer.enabled():
+    if sheet_bindings and sheets_writer.enabled():
+        prepared = []
+        for multi_binding in sheet_bindings:
+            try:
+                sheets_writer.ensure_review_columns(
+                    multi_binding, multi_binding.get("headers", []),
+                    HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                    review_url=review_url if base else "",
+                )
+                multi_binding.pop("writeback_error", None)
+            except Exception as e:
+                log.error(
+                    "Bound workbook tab setup failed for %s/%s: %s",
+                    batch_id, multi_binding.get("tab", ""), e, exc_info=True,
+                )
+                multi_binding["writeback_error"] = str(e)
+            prepared.append(multi_binding)
+        sheet_bindings = prepared
+        if prepared:
+            sid = prepared[0]["spreadsheet_id"]
+            sheet_url = f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    elif binding and sheets_writer.enabled():
         # Run-in-place: no new sheet — add the fill-out columns + dropdowns to
         # the team's own sheet and write decisions back into it.
         try:
@@ -640,7 +690,11 @@ def _finalize_batch(results, title, headers=None, rows=None, binding=None):
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
     review_store.save_batch(batch_id, title, results, sheet_url=sheet_url,
                             table_headers=headers, table_rows=rows,
-                            sheet_binding=binding)
+                            sheet_binding=binding,
+                            sheet_bindings=sheet_bindings,
+                            tab_inventory=tab_inventory,
+                            schema_version=2 if sheet_bindings else 1,
+                            run_id=run_id)
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url
@@ -693,6 +747,123 @@ def run():
     return response
 
 
+@api.route("/workbook-runs", methods=["GET"])
+@api.route("/v2/workbook-runs", methods=["GET"])
+@require_key
+def workbook_run_list():
+    if not workbook_runs.surface_enabled("api", default=False):
+        return jsonify({"error": "multi-tab workbook processing is disabled"}), 503
+    return jsonify({"runs": workbook_runs.list_runs()})
+
+
+@api.route("/workbook-runs", methods=["POST"])
+@api.route("/v2/workbook-runs", methods=["POST"])
+@require_key
+def workbook_run_create():
+    """Create one asynchronous, fail-closed workbook run."""
+    if not workbook_runs.surface_enabled("api", default=False):
+        return jsonify({"error": "multi-tab workbook processing is disabled"}), 503
+    uploaded = request.files.get("file") or request.files.get("data")
+    sheet_url = (request.form.get("sheet_url") or "").strip()
+    if not sheet_url and request.is_json:
+        sheet_url = str((request.get_json(silent=True) or {}).get("sheet_url") or "").strip()
+    try:
+        if sheet_url:
+            run = workbook_runs.prepare_google_sheet(
+                sheet_url, source_kind="api_sheet",
+            )
+        elif uploaded and uploaded.filename:
+            filename = secure_filename(uploaded.filename) or "workbook"
+            suffix = Path(filename).suffix.lower()
+            if suffix == ".xls":
+                return jsonify({
+                    "error": "Save the legacy Excel workbook as .xlsx and upload it again."
+                }), 400
+            if suffix not in {".xlsx", ".csv"}:
+                return jsonify({"error": "Upload must be an .xlsx or .csv file"}), 400
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                uploaded.save(handle.name)
+                temp_path = handle.name
+            try:
+                run = workbook_runs.prepare_local_file(
+                    temp_path, filename, source_kind="api",
+                )
+            finally:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+        else:
+            return jsonify({
+                "error": "Provide multipart field 'file' or JSON/form field 'sheet_url'"
+            }), 400
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        log.error("Workbook run creation failed: %s", exc, exc_info=True)
+        return jsonify({"error": str(exc)}), 409
+    code = 409 if run.get("confirmation_required") or run.get("preflight_failed") else 202
+    return jsonify(_workbook_api_payload(run)), code
+
+
+@api.route("/workbook-runs/<run_id>", methods=["GET"])
+@api.route("/v2/workbook-runs/<run_id>", methods=["GET"])
+@require_key
+def workbook_run_status(run_id):
+    run = workbook_runs.load_run(run_id)
+    if not run:
+        return jsonify({"error": "workbook run not found"}), 404
+    return jsonify(_workbook_api_payload(run))
+
+
+@api.route("/workbook-runs/<run_id>/confirmation", methods=["POST"])
+@api.route("/v2/workbook-runs/<run_id>/confirmation", methods=["POST"])
+@require_key
+def workbook_run_confirmation(run_id):
+    body = request.get_json(silent=True) or {}
+    selections = body.get("tabs")
+    if not isinstance(selections, list):
+        return jsonify({"error": "'tabs' must be a list of confirmed mappings"}), 400
+    try:
+        run = workbook_runs.confirm_mappings(run_id, selections)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    try:
+        from drive_inbox import clear_pending_run
+        clear_pending_run(run_id)
+    except Exception:
+        log.warning("Could not clear Drive pending marker for %s", run_id)
+    code = 409 if run.get("preflight_failed") else 202
+    return jsonify(_workbook_api_payload(run)), code
+
+
+@api.route("/workbook-runs/<run_id>/approval", methods=["POST"])
+@api.route("/v2/workbook-runs/<run_id>/approval", methods=["POST"])
+@require_key
+def workbook_run_approval(run_id):
+    try:
+        run = workbook_runs.approve(run_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    try:
+        from drive_inbox import clear_pending_run
+        clear_pending_run(run_id)
+    except Exception:
+        log.warning("Could not clear Drive pending marker for %s", run_id)
+    return jsonify(_workbook_api_payload(run)), 202
+
+
+@api.route("/workbook-runs/<run_id>/retry", methods=["POST"])
+@api.route("/v2/workbook-runs/<run_id>/retry", methods=["POST"])
+@require_key
+def workbook_run_retry(run_id):
+    try:
+        run = workbook_runs.retry(run_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(_workbook_api_payload(run)), 202
+
+
 @api.route("/run-file", methods=["POST"])
 @require_key
 def run_file():
@@ -704,6 +875,40 @@ def run_file():
     uploaded = request.files.get("file") or request.files.get("data")
     if not uploaded or uploaded.filename == "":
         return jsonify({"error": "missing uploaded file field named 'file'"}), 400
+    suffix = Path(uploaded.filename or "").suffix.lower()
+    if suffix == ".xls":
+        return jsonify({
+            "error": "Save the legacy Excel workbook as .xlsx and upload it again."
+        }), 400
+    if suffix == ".xlsx":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as handle:
+            uploaded.save(handle.name)
+            guard_path = handle.name
+        try:
+            snapshot = workbook_runs.inspect_xlsx(guard_path)
+            resolution = intake_resolver.resolve_workbook_schema(
+                snapshot["tabs"], ADDRESS_VARIANTS,
+            )
+        finally:
+            try:
+                os.remove(guard_path)
+            except OSError:
+                pass
+        uploaded.stream.seek(0)
+        selected = [
+            tab for tab in resolution["tabs"] if tab.get("status") == "selected"
+        ]
+        if resolution["status"] != "ready" or len(selected) > 1:
+            return jsonify({
+                "error": (
+                    "This workbook contains multiple or ambiguous address tabs. "
+                    "Use POST /api/v2/workbook-runs so every eligible tab is accounted for."
+                ),
+                "status": "workbook_endpoint_required",
+                "tab_inventory": workbook_runs.public_summary({
+                    "tabs": resolution["tabs"],
+                })["tabs"],
+            }), 409
 
     try:
         df, addr_col, boro_col, zip_col = _read_uploaded_dataframe(uploaded)
@@ -798,7 +1003,11 @@ def batch(batch_id):
         "headers": b.get("table_headers", []),
         "rows": b.get("table_rows", []),
         "decisions": decisions,
-        "count": len(b.get("table_rows", [])),
+        "count": (
+            len(b.get("entries", []))
+            if int(b.get("schema_version") or 1) >= 2
+            else len(b.get("table_rows", []))
+        ),
         "reviewed": len(decisions),
     })
 
@@ -892,6 +1101,12 @@ def batch_rerun(batch_id):
         entry["row_id"] = old.get("row_id")
         if old.get("i") is not None:
             entry["i"] = old.get("i")
+        for key in (
+            "source_key", "source_grid_id", "source_tab", "source_row",
+            "analysis_key",
+        ):
+            if old.get(key) is not None:
+                entry[key] = old[key]
         fresh[rid] = entry
         statuses.append({"row_id": rid, "status": "ok",
                          "verdict": entry.get("verdict", ""),
@@ -922,6 +1137,30 @@ def batch_rerun(batch_id):
                     log.error("Sheet address update failed for %s/%s: %s", batch_id, rid, e)
 
     remaining = len(_entry_failures(b))
+    if b.get("run_id"):
+        try:
+            def complete_human(entry):
+                human = entry.get("human") or {}
+                return all(str(human.get(key) or "").strip() for key in (
+                    "hvac_systems", "optimizer_fit", "periscope_fit",
+                ))
+
+            entries = b.get("entries", [])
+            workbook_runs.update_review_progress(
+                b["run_id"],
+                sum(1 for entry in entries if complete_human(entry)),
+                len(entries),
+                writeback_failures=sum(
+                    1 for entry in entries
+                    if (entry.get("writeback") or {}).get("status") == "error"
+                ),
+                needs_attention=sum(
+                    1 for entry in entries
+                    if _entry_is_failure(entry) and not complete_human(entry)
+                ),
+            )
+        except Exception:
+            log.exception("Could not update workbook rerun progress for %s", batch_id)
     return jsonify({"ok": True, "batch_id": batch_id, "rerun": statuses,
                     "remaining_failures": remaining})
 
