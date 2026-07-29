@@ -3,7 +3,8 @@
 Produces a single self-contained HTML string from a list of pipeline web_entry
 dicts (the shape built by tasks_local._build_web_entry): per-verdict sections,
 each address rendered as a card with the embedded annotated image, a maps link,
-and BOTH VLM models' reasoning (Gemini in green, Grok in black).
+and the reviewer reasoning used for that row (Gemini normally; Grok only for an
+emergency fallback).
 
 EMAIL COMPATIBILITY (why this looks the way it does):
 Email clients (Gmail, Outlook, Apple Mail) are NOT browsers. Outlook renders with
@@ -299,6 +300,7 @@ def _render_card(entry: Dict[str, Any], idx: int, email_mode: bool = False,
     combined = str(entry.get("reasoning") or "")
     g_reason = html.escape(str(entry.get("gemini_reasoning") or "") or "")
     k_reason = html.escape(str(entry.get("grok_reasoning") or "") or "")
+    has_grok = bool(entry.get("grok_verdict") or entry.get("grok_reasoning"))
     if not g_reason and not k_reason and combined:
         g_reason = html.escape(combined)  # legacy entries: show combined under Gemini
 
@@ -341,7 +343,7 @@ def _render_card(entry: Dict[str, Any], idx: int, email_mode: bool = False,
     else:
         text_blocks = (
             _model_block("Gemini", gv, gc, g_reason, _GEMINI_COLOR)
-            + _model_block("Grok", kv, kc, k_reason, _GROK_COLOR)
+            + (_model_block("Grok", kv, kc, k_reason, _GROK_COLOR) if has_grok else "")
             + f'<div style="margin-top:4px;{small}">Notes: {notes}</div>'
         )
 
@@ -483,8 +485,8 @@ def build_audit_report(
 
 <tr><td style="padding:18px 4px;font:11px {_FONT};color:#999999;">
   Imagery &copy; Maxar via Mapbox / Google &middot; Map data &copy; OpenStreetMap contributors.
-  Each building is independently judged by two AI vision models (Gemini + Grok);
-  when they disagree the row is flagged for human review.
+  Gemini is the normal AI reviewer. Grok is shown only when it was used as a
+  one-time emergency fallback after a technical Gemini failure.
 </td></tr>
 
 </table>

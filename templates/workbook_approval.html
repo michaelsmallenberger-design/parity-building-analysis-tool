@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Approve workbook run{% endblock %}
+{% block content %}
+<main class="container" style="max-width:760px;margin:44px auto;padding:0 20px;">
+  <h1>Approve the full workbook</h1>
+  <p>
+    This workbook is larger than the automatic threshold. Approval reserves the
+    whole run; Parity will not truncate it at 250 rows.
+  </p>
+  {% if error %}
+  <p style="background:#fff0f0;color:#a61b1b;padding:12px 14px;border-radius:9px;">{{ error }}</p>
+  {% endif %}
+  <div style="background:white;border:1px solid #dce2e7;border-radius:12px;padding:18px;margin:18px 0;">
+    <p><strong>{{ run.row_count }}</strong> workbook rows across <strong>{{ run.tab_count }}</strong> selected tabs</p>
+    <p><strong>{{ run.analysis_count }}</strong> unique addresses will be analyzed; exact duplicates reuse one machine result.</p>
+    <ul>
+      {% for tab in run.tabs if tab.status == "selected" %}
+      <li>{{ tab.tab }}: {{ tab.row_count }} rows</li>
+      {% endfor %}
+    </ul>
+    {% if run.cost_estimate %}
+      <p>
+        Configured estimate:
+        <strong>${{ "%.2f"|format(run.cost_estimate.minimum) }}–${{ "%.2f"|format(run.cost_estimate.maximum) }}</strong>
+        USD for the unique addresses.
+      </p>
+    {% else %}
+      <p>
+        No cost estimate is configured. This approval records the exact workbook
+        scope shown above and allows the complete run to proceed.
+      </p>
+    {% endif %}
+  </div>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="go" type="submit">
+      Approve and analyze the entire workbook
+    </button>
+  </form>
+</main>
+{% endblock %}

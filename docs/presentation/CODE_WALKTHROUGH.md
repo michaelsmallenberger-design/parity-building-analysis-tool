@@ -36,12 +36,12 @@ Address
   4. IMAGERY        download satellite tile centered on the roof   [Google Static Maps / Mapbox]
   5. DETECT (CV)    YOLO model ensemble finds candidate towers     [2× custom-trained YOLO]
   6. FILTER         keep only detections ON this building's roof   [geometry / point-in-polygon]
-  7. VERIFY (AI)    two vision models judge the evidence           [Gemini + Grok, in parallel]
+  7. VERIFY (AI)    Gemini judges the evidence                     [Grok only after technical failure]
   8. REPORT         verdict + annotated image + reasoning          [audit-card HTML]
 ```
 
 > **Slide takeaway:** "Eight stages, but the headline is: locate the building →
-> look at its roof → CV proposes → two AIs verify → report."
+> look at its roof → CV proposes → bounded AI verifies → report."
 
 This is exactly what the demo run logged, per address. The rest of this doc is
 each stage in plain English.
@@ -165,37 +165,25 @@ building; `0 kept` for the negative (nothing on that roof).
 
 ---
 
-## 8. Stage 7 — Verification: TWO AI vision models cross-check
+## 8. Stage 7 — Verification: Gemini-first with a bounded fallback
 
 **Module:** `vlm.py` (`verify_address`) — the heart of the accuracy story
 
-- The annotated tile (+ the opposite-zoom tile as context) is sent to **two
-  independent AI vision models, called in parallel:**
-  - **Gemini** (Google) — `gemini-3.5-flash` in the demo config
-  - **Grok** (xAI) — `grok-4.3`, run at high reasoning effort
-- Each model independently returns a structured verdict + confidence + written
-  reasoning ("there is a rectangular cooling tower with visible fans on the
-  northeast corner of the roof", etc.).
-- Both models are given **few-shot reference images** (`reference_images/positive`
+- The annotated tile (+ the opposite-zoom tile as context) is sent to **Gemini**
+  (`gemini-3.6-flash`) for the normal structured verdict, confidence, and written
+  reasoning.
+- A valid uncertain Gemini result is kept as `needs_review`; uncertainty does not
+  spend on another provider.
+- **Grok** (`grok-4.3`) is allowed one emergency request only after Gemini exhausts
+  its retries because of a provider, transport, timeout, or structured-output
+  failure. It is an availability fallback, not a second vote.
+- The reviewer is given **few-shot reference images** (`reference_images/positive`
   and `/negative`) so they know what a real cooling tower vs. a lookalike (vents,
   RTUs, water tanks) looks like.
 
-**Consensus rule (`VLM_CONSENSUS_THRESHOLD`, default 0.7):**
-- Both models agree it's a tower AND both are confident → **confirmed / likely**
-- Both agree it's not → **not_detected / no_cooling_tower**
-- They disagree, or either is unsure → **needs_review** (a human looks at it)
-
-> **Slide takeaway:** "Two different AI vision models, from two different
-> companies, must agree. When they don't, we don't guess — we flag it for a human.
-> That disagreement-handling is what makes the output trustworthy."
-
-**Why two models instead of one:** independent models fail differently. Requiring
-agreement turns two ~good models into one high-precision verdict, and the
-disagreements become a *useful* signal (the genuinely ambiguous rooftops) instead
-of silent errors.
-
-**From the demo log:** both Gemini and Grok returned `200 OK`; result `confirmed`
-for the two positives, `not_detected` for the negative.
+> **Slide takeaway:** "Gemini handles normal rooftop review. If its service fails
+> technically, one bounded Grok fallback keeps the row moving; genuine visual
+> uncertainty still goes to a human instead of being guessed."
 
 ---
 
@@ -206,9 +194,10 @@ for the two positives, `not_detected` for the negative.
 - Produces a **self-contained HTML audit report**: one **card per building**, in
   sections grouped by verdict (positives first, "needs review" in the middle,
   negatives last).
-- Each card shows: the address, the verdict + consensus confidence, the
+- Each card shows: the address, the verdict + confidence, the
   **annotated satellite image** (red building outline, color-coded detection
-  boxes), and **both models' verdicts + the reasoning** side-by-side.
+  boxes), Gemini's reasoning, and Grok's reasoning only when the emergency
+  fallback actually ran.
 - Built **email-safe** (table layout, inline styles) so it renders correctly in
   Gmail/Outlook, not just a browser.
 - Images are embedded inline (base64), so the report is one file / one email with
@@ -264,7 +253,7 @@ Webhook → Read Google Sheet → Normalize each address (Grok LLM)
 | Layer | Technology |
 |---|---|
 | Computer vision | Ultralytics YOLO (2× custom cooling-tower models, ~44 MB each) |
-| AI verification | Google Gemini + xAI Grok (dual-model consensus) |
+| AI verification | Google Gemini normally; one xAI Grok request only after a technical Gemini failure |
 | Geocoding / imagery | Google Maps + Mapbox (+ Nominatim/OSM fallback) |
 | Building footprints | OpenStreetMap Overpass → NYC planimetric → Microsoft |
 | Geometry | Shapely (point-in-polygon, Web-Mercator math) |
@@ -272,21 +261,21 @@ Webhook → Read Google Sheet → Normalize each address (Grok LLM)
 | Packaging | Docker (`Dockerfile.railway`, CPU-only PyTorch) |
 | Orchestration | n8n Cloud |
 
-> **Slide takeaway:** "Python + Flask + a custom YOLO model + two frontier AI
-> models, packaged in Docker, orchestrated by n8n."
+> **Slide takeaway:** "Python + Flask + a custom YOLO model + bounded AI
+> verification, packaged in Docker, orchestrated by n8n."
 
 ---
 
 ## 13. Accuracy, cost, and honest limits (good for the "what's next" slide)
 
-- **Accuracy approach:** recall-first CV (catch everything) + dual-AI
-  precision filter (agreement required) + a `needs_review` bucket so uncertain
+- **Accuracy approach:** recall-first CV (catch everything) + Gemini
+  precision review + a `needs_review` bucket so uncertain
   cases go to a human rather than being guessed. The system is designed to
   **not silently be wrong.**
 - **Footprint coverage:** depends on OSM/NYC/Microsoft data; genuinely missing
   buildings are flagged `footprint_missing` for manual check.
-- **Cost:** ~$0.10–$0.30 of AI spend per address (Gemini + Grok), proportional to
-  list size. Hosting is separate and small.
+- **Cost:** Gemini is the normal per-address AI expense. Grok adds cost only on
+  exceptional technical fallback calls. Hosting is separate and flat.
 - **Large batches (>~200):** the report embeds every image, so very large reports
   get heavy for email — split the sheet or write to Drive (a known next-step).
 
