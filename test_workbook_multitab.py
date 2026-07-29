@@ -689,6 +689,7 @@ def test_resume_skips_checkpointed_rows(root):
     old_key = os.environ.get("MAPBOX_API_KEY")
     original = tasks_local._process_one_address
     calls = []
+    partials = []
     try:
         os.environ["MAPBOX_API_KEY"] = "mock"
 
@@ -707,6 +708,7 @@ def test_resume_skips_checkpointed_rows(root):
             should_cancel=lambda: False,
             upload_file=lambda _local, blob: blob,
             make_signed_url=lambda blob: f"/files/{blob}",
+            write_partial_result=lambda data: partials.append(data),
             concurrency=1,
             resume_results={
                 0: {
@@ -720,6 +722,29 @@ def test_resume_skips_checkpointed_rows(root):
         assert calls == [1]
         assert [entry["address"] for entry in result["web_results"]] == [
             "1 Main St", "2 Main St",
+        ]
+        assert any(
+            next(
+                state for state in partial["address_states"]
+                if state["index"] == 1
+            )["state"] == "analyzing"
+            for partial in partials
+        )
+        assert partials[-1]["address_states"] == [
+            {
+                "index": 0,
+                "address": "1 Main St",
+                "state": "complete",
+                "message": "Machine analysis finished",
+                "error": "",
+            },
+            {
+                "index": 1,
+                "address": "2 Main St",
+                "state": "complete",
+                "message": "Machine analysis finished",
+                "error": "",
+            },
         ]
     finally:
         tasks_local._process_one_address = original

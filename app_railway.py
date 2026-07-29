@@ -792,10 +792,36 @@ def job_status_route(job_id):
 
     # Include result data (both partial and final)
     # This allows frontend to display results as they come in
-    if status['status'] in ['processing', 'finished']:
+    if status['status'] in ['processing', 'finished', 'failed']:
         result = read_result(job_id)
         if result:
             response['result'] = result
+            rows = result.get("live_rows") or []
+            if not rows and result.get("address_states"):
+                rows = [
+                    {
+                        "row_id": str(item.get("index", "")),
+                        "address": item.get("address") or "",
+                        "tab": "",
+                        "source_row": None,
+                        "state": item.get("state") or "queued",
+                        "message": item.get("message") or "",
+                        "error": item.get("error") or "",
+                        "model_result": "",
+                    }
+                    for item in result.get("address_states", [])
+                    if isinstance(item, dict)
+                ]
+            response["rows"] = rows
+            if result.get("live_rows") is not None:
+                response["total"] = len(rows)
+                response["progress"] = sum(
+                    str(item.get("state") or "") in {
+                        "complete", "attention", "failed",
+                    }
+                    for item in rows
+                    if isinstance(item, dict)
+                )
 
     return jsonify(response), 200
 
