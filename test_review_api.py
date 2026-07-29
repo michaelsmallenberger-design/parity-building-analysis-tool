@@ -9,7 +9,7 @@ import review_store
 import sheets_writer
 import storage_helpers
 import workbook_runs
-from review_contract import DUAL_FIT_SCHEMA
+from review_contract import DUAL_FIT_SCHEMA, SINGLE_FIT_SCHEMA
 
 
 class IsolatedReviews:
@@ -58,6 +58,7 @@ def test_single_fit_submission_returns_200_and_updates_exact_source(root):
             }],
             schema_version=2,
             run_id="w-review",
+            review_schema=SINGLE_FIT_SCHEMA,
         )
         originals = {
             "enabled": sheets_writer.enabled,
@@ -190,13 +191,69 @@ def test_pre_fix_multitab_batch_infers_single_fit_without_guessing(root):
         assert review_store.decisions_for("pre-fix") == []
 
 
-def test_upload_mapping_preserves_single_fit_and_does_not_guess_dual_fields():
+def test_unreviewed_misstamped_run_upgrades_from_source_tab_inventory(root):
+    with IsolatedReviews(root):
+        storage_helpers.write_json("reviews/misstamped.json", {
+            "job_id": "misstamped",
+            "schema_version": 2,
+            "review_schema": SINGLE_FIT_SCHEMA,
+            "tab_inventory": [{
+                "tab": "DC",
+                "status": "selected",
+                "headers": [
+                    "Optimizer Fit", "Periscope Fit", "HVAC systems",
+                    "Notes", "Property Address",
+                ],
+            }],
+            "sheet_bindings": [{
+                "tab": "DC",
+                "headers": [
+                    "Optimizer Fit", "Periscope Fit", "HVAC systems",
+                    "Notes", "Property Address",
+                ],
+                "colmap": {
+                    "Fit": 5,
+                    "HVAC Systems": 2,
+                    "Notes": 3,
+                },
+            }],
+            "entries": [{"row_id": "g10:r2", "verdict": "confirmed"}],
+        })
+        batch = review_store.load_batch("misstamped")
+        assert batch["review_schema"] == DUAL_FIT_SCHEMA
+
+
+def test_reviewed_single_fit_run_is_never_auto_migrated(root):
+    with IsolatedReviews(root):
+        storage_helpers.write_json("reviews/reviewed-single.json", {
+            "job_id": "reviewed-single",
+            "schema_version": 2,
+            "review_schema": SINGLE_FIT_SCHEMA,
+            "tab_inventory": [{
+                "tab": "DC",
+                "status": "selected",
+                "headers": [
+                    "Optimizer Fit", "Periscope Fit", "HVAC systems",
+                    "Notes", "Property Address",
+                ],
+            }],
+            "entries": [{
+                "row_id": "g10:r2",
+                "human": {"hvac_systems": "RTU", "fit": "Optimizer"},
+            }],
+        })
+        batch = review_store.load_batch("reviewed-single")
+        assert batch["review_schema"] == SINGLE_FIT_SCHEMA
+
+
+def test_upload_mapping_preserves_dual_fields_and_does_not_guess_from_single_fit():
     headers, rows = api_analyze._table_from_df(pd.DataFrame({
         "Property Address": ["1 Main St"],
         "HVAC Systems": ["AHU"],
         "Fit": ["Periscope"],
     }))
-    assert rows[0][headers.index("Fit")] == "Periscope"
+    assert rows[0][headers.index("Optimizer Fit")] == ""
+    assert rows[0][headers.index("Periscope Fit")] == ""
 
     headers, rows = api_analyze._table_from_df(pd.DataFrame({
         "Property Address": ["1 Main St"],
@@ -204,7 +261,8 @@ def test_upload_mapping_preserves_single_fit_and_does_not_guess_dual_fields():
         "Optimizer Fit": ["Good"],
         "Periscope Fit": ["Bad"],
     }))
-    assert rows[0][headers.index("Fit")] == ""
+    assert rows[0][headers.index("Optimizer Fit")] == "Good"
+    assert rows[0][headers.index("Periscope Fit")] == "Bad"
 
 
 if __name__ == "__main__":
@@ -214,5 +272,9 @@ if __name__ == "__main__":
         test_true_historical_dual_submission_remains_valid(temp_dir)
     with tempfile.TemporaryDirectory() as temp_dir:
         test_pre_fix_multitab_batch_infers_single_fit_without_guessing(temp_dir)
-    test_upload_mapping_preserves_single_fit_and_does_not_guess_dual_fields()
-    print("OK: review API single-Fit and historical compatibility hold.")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_unreviewed_misstamped_run_upgrades_from_source_tab_inventory(temp_dir)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_reviewed_single_fit_run_is_never_auto_migrated(temp_dir)
+    test_upload_mapping_preserves_dual_fields_and_does_not_guess_from_single_fit()
+    print("OK: review API dual-product mapping and single-Fit compatibility hold.")

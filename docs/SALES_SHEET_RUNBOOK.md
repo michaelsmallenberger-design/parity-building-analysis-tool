@@ -89,14 +89,15 @@ Each Submit immediately saves the reviewer choice and writes it back into the
 same row in Sales's Google Sheet. The model guidance itself is not added as a
 customer-facing Sheet column.
 
-## Fit Standard
+## Product-Fit Standard
 
-Each building requires one mutually exclusive **Fit** decision:
+Each building requires two independent product decisions:
 
-- `Optimizer`
-- `Periscope`
-- `Unclear`
-- `Bad`
+- **Optimizer Fit:** `Good`, `Bad`, or `Not Sure`
+- **Periscope Fit:** `Good`, `Bad`, or `Not Sure`
+
+A building can be a good fit for both products, one product, or neither. The
+reviewer therefore never combines these decisions into one field.
 
 ## What Changes in the Sales Sheet
 
@@ -111,12 +112,12 @@ are not reformatted or replaced.
 ## When the Work Is Complete
 
 The run is complete only when every eligible row has a terminal machine result,
-one Fit decision and an HVAC decision have been submitted, and no Sheet
-write-back remains failed. Open the resulting Google Sheet and spot-check rows
-on several tabs:
+an HVAC decision plus both product-fit decisions have been submitted, and no
+Sheet write-back remains failed. Open the resulting Google Sheet and spot-check
+rows on several tabs:
 
 - the original Sales data is still present;
-- HVAC/Fit/Notes appear on the intended rows; and
+- HVAC, Optimizer Fit, Periscope Fit, and Notes appear on the intended rows; and
 - the Sheet still looks like Sales's Sheet.
 
 There is no second Sheet to merge. A live Google Sheet input is updated in

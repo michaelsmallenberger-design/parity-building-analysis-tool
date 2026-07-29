@@ -41,8 +41,12 @@ from tasks_local import (_process_one_address, _build_web_entry, ADDRESS_VARIANT
 from report_audit import build_audit_report
 from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS
 from review_contract import (
+    CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_OPTIONS,
+    DUAL_FIT_SCHEMA,
     FIT_COL,
+    OPT_FIT_COL,
+    PERI_FIT_COL,
     SINGLE_FIT_SCHEMA,
     entry_is_reviewed,
 )
@@ -482,10 +486,10 @@ def analyze():
 
 CANON_HVAC, CANON_NOTES, CANON_ID = "HVAC Systems", "Notes", "Row_ID"
 CANON_ADDR = "Property Address"
-# The output format uses the same single Fit field as the team's live workbook.
+# New output tables use one independently reviewed column per product.
 # Upload columns are mapped by synonym; anything unrecognized is left blank.
 CANONICAL_COLUMNS = [
-    FIT_COL, CANON_HVAC, CANON_NOTES,
+    OPT_FIT_COL, PERI_FIT_COL, CANON_HVAC, CANON_NOTES,
     "Property Name", CANON_ADDR, "City", "Market Name", "Units", "Stories",
     "Total Buildings", "Year Built", "Year Renovated", "Property Type",
     "Secondary Type", "Affordable Type", "True Owner Name",
@@ -494,7 +498,8 @@ CANONICAL_COLUMNS = [
 # Lower-cased upload-header synonyms for each canonical column. The canonical
 # name itself always matches; HVAC and the address column get special handling.
 COLUMN_SYNONYMS = {
-    FIT_COL: ["fit type", "product fit"],
+    OPT_FIT_COL: ["optimizer", "optimizer fit?"],
+    PERI_FIT_COL: ["periscope", "periscope fit?"],
     CANON_NOTES: ["note", "comments", "comment"],
     "Property Name": ["building name", "name", "property"],
     "City": [],
@@ -584,40 +589,20 @@ def _lean_table(results):
 
 
 def _table_from_df(df):
-    """Map uploads into the canonical single-Fit sheet format.
+    """Map uploads into the canonical dual-product sheet format.
 
-    Recognized current Fit values carry forward. Historical Good/Bad/Not Sure
-    product columns are detected so they are not mistaken for HVAC, but they
-    are not guessed into the mutually-exclusive current Fit field.
+    Separate Optimizer/Periscope values carry forward. A legacy single Fit
+    value is not guessed into either independent product decision.
     """
-    hvac_col, fit_col = _detect_hvac_fit_columns(df)
-    single_fit_col = None
-    if fit_col is not None:
-        single_fit_values = {option.casefold() for option in FIT_OPTIONS}
-        fit_values = [
-            part.strip()
-            for value in df[fit_col].dropna().tolist()
-            for part in re.split(r"[,/;]", str(value))
-            if part.strip()
-        ]
-        if (
-            _norm_header(fit_col) in {_norm_header(name) for name in FIT_COL_NAMES}
-            or (
-                fit_values
-                and all(value.casefold() in single_fit_values for value in fit_values)
-            )
-        ):
-            single_fit_col = fit_col
+    hvac_col, _legacy_fit_col = _detect_hvac_fit_columns(df)
     norm_cols = {}
     for c in df.columns:
         norm_cols.setdefault(_norm_header(c), c)
 
-    used = {column for column in (hvac_col, fit_col) if column is not None}
+    used = {column for column in (hvac_col,) if column is not None}
     mapping = {}
     if hvac_col is not None:
         mapping[CANON_HVAC] = hvac_col
-    if single_fit_col is not None:
-        mapping[FIT_COL] = single_fit_col
     addr_norms = [v.lower() for v in ADDRESS_VARIANTS]
     for canon in CANONICAL_COLUMNS:
         if canon in mapping:
@@ -687,8 +672,8 @@ def _finalize_batch(
                 ):
                     sheets_writer.ensure_review_columns(
                         multi_binding, multi_binding.get("headers", []),
-                        HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
-                        review_schema=SINGLE_FIT_SCHEMA,
+                        HVAC_SYSTEMS + [NONE_OPTION], DUAL_FIT_OPTIONS,
+                        review_schema=DUAL_FIT_SCHEMA,
                     )
                 multi_binding.pop("writeback_error", None)
             except Exception as e:
@@ -708,8 +693,8 @@ def _finalize_batch(
         try:
             sheets_writer.ensure_review_columns(
                 binding, binding.get("headers", []), HVAC_SYSTEMS + [NONE_OPTION],
-                FIT_OPTIONS, review_url=review_url if base else "",
-                review_schema=SINGLE_FIT_SCHEMA)
+                DUAL_FIT_OPTIONS, review_url=review_url if base else "",
+                review_schema=DUAL_FIT_SCHEMA)
             sheet_url = binding["sheet_url"]
         except Exception as e:
             log.error("Bound-sheet setup failed for %s: %s", batch_id, e, exc_info=True)
@@ -717,7 +702,7 @@ def _finalize_batch(
     elif sheets_writer.enabled():
         try:
             sheet_url = sheets_writer.create_batch_sheet(
-                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], DUAL_FIT_OPTIONS,
                 review_url=review_url if base else "")
         except Exception as e:
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
@@ -728,7 +713,7 @@ def _finalize_batch(
                             tab_inventory=tab_inventory,
                             schema_version=2 if sheet_bindings else 1,
                             run_id=run_id,
-                            review_schema=SINGLE_FIT_SCHEMA)
+                            review_schema=DUAL_FIT_SCHEMA)
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url
@@ -1210,7 +1195,7 @@ def batch_rerun(batch_id):
     if b.get("run_id"):
         try:
             entries = b.get("entries", [])
-            review_schema = b.get("review_schema", SINGLE_FIT_SCHEMA)
+            review_schema = b.get("review_schema", CURRENT_REVIEW_SCHEMA)
             workbook_runs.update_review_progress(
                 b["run_id"],
                 sum(
