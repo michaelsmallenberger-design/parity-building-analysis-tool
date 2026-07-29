@@ -72,6 +72,11 @@ registry_options.html
 results.xlsx
 data/
 
+# Market runway dashboard build and local state
+market_dashboard/frontend/node_modules/
+market_dashboard/frontend/dist/
+market_dashboard/local_storage/
+
 # n8n one-off/simple workflow drafts
 n8n/*simple*.workflow.json
 n8n/SIMPLE_SETUP.md
