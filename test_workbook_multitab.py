@@ -18,6 +18,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import api_analyze
 import intake_resolver
 import job_queue
+import review_contract
 import review_render
 import review_store
 import sheets_writer
@@ -764,8 +765,8 @@ def test_grouped_review_and_exact_tab_writeback():
     html = review_render.build_review_page(entries, "w-test")
     assert "<h2>Washington</h2>" in html and "<h2>Virginia</h2>" in html
     assert 'data-rid="g10:r2"' in html and 'data-rid="g20:r2"' in html
-    assert "choose one Fit: Optimizer, Periscope, Unclear, or Bad" in html
-    assert "Optimizer Fit:" not in html and "Periscope Fit:" not in html
+    assert "choose both Optimizer Fit and Periscope Fit" in html
+    assert "Optimizer Fit:" in html and "Periscope Fit:" in html
 
     class FakeSheets:
         def __init__(self):
@@ -790,10 +791,12 @@ def test_grouped_review_and_exact_tab_writeback():
                 {
                     "spreadsheet_id": "sheet", "grid_id": grid, "tab": tab,
                     "colmap": {
-                        "HVAC Systems": 2, "Fit": 3,
+                        "HVAC Systems": 2,
+                        "Optimizer Fit": 3,
+                        "Periscope Fit": 4,
                     },
                 },
-                2, "None", fit="Bad",
+                2, "None", optimizer_fit="Good", periscope_fit="Bad",
             )
         ranges = [
             item["range"]
@@ -804,6 +807,8 @@ def test_grouped_review_and_exact_tab_writeback():
         assert any("'Virginia'!C2" == value for value in ranges)
         assert any("'Washington'!D2" == value for value in ranges)
         assert any("'Virginia'!D2" == value for value in ranges)
+        assert any("'Washington'!E2" == value for value in ranges)
+        assert any("'Virginia'!E2" == value for value in ranges)
         assert sheets_writer.write_source_values(
             {
                 "spreadsheet_id": "sheet", "grid_id": 20, "tab": "Virginia",
@@ -821,7 +826,7 @@ def test_grouped_review_and_exact_tab_writeback():
         sheets_writer._get_services = original
 
 
-def test_single_fit_column_is_reused_or_appended_once():
+def test_dual_fit_columns_are_reused_or_appended_once():
     class FakeSheets:
         def __init__(self):
             self.value_updates = []
@@ -853,14 +858,21 @@ def test_single_fit_column_is_reused_or_appended_once():
         }
         sheets_writer.ensure_review_columns(
             binding,
-            ["Property Address", "HVAC Systems", "Fit", "Notes"],
+            [
+                "Property Address",
+                "HVAC Systems",
+                "Optimizer Fit",
+                "Periscope Fit",
+                "Notes",
+            ],
             review_render.HVAC_SYSTEMS + [review_render.NONE_OPTION],
-            review_render.FIT_OPTIONS,
+            review_contract.DUAL_FIT_OPTIONS,
         )
         assert binding["colmap"] == {
             "HVAC Systems": 1,
-            "Fit": 2,
-            "Notes": 3,
+            "Optimizer Fit": 2,
+            "Periscope Fit": 3,
+            "Notes": 4,
         }
         assert existing.value_updates == []
         assert existing.grid_updates == []
@@ -877,22 +889,25 @@ def test_single_fit_column_is_reused_or_appended_once():
             binding,
             ["Property Address", "HVAC Systems", "Notes"],
             review_render.HVAC_SYSTEMS + [review_render.NONE_OPTION],
-            review_render.FIT_OPTIONS,
+            review_contract.DUAL_FIT_OPTIONS,
         )
-        assert missing.value_updates[0]["body"]["values"] == [["Fit"]]
+        assert missing.value_updates[0]["body"]["values"] == [[
+            "Optimizer Fit", "Periscope Fit",
+        ]]
         validation_requests = [
             request["setDataValidation"]
             for update in missing.grid_updates
             for request in update["body"]["requests"]
             if "setDataValidation" in request
         ]
-        assert len(validation_requests) == 1
-        options = [
-            item["userEnteredValue"]
-            for item in validation_requests[0]["rule"]["condition"]["values"]
-        ]
-        assert options == ["Optimizer", "Periscope", "Unclear", "Bad"]
-        assert validation_requests[0]["rule"]["strict"] is True
+        assert len(validation_requests) == 2
+        for validation in validation_requests:
+            options = [
+                item["userEnteredValue"]
+                for item in validation["rule"]["condition"]["values"]
+            ]
+            assert options == ["Good", "Bad", "Not Sure"]
+            assert validation["rule"]["strict"] is True
     finally:
         sheets_writer._get_services = original
 
@@ -923,8 +938,9 @@ def test_converted_copy_review_answers_are_cleared_without_rule_changes():
             "row_numbers": [2, 3, 11],
             "colmap": {
                 "HVAC Systems": 8,
-                "Fit": 9,
-                "Notes": 10,
+                "Optimizer Fit": 9,
+                "Periscope Fit": 10,
+                "Notes": 11,
             },
         }
         assert sheets_writer.clear_review_answers(binding)
@@ -934,6 +950,7 @@ def test_converted_copy_review_answers_are_cleared_without_rule_changes():
                 "ranges": [
                     "'Road Trip Chaos'!I2:I11",
                     "'Road Trip Chaos'!J2:J11",
+                    "'Road Trip Chaos'!K2:K11",
                 ],
             },
         }]
@@ -1133,7 +1150,7 @@ if __name__ == "__main__":
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()
     test_grouped_review_and_exact_tab_writeback()
-    test_single_fit_column_is_reused_or_appended_once()
+    test_dual_fit_columns_are_reused_or_appended_once()
     test_converted_copy_review_answers_are_cleared_without_rule_changes()
     test_versioned_async_api_contract()
     test_costless_approval_ui_is_enabled()

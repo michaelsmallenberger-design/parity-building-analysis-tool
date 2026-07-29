@@ -29,6 +29,7 @@ from review_render import (
     FIT_OPTIONS, HVAC_SYSTEMS, NONE_OPTION, build_review_page,
 )
 from review_contract import (
+    CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
     FIT_COL,
@@ -963,7 +964,7 @@ def review_page(job_id):
         webhook_url="/api/review",  # same-origin relay -> no browser CORS
         title=batch.get("title", "Cooling Tower Review"),
         csrf_token=_csrf_token(),
-        review_schema=batch.get("review_schema", SINGLE_FIT_SCHEMA),
+        review_schema=batch.get("review_schema", CURRENT_REVIEW_SCHEMA),
     )
     return Response(html, mimetype="text/html")
 
@@ -990,7 +991,7 @@ def api_review():
         for item in existing_batch.get("entries", [])
     ):
         return jsonify({"error": "unknown batch/row"}), 404
-    review_schema = existing_batch.get("review_schema", SINGLE_FIT_SCHEMA)
+    review_schema = existing_batch.get("review_schema", CURRENT_REVIEW_SCHEMA)
     hvac_value = str(payload.get("hvac_systems") or "").strip()
     if not hvac_value:
         return jsonify({"error": "choose at least one HVAC system or None"}), 400
@@ -1063,6 +1064,14 @@ def api_review():
                 needs_columns = not binding.get("colmap")
                 if review_schema == SINGLE_FIT_SCHEMA:
                     needs_columns = needs_columns or FIT_COL not in binding.get("colmap", {})
+                else:
+                    needs_columns = needs_columns or any(
+                        column not in binding.get("colmap", {})
+                        for column in (
+                            sheets_writer.OPT_FIT_COL,
+                            sheets_writer.PERI_FIT_COL,
+                        )
+                    )
                 if needs_columns:
                     sheets_writer.ensure_review_columns(
                         binding, binding.get("headers", []),
@@ -1097,6 +1106,16 @@ def api_review():
                 or (
                     review_schema == SINGLE_FIT_SCHEMA
                     and FIT_COL not in binding.get("colmap", {})
+                )
+                or (
+                    review_schema == DUAL_FIT_SCHEMA
+                    and any(
+                        column not in binding.get("colmap", {})
+                        for column in (
+                            sheets_writer.OPT_FIT_COL,
+                            sheets_writer.PERI_FIT_COL,
+                        )
+                    )
                 )
             ):
                 sheets_writer.ensure_review_columns(

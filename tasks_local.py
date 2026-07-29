@@ -81,8 +81,9 @@ _yolo_lock = threading.Lock()
 # is overlapping the dual-VLM wait (YOLO and Overpass are lock-serialized). The
 # web worker uses this default; the audit harness overrides per-run to diff 1 vs 5.
 DEFAULT_VLM_ADDRESS_CONCURRENCY = 5
-# Transient failures (throttled Overpass, transient VLM verdict) are re-queued and
-# retried this many extra rounds before being emitted as unverified.
+# Address-level infrastructure failures (for example throttled footprint lookup)
+# are re-queued this many extra rounds. VLM provider retries are bounded inside
+# vlm.py; a provider-exhausted result is never sent through another full pass.
 MAX_RETRY_ROUNDS = int(os.environ.get("VLM_RETRY_ROUNDS", "2"))
 RETRY_BACKOFF_SECONDS = float(os.environ.get("VLM_RETRY_BACKOFF", "5"))
 # Markers vlm.py stamps into reasoning on transient failures (timeout / server
@@ -90,7 +91,7 @@ RETRY_BACKOFF_SECONDS = float(os.environ.get("VLM_RETRY_BACKOFF", "5"))
 # low-confidence/disagreement/construction needs_review has none of these.
 _VLM_TRANSIENT_MARKERS = (
     "network timeout", "network connection error",
-    "server error (http", "throttled", "after 4 attempts",
+    "server error (http", "throttled", "after 3 attempts",
 )
 
 
@@ -1367,9 +1368,9 @@ def process_address_list(
     # Concurrent orchestrator: run up to `concurrency` addresses at once to
     # overlap the dual-VLM wait. Per-address work is isolated in
     # _process_one_address; shared state (progress, partial-result streaming,
-    # ordering) is handled here under one lock. Transient failures (throttled
-    # Overpass → TransientFootprintError, transient VLM verdict) are re-queued
-    # and retried in later rounds; nothing is silently dropped.
+    # ordering) is handled here under one lock. Address-level infrastructure
+    # failures such as a throttled footprint lookup are re-queued. A VLM result
+    # that exhausted its provider retry budget is terminal needs-attention.
     # ------------------------------------------------------------------
     if concurrency is None:
         concurrency = int(os.environ.get("VLM_ADDRESS_CONCURRENCY", str(DEFAULT_VLM_ADDRESS_CONCURRENCY)))
@@ -1415,7 +1416,6 @@ def process_address_list(
                 "message": error or "Machine analysis finished",
                 "error": error,
             }
-    last_seen = {}          # i -> last (web_entry, csv_row) for transient-VLM rows
     commit_lock = threading.RLock()
     done = len(results_by_index)
 
@@ -1523,13 +1523,15 @@ def process_address_list(
                     retry.append((i, row))
                     continue
                 if _is_transient_vlm(web_entry):
-                    last_seen[i] = (web_entry, csv_row)  # keep as fallback if retries don't clear it
-                    log.info(f"Row {i+1}/{total}: transient VLM verdict; queued for retry")
+                    log.warning(
+                        f"Row {i+1}/{total}: VLM provider retry budget exhausted; "
+                        "keeping explicit needs_review result"
+                    )
                     _set_state(
                         i, row, "retrying",
-                        "Visual analysis was inconclusive; retrying",
+                        "Visual analysis provider failed after its retry limit",
                     )
-                    retry.append((i, row))
+                    _commit(i, web_entry, csv_row)
                     continue
                 _commit(i, web_entry, csv_row)
         return retry
@@ -1546,14 +1548,11 @@ def process_address_list(
             time.sleep(RETRY_BACKOFF_SECONDS * round_num)
         pending = _run_round(pending)
 
-    # No silent drops. If a transient VLM result was seen, keep it (a legitimate
-    # needs_review row); if the footprint never resolved, emit footprint_missing
-    # tagged unverified so a throttle-induced miss is never logged as a clean
-    # genuine negative.
+    # No silent drops. Provider-exhausted VLM results were committed above as
+    # explicit needs_review rows. If an address-level infrastructure dependency
+    # never resolved, emit footprint_missing tagged unverified so a throttle-
+    # induced miss is never logged as a clean genuine negative.
     for i, row in pending:
-        if i in last_seen:
-            _commit(i, *last_seen[i])
-            continue
         full_address = _compose_address(row, columns)
         log.warning(f"Row {i+1}/{total}: still failing after {MAX_RETRY_ROUNDS} retries; emitting unverified")
         notes = "Transient failure (Overpass/VLM) unresolved after retries; manual verification needed"
