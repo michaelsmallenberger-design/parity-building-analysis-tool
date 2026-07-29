@@ -1,0 +1,25 @@
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: #eeeeee;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+@media (max-width: 720px) {
+  body {
+    overflow-x: auto;
+  }
+}
