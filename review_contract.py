@@ -1,8 +1,8 @@
 """Versioned human-review contracts shared by rendering, storage, and Sheets.
 
-Current Washington Gas workbooks use one mutually-exclusive ``Fit`` dropdown:
-Optimizer, Periscope, Unclear, or Bad.  Historical Parity batches that genuinely
-targeted separate Optimizer/Periscope columns remain readable and submittable.
+New Parity workbooks use separate ``Optimizer Fit`` and ``Periscope Fit``
+columns. Each product is reviewed independently as Good, Bad, or Not Sure.
+Previously persisted single-``Fit`` batches remain readable and submittable.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ OPT_FIT_COL = "Optimizer Fit"
 PERI_FIT_COL = "Periscope Fit"
 DUAL_FIT_COLUMNS = [OPT_FIT_COL, PERI_FIT_COL]
 DUAL_FIT_OPTIONS = ["Good", "Bad", "Not Sure"]
+CURRENT_REVIEW_SCHEMA = DUAL_FIT_SCHEMA
 
 
 def _norm(value: Any) -> str:
@@ -30,15 +31,46 @@ def _norm(value: Any) -> str:
 def infer_review_schema(batch: dict[str, Any] | None) -> str:
     """Infer old persisted batches without rewriting their stored JSON.
 
-    An explicit version always wins.  A source ``Fit`` header identifies the
-    current contract even if a broken earlier run appended two product columns
-    later.  Truly historical dual-column batches keep their old interface.
-    Batches with no usable header metadata default to the historical contract;
-    every newly-created batch is explicitly stamped as single-fit.
+    An explicit version normally wins. One production release incorrectly
+    stamped untouched multi-tab runs as single-Fit even when every selected
+    source tab already had the two product columns. Such a run can be upgraded
+    safely from its immutable tab inventory, but only before any human decision
+    exists. A source ``Fit`` header otherwise keeps a previously persisted
+    single-product-choice batch on its original interface.
     """
     batch = batch or {}
     explicit = str(batch.get("review_schema") or "")
-    if explicit in VALID_REVIEW_SCHEMAS:
+    if explicit == DUAL_FIT_SCHEMA:
+        return explicit
+
+    selected_inventory_headers = []
+    for tab in batch.get("tab_inventory") or []:
+        if not isinstance(tab, dict):
+            continue
+        status = _norm(tab.get("status"))
+        if status and status != "selected":
+            continue
+        headers = list(tab.get("headers") or [])
+        if headers:
+            selected_inventory_headers.append({_norm(header) for header in headers})
+
+    inventory_proves_dual = bool(selected_inventory_headers) and all(
+        all(_norm(column) in headers for column in DUAL_FIT_COLUMNS)
+        and _norm(FIT_COL) not in headers
+        for headers in selected_inventory_headers
+    )
+    has_human_decisions = any(
+        bool(entry.get("human"))
+        for entry in batch.get("entries") or []
+        if isinstance(entry, dict)
+    )
+    if (
+        explicit == SINGLE_FIT_SCHEMA
+        and inventory_proves_dual
+        and not has_human_decisions
+    ):
+        return DUAL_FIT_SCHEMA
+    if explicit == SINGLE_FIT_SCHEMA:
         return explicit
 
     header_sets: list[list[Any]] = []
@@ -57,7 +89,7 @@ def infer_review_schema(batch: dict[str, Any] | None) -> str:
         return SINGLE_FIT_SCHEMA
     if all(_norm(column) in normalized for column in DUAL_FIT_COLUMNS):
         return DUAL_FIT_SCHEMA
-    return DUAL_FIT_SCHEMA
+    return CURRENT_REVIEW_SCHEMA
 
 
 def human_is_complete(human: dict[str, Any] | None, review_schema: str) -> bool:

@@ -37,6 +37,7 @@ _REFERENCE_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
+_MAX_PROVIDER_ATTEMPTS = 3  # initial request plus at most two retries
 
 _DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 _DEFAULT_GROK_MODEL = "grok-4.3"
@@ -784,7 +785,7 @@ def _verify_gemini(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -795,19 +796,23 @@ def _verify_gemini(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -816,7 +821,8 @@ def _verify_gemini(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -835,7 +841,9 @@ def _verify_gemini(
 
         return _parse_response(response, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_gemini_rooftop(
@@ -885,7 +893,7 @@ def _verify_gemini_rooftop(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -896,19 +904,23 @@ def _verify_gemini_rooftop(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Rooftop attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -917,7 +929,8 @@ def _verify_gemini_rooftop(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Rooftop attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -936,7 +949,9 @@ def _verify_gemini_rooftop(
 
         return _parse_response(response, _RooftopResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_grok(
@@ -945,7 +960,7 @@ def _verify_grok(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
-    max_attempts: int = 4,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -988,7 +1003,8 @@ def _verify_grok(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(max(1, min(int(max_attempts), 4))):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1002,13 +1018,15 @@ def _verify_grok(
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok attempt %d timeout: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok network timeout after 4 attempts."
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
             )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -1018,7 +1036,9 @@ def _verify_grok(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -1029,7 +1049,8 @@ def _verify_grok(
                     attempt + 1, code, _truncate(e),
                 )
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -1061,7 +1082,8 @@ def _verify_grok(
         return _parse_response(shim, _VerificationResponse)
 
     return last_transient_result or _needs_review(
-        "Grok network timeout after 4 attempts."
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
     )
 
 
@@ -1070,7 +1092,7 @@ def _verify_grok_rooftop(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
-    max_attempts: int = 4,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -1110,7 +1132,8 @@ def _verify_grok_rooftop(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(max(1, min(int(max_attempts), 4))):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1124,13 +1147,15 @@ def _verify_grok_rooftop(
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok network timeout after 4 attempts."
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
             )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok rooftop attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -1140,7 +1165,9 @@ def _verify_grok_rooftop(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -1151,7 +1178,8 @@ def _verify_grok_rooftop(
                     attempt + 1, code, _truncate(e),
                 )
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -1183,7 +1211,8 @@ def _verify_grok_rooftop(
         return _parse_response(shim, _RooftopResponse)
 
     return last_transient_result or _needs_review(
-        "Grok network timeout after 4 attempts."
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
     )
 
 
@@ -1241,7 +1270,7 @@ def _verify_gemini_address(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1252,19 +1281,23 @@ def _verify_gemini_address(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Address attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Address attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Address attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -1273,7 +1306,8 @@ def _verify_gemini_address(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Address attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -1292,7 +1326,9 @@ def _verify_gemini_address(
 
         return _parse_response(response, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_grok_address(
@@ -1302,7 +1338,7 @@ def _verify_grok_address(
     timeout_s: int,
     context_image_path: str = None,
     closeup_image_path: str = None,
-    max_attempts: int = 4,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -1347,7 +1383,8 @@ def _verify_grok_address(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(max(1, min(int(max_attempts), 4))):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1360,12 +1397,16 @@ def _verify_grok_address(
             )
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok address attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Grok network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
+            )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok address attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -1375,7 +1416,9 @@ def _verify_grok_address(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok address attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -1383,7 +1426,8 @@ def _verify_grok_address(
             if code in (408, 429) or 500 <= code < 600:
                 _LOGGER.debug("Grok address attempt %d transient (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -1408,7 +1452,10 @@ def _verify_grok_address(
         shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
         return _parse_response(shim, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Grok network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
+    )
 
 
 def verify_address(

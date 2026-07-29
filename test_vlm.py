@@ -64,7 +64,7 @@ _TOP_LEVEL_KEYS = {
 }
 _CONSENSUS_NEEDS_REVIEW_MARKERS = ("disagreed", "threshold", "timeout")
 _API_ERROR_MARKERS = (
-    "after 4 attempts",
+    "after 3 attempts",
     "Network timeout",
     "Network connection error",
     "API server error",
