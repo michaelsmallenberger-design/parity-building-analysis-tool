@@ -25,6 +25,7 @@ import re
 import threading
 
 from review_contract import (
+    CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
     FIT_COL,
@@ -100,8 +101,8 @@ _DUAL_FILL_SYNONYMS = {
     PERI_FIT_COL: ["periscope fit", "periscope", "periscope fit?"],
     NOTES_COL: ["notes", "note"],
 }
-# Current callers and tests use the single-Fit contract by default.
-_FILL_SYNONYMS = _SINGLE_FILL_SYNONYMS
+# Current callers use separate product-fit columns.
+_FILL_SYNONYMS = _DUAL_FILL_SYNONYMS
 
 
 def _norm(h) -> str:
@@ -348,12 +349,15 @@ def read_bound_sheet(sheet_url, address_variants):
 
 
 def ensure_review_columns(binding, headers, hvac_options, fit_options,
-                          review_url="", review_schema=SINGLE_FIT_SCHEMA):
-    """Make sure the bound sheet has the review columns for its version (matched by
-    name; missing ones are APPENDED after the last header so the team's layout
-    is untouched) and give newly-created Fit columns dropdowns. Current workbooks
-    reuse their one existing ``Fit`` column; historical dual-product bindings
-    retain their separate columns."""
+                          review_url="", review_schema=CURRENT_REVIEW_SCHEMA):
+    """Make sure the bound sheet has the review columns for its version.
+
+    Existing columns are matched by name. Missing ones are appended after the
+    last header so the team's layout is untouched, and newly created product-fit
+    columns receive dropdowns. Current workbooks use separate ``Optimizer Fit``
+    and ``Periscope Fit`` columns; versioned historical batches can still reuse
+    one legacy ``Fit`` column.
+    """
     sheets, _ = _get_services()
     sid, grid, tab = binding["spreadsheet_id"], binding["grid_id"], binding["tab"]
     norm_to_idx = {}
@@ -438,7 +442,7 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     return binding
 
 
-def clear_review_answers(binding, review_schema=SINGLE_FIT_SCHEMA) -> bool:
+def clear_review_answers(binding, review_schema=CURRENT_REVIEW_SCHEMA) -> bool:
     """Blank review answers in a converted copy without changing its controls.
 
     The Sheets values API removes only cell values, so dropdown validation,

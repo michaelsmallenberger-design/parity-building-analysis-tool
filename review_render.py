@@ -1,13 +1,15 @@
-"""Interactive review page with imagery, map links, HVAC multi-select, and Fit.
+"""Interactive review page with imagery, HVAC, and product-fit decisions.
 
-Current workbooks submit one mutually-exclusive Fit value. Historical batches
-that genuinely target two product-fit columns keep their versioned interface.
+Current workbooks review Optimizer and Periscope independently. Previously
+persisted single-Fit batches keep their versioned interface.
 """
 import html as _html
 import json
 import urllib.parse
 
 from review_contract import (
+    CURRENT_REVIEW_SCHEMA,
+    DUAL_FIT_COLUMNS,
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
     FIT_OPTIONS,
@@ -23,12 +25,18 @@ HVAC_SYSTEMS = ["Cooling Tower", "Chiller", "Exhaust Fan", "RTU", "AHU", "PTAC",
 # Reviewers sometimes see no relevant HVAC at all; "None" is a submittable answer,
 # mutually exclusive with the systems above. Not part of the taxonomy itself.
 NONE_OPTION = "None"
-# Current workbooks use the one existing Fit dropdown.
-FIT_COLUMNS = ["Fit"]
+# Current workbooks use one independently reviewed column per product.
+FIT_COLUMNS = DUAL_FIT_COLUMNS
 # Compatibility export used by upload schema detection.
 LEGACY_FIT_VALUES = FIT_OPTIONS
 # AI verdicts that mean "cooling tower present" -> pre-check Cooling Tower for the reviewer.
-_AI_POSITIVE = {"confirmed", "registry_confirmed", "likely", "cooling_tower_present"}
+_AI_POSITIVE = {
+    "confirmed",
+    "registry_confirmed",
+    "likely",
+    "cooling_tower_present",
+    "cooling_tower_possible",
+}
 _IMG_SLOTS = [
     ("result_image_url", "Aerial (detections)"),
     ("result_image_url_wide", "Wide / context"),
@@ -69,7 +77,7 @@ def _model_boxes(e, reasoning):
     return out
 
 
-def _card(e, review_schema=SINGLE_FIT_SCHEMA):
+def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
     # A batch entry carries a "human" decision once reviewed (review_store); render
     # such cards in the exact state a live Submit leaves them in, so reopening the
     # page mid-batch shows what's already done.
@@ -84,6 +92,7 @@ def _card(e, review_schema=SINGLE_FIT_SCHEMA):
     addr = str(e.get("address", ""))
     addr_e = _html.escape(addr)
     ai = str(e.get("verdict") or "")
+    ai_positive = ai.strip().casefold() in _AI_POSITIVE
     ai_color = VERDICT_COLOR.get(ai, "#868e96")
     reasoning = _html.escape(str(e.get("reasoning") or "") or "(no model reasoning)")
     q = urllib.parse.quote(addr)
@@ -117,7 +126,7 @@ def _card(e, review_schema=SINGLE_FIT_SCHEMA):
         if human:
             pre = " sel" if s in picked else ""
         else:
-            pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
+            pre = " sel" if (s == "Cooling Tower" and ai_positive) else ""
         chips += f'<button type="button" class="chip{pre}"{controls_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
     fitrows = ""
     if review_schema == DUAL_FIT_SCHEMA:
@@ -129,6 +138,11 @@ def _card(e, review_schema=SINGLE_FIT_SCHEMA):
         fit_specs = [("Fit", "fit", FIT_OPTIONS)]
     for col, fit_key, fit_options in fit_specs:
         picked_fit = str(human.get(fit_key) or "")
+        if not human and ai_positive:
+            if review_schema == DUAL_FIT_SCHEMA and fit_key == "optimizer_fit":
+                picked_fit = "Good"
+            elif review_schema == SINGLE_FIT_SCHEMA and fit_key == "fit":
+                picked_fit = "Optimizer"
         chips_f = ""
         for fo in fit_options:
             pre = " sel" if fo == picked_fit else ""
@@ -188,7 +202,7 @@ def _card(e, review_schema=SINGLE_FIT_SCHEMA):
 
 def build_review_page(
     entries, job_id, webhook_url="", title="Cooling Tower Review",
-    csrf_token="", review_schema=SINGLE_FIT_SCHEMA,
+    csrf_token="", review_schema=CURRENT_REVIEW_SCHEMA,
 ):
     grouped = {}
     for entry in entries:
@@ -221,6 +235,11 @@ def build_review_page(
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
     schema_json = json.dumps(str(review_schema))
+    fit_help = (
+        "both Optimizer Fit and Periscope Fit choices"
+        if review_schema == DUAL_FIT_SCHEMA
+        else "a Fit choice"
+    )
     return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)}</title>
@@ -280,7 +299,7 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 <div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · {attention0} need attention · every Submit writes to the source tab</div></header>
 <div class="wrap">{cards}</div>
 <div class="bulk-review">
-  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>) and a Fit choice. Incomplete cards are skipped so nothing is guessed.</div>
+  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
   <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed</button>
   <span id="bulk-status" class="bulk-status"></span>
 </div>

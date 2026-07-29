@@ -12,6 +12,7 @@ import threading
 
 from storage_helpers import write_json, read_json, get_file_path
 from review_contract import (
+    CURRENT_REVIEW_SCHEMA,
     SINGLE_FIT_SCHEMA,
     entry_is_reviewed,
     infer_review_schema,
@@ -77,7 +78,7 @@ def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
                sheet_binding: dict = None, sheet_bindings: list = None,
                tab_inventory: list = None, schema_version: int = 1,
                run_id: str = None,
-               review_schema: str = SINGLE_FIT_SCHEMA) -> None:
+               review_schema: str = CURRENT_REVIEW_SCHEMA) -> None:
     """Persist a batch's web_entries (with images) for the review page, plus the
     ORIGINAL uploaded table (headers + rows, all the user's columns) so the finished
     Google Sheet can be assembled from the human picks later. sheet_binding is set
@@ -91,7 +92,7 @@ def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
             "sheet_bindings": sheet_bindings or [],
             "tab_inventory": tab_inventory or [],
             "schema_version": int(schema_version),
-            "review_schema": str(review_schema or SINGLE_FIT_SCHEMA),
+            "review_schema": str(review_schema or CURRENT_REVIEW_SCHEMA),
             "run_id": run_id,
             "created": datetime.utcnow().isoformat(),
             "table_headers": table_headers or [],

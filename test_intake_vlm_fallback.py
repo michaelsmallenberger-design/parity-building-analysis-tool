@@ -5,13 +5,16 @@ with local fakes; this suite never makes a network or paid-model request.
 """
 import os
 import tempfile
+from pathlib import Path
 
+import httpx
 import pandas as pd
 from PIL import Image
 
 import intake_resolver
 from report_audit import build_audit_report
 import sheets_writer
+import tasks_local
 import vlm
 
 
@@ -118,7 +121,7 @@ def test_gemini_first_fallback():
 
             # A technical Gemini failure permits exactly one emergency Grok call.
             vlm._verify_gemini_address = lambda *_args, **_kwargs: _valid_result(
-                "needs_review", 0.0, "Network timeout after 4 attempts.")
+                "needs_review", 0.0, "Network timeout after 3 attempts.")
             def grok_once(*_args, **kwargs):
                 grok_calls.append(kwargs.get("max_attempts"))
                 return _valid_result("likely", 0.6, "Fallback found louvers.")
@@ -144,6 +147,111 @@ def test_gemini_first_fallback():
             os.environ.pop("XAI_API_KEY", None)
         else:
             os.environ["XAI_API_KEY"] = old_xai
+
+
+def test_gemini_stops_after_two_retries():
+    old_client = vlm._get_gemini_client
+    old_sleep = vlm.time.sleep
+    old_key = os.environ.get("GEMINI_API_KEY")
+
+    class AlwaysTimeoutModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, **_kwargs):
+            self.calls += 1
+            raise httpx.TimeoutException("local retry-cap test")
+
+    models = AlwaysTimeoutModels()
+    fake_client = type("FakeGeminiClient", (), {"models": models})()
+    try:
+        os.environ["GEMINI_API_KEY"] = "mock-key"
+        vlm._get_gemini_client = lambda _api_key: fake_client
+        vlm.time.sleep = lambda _seconds: None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "test.png")
+            Image.new("RGB", (16, 16), "white").save(image_path)
+            result = vlm._verify_gemini_address(
+                image_path,
+                {"address": "1 Test St", "lat": 1.0, "lon": 1.0},
+                n_boxes=0,
+                timeout_s=1,
+            )
+        assert vlm._MAX_PROVIDER_ATTEMPTS == 3
+        assert models.calls == 3, "Gemini must make one request plus only two retries"
+        assert "after 3 attempts" in result["reasoning"]
+    finally:
+        vlm._get_gemini_client = old_client
+        vlm.time.sleep = old_sleep
+        if old_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = old_key
+
+
+def test_gemini_quota_exhaustion_uses_one_grok_call():
+    old_client = vlm._get_gemini_client
+    old_grok = vlm._verify_grok_address
+    old_sleep = vlm.time.sleep
+    old_gemini_key = os.environ.get("GEMINI_API_KEY")
+    old_xai_key = os.environ.get("XAI_API_KEY")
+
+    class AlwaysQuotaLimitedModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, **_kwargs):
+            self.calls += 1
+            raise vlm.genai_errors.ClientError(
+                429,
+                {
+                    "error": {
+                        "code": 429,
+                        "message": "quota exhausted in local test",
+                        "status": "RESOURCE_EXHAUSTED",
+                    }
+                },
+            )
+
+    models = AlwaysQuotaLimitedModels()
+    fake_client = type("FakeGeminiClient", (), {"models": models})()
+    grok_calls = []
+    try:
+        os.environ["GEMINI_API_KEY"] = "mock-key"
+        os.environ["XAI_API_KEY"] = "mock-key"
+        vlm._get_gemini_client = lambda _api_key: fake_client
+        vlm.time.sleep = lambda _seconds: None
+
+        def grok_once(*_args, **kwargs):
+            grok_calls.append(kwargs.get("max_attempts"))
+            return _valid_result("confirmed", 0.88, "Grok fallback confirmed it.")
+
+        vlm._verify_grok_address = grok_once
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "test.png")
+            Image.new("RGB", (16, 16), "white").save(image_path)
+            result = vlm.verify_address(
+                image_path,
+                {"address": "1 Test St", "lat": 1.0, "lon": 1.0},
+            )
+
+        assert models.calls == 3, "quota failures get only two Gemini retries"
+        assert grok_calls == [1], "the emergency Grok path gets one request"
+        assert result["model_path"] == "grok_emergency_fallback"
+        assert result["grok_fallback_used"]
+        assert result["verdict"] == "confirmed"
+    finally:
+        vlm._get_gemini_client = old_client
+        vlm._verify_grok_address = old_grok
+        vlm.time.sleep = old_sleep
+        if old_gemini_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = old_gemini_key
+        if old_xai_key is None:
+            os.environ.pop("XAI_API_KEY", None)
+        else:
+            os.environ["XAI_API_KEY"] = old_xai_key
 
 
 def test_multi_tab_file_resolution():
@@ -220,10 +328,59 @@ def test_grok_is_hidden_when_no_fallback_ran():
     assert "Grok &mdash;" not in html
 
 
+def test_provider_exhaustion_is_not_retried_by_the_address_queue():
+    """The provider owns its two retries; the outer queue must not repeat them."""
+    old_process = tasks_local._process_one_address
+    old_rounds = tasks_local.MAX_RETRY_ROUNDS
+    old_mapbox = os.environ.get("MAPBOX_API_KEY")
+    calls = []
+    try:
+        os.environ["MAPBOX_API_KEY"] = "local-no-spend-test"
+        tasks_local.MAX_RETRY_ROUNDS = 2
+
+        def exhausted(*_args, **_kwargs):
+            calls.append(1)
+            entry = {
+                "address": "1 Test St",
+                "verdict": "needs_review",
+                "reasoning": "Gemini network timeout after 3 attempts.",
+                "error": "",
+            }
+            return entry, {"Address": "1 Test St", "Verdict": "needs_review"}
+
+        tasks_local._process_one_address = exhausted
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "addresses.csv"
+            source.write_text("Address\n1 Test St\n", encoding="utf-8")
+            result = tasks_local.process_address_list(
+                str(source),
+                "provider-budget",
+                lambda *_args: None,
+                lambda: False,
+                lambda _local, blob: blob,
+                lambda blob: f"/files/{blob}",
+                concurrency=1,
+            )
+
+        assert len(calls) == 1
+        assert len(result["web_results"]) == 1
+        assert result["web_results"][0]["verdict"] == "needs_review"
+    finally:
+        tasks_local._process_one_address = old_process
+        tasks_local.MAX_RETRY_ROUNDS = old_rounds
+        if old_mapbox is None:
+            os.environ.pop("MAPBOX_API_KEY", None)
+        else:
+            os.environ["MAPBOX_API_KEY"] = old_mapbox
+
+
 if __name__ == "__main__":
     test_intake_resolution()
     test_gemini_first_fallback()
+    test_gemini_stops_after_two_retries()
+    test_gemini_quota_exhaustion_uses_one_grok_call()
     test_multi_tab_file_resolution()
     test_existing_sheet_dropdowns_are_untouched()
     test_grok_is_hidden_when_no_fallback_ran()
+    test_provider_exhaustion_is_not_retried_by_the_address_queue()
     print("OK: intake resolution and Gemini-first fallback are covered with local mocks only.")

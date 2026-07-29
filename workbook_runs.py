@@ -750,20 +750,24 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
     if not mappings:
         raise ValueError("Workbook has no selected address tabs")
     bindings = sheets_writer.read_bound_sheet_mappings(run["sheet_url"], mappings)
-    from review_render import FIT_OPTIONS, HVAC_SYSTEMS, NONE_OPTION
+    from review_contract import DUAL_FIT_OPTIONS, DUAL_FIT_SCHEMA
+    from review_render import HVAC_SYSTEMS, NONE_OPTION
     for binding in bindings:
         sheets_writer.ensure_review_columns(
             binding,
             binding.get("headers", []),
             HVAC_SYSTEMS + [NONE_OPTION],
-            FIT_OPTIONS,
+            DUAL_FIT_OPTIONS,
+            review_schema=DUAL_FIT_SCHEMA,
         )
         # File uploads are converted into a disposable working Sheet. Start
         # each review blank even when its template contains stale selections;
         # values-only clearing preserves every dropdown and all formatting.
         # Live Google Sheet intake has no source_blob and stays untouched.
         if run.get("source_blob"):
-            sheets_writer.clear_review_answers(binding)
+            sheets_writer.clear_review_answers(
+                binding, review_schema=DUAL_FIT_SCHEMA,
+            )
     tab_counts = collections.Counter()
     grouped: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
     target_order = []

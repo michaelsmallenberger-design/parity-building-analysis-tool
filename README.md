@@ -10,7 +10,7 @@ Internal cooling-tower analysis tool for building address lists. The app geocode
 - Main deployment entry: `app_railway.py` copied to `app.py` in `Dockerfile.railway`
 - Current report format: audit-card HTML from `report_audit.py`; interactive dark review page from `review_render.py`
 - Current automation paths: browser, Drive inbox, and the versioned API use the durable workbook engine; there is no deployed n8n dependency
-- Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC/Fit picks into a Google Sheet
+- Current operator path: the Claude skill `.claude/skills/parity-cooling-tower` runs a batch, hands the team a review page, then writes the reviewed HVAC, Optimizer Fit, and Periscope Fit picks into a Google Sheet
 
 Presentation material is in `docs/presentation/`.
 
