@@ -20,7 +20,21 @@
         max-width: 560px;
         width: calc(100% - 2rem);
     }
-    .logo { width: 64px; height: 64px; margin-bottom: .6rem; }
+    .logo-wrap {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: #fff;
+        border-radius: 10px;
+        padding: 9px 13px;
+        margin-bottom: .75rem;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, .28);
+    }
+    .logo {
+        display: block;
+        width: 164px;
+        height: auto;
+    }
     h1 { margin: 0 0 .3rem; color: #e6e8eb; font-size: 22px; }
     .blurb { font-size: .95rem; color: #9aa3ad; margin: 0 0 1.6rem; }
     .steps {
@@ -60,7 +74,9 @@
 
 {% block content %}
 <div class="container">
-    <img class="logo" src="/static/images/Parity-Logo.png" alt="Parity">
+    <div class="logo-wrap">
+        <img class="logo" src="/static/images/Parity-Logo.png" alt="Parity">
+    </div>
     <h1>Cooling Tower Analyzer</h1>
     <p class="blurb">Paste your building list's Google Sheet link — the answers get written back into your sheet.</p>
     <ol class="steps">
