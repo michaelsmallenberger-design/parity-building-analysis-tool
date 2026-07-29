@@ -13,13 +13,14 @@ from pathlib import Path
 from job_queue import (
     init_db, get_pending_jobs, update_job_status,
     should_cancel_job, get_job_payload, increment_usage,
-    recover_interrupted_workbook_jobs,
+    recover_interrupted_workbook_jobs, get_job_status,
 )
 from storage_helpers import (
     init_storage, get_file_path, upload_file, make_url, write_result,
-    read_json, write_json,
+    read_json, write_json, read_result,
 )
 from tasks_local import process_address_list
+from failure_diagnostics import build_failure_diagnostic
 
 log = logging.getLogger("worker")
 
@@ -77,6 +78,10 @@ class BackgroundWorker:
 
         if not payload:
             log.error(f"No payload found for job {job_id}")
+            self._save_failure_diagnostic(
+                job_id, {}, RuntimeError("No queued job payload was available"),
+                stage="queue_payload",
+            )
             update_job_status(job_id, status="failed", message="No payload")
             return
 
@@ -139,7 +144,10 @@ class BackgroundWorker:
             if isinstance(result, dict) and "error" in result:
                 error_msg = result["error"]
                 log.error(f"Job {job_id} failed during processing: {error_msg}")
-                write_result(job_id, result)  # Save error result for user visibility
+                self._save_failure_diagnostic(
+                    job_id, payload, str(error_msg),
+                    stage="address_processing", result=result,
+                )
                 update_job_status(job_id, status="failed",
                                 progress=0,
                                 total=max(int(total), 1),
@@ -205,10 +213,47 @@ class BackgroundWorker:
                     workbook_runs.mutate_run(job_id, mark_attention)
                 except Exception:
                     log.exception("Could not update failed workbook manifest %s", job_id)
+            self._save_failure_diagnostic(
+                job_id, payload, e,
+                stage=(
+                    "workbook_processing"
+                    if payload.get("kind") == "workbook"
+                    else "address_processing"
+                ),
+            )
             update_job_status(job_id, status="failed",
                             progress=0,
                             total=max(int(payload.get('total', 1)), 1),
                             message=str(e))
+
+    def _save_failure_diagnostic(
+        self, job_id, payload, error, *, stage, result=None,
+    ):
+        """Attach a sanitized diagnostic without masking the original failure."""
+        try:
+            current = (
+                deepcopy(result)
+                if isinstance(result, dict)
+                else (read_result(job_id) or {})
+            )
+            status = get_job_status(job_id) or {}
+            rows = current.get("live_rows") or current.get("address_states") or []
+            diagnostic = build_failure_diagnostic(
+                run_id=job_id,
+                stage=stage,
+                error=error,
+                progress=int(status.get("progress") or 0),
+                total=int(status.get("total") or payload.get("total") or 0),
+                rows=rows,
+            )
+            current["diagnostic"] = diagnostic
+            write_result(job_id, current)
+        except Exception as diagnostic_error:
+            log.warning(
+                "Could not persist failure diagnostic for %s: %s",
+                job_id,
+                type(diagnostic_error).__name__,
+            )
 
     def _process_workbook_job(self, job_id, payload):
         """Resume a durable workbook one checkpointed analysis chunk at a time."""
@@ -228,6 +273,47 @@ class BackgroundWorker:
             for chunk in run.get("chunks", [])
             if chunk.get("status") == "complete"
         )
+        live_state_lock = threading.Lock()
+        live_rows_by_key = {}
+        for manifest_chunk in run.get("chunks", []):
+            for item in manifest_chunk.get("items", []):
+                for target in item.get("targets", []):
+                    source_key = str(target.get("source_key") or "")
+                    live_rows_by_key[source_key] = {
+                        "row_id": source_key,
+                        "address": item.get("address") or "",
+                        "tab": target.get("tab") or "",
+                        "source_row": target.get("source_row"),
+                        "state": "queued",
+                        "message": "Waiting to be analyzed",
+                        "error": "",
+                        "model_result": "",
+                    }
+            if manifest_chunk.get("status") == "complete":
+                completed = read_json(manifest_chunk.get("result_blob") or "") or {}
+                for entry in completed.get("entries", []):
+                    source_key = str(entry.get("source_key") or "")
+                    if source_key not in live_rows_by_key:
+                        continue
+                    error = str(entry.get("error") or "")
+                    live_rows_by_key[source_key].update({
+                        "state": "attention" if error else "complete",
+                        "message": error or "Machine analysis finished",
+                        "error": error,
+                        "model_result": str(entry.get("verdict") or ""),
+                    })
+
+        def _live_payload():
+            return {
+                "schema_version": 2,
+                "run_id": job_id,
+                "live_rows": list(live_rows_by_key.values()),
+                "count": len(live_rows_by_key),
+                "review_url": "",
+                "sheet_url": run.get("sheet_url") or "",
+            }
+
+        write_result(job_id, _live_payload())
 
         for chunk in run.get("chunks", []):
             if chunk.get("status") == "complete":
@@ -256,6 +342,38 @@ class BackgroundWorker:
                     ),
                 )
 
+            def write_workbook_partial(data):
+                write_json(chunk["partial_blob"], data)
+                states = {
+                    int(item["index"]): item
+                    for item in data.get("address_states", [])
+                    if isinstance(item, dict) and "index" in item
+                }
+                results = {
+                    int(item["index"]): item.get("web_entry") or {}
+                    for item in data.get("row_results", [])
+                    if isinstance(item, dict) and "index" in item
+                }
+                with live_state_lock:
+                    for index, state in states.items():
+                        if index < 0 or index >= len(chunk.get("items", [])):
+                            continue
+                        analysis_item = chunk["items"][index]
+                        web_entry = results.get(index) or {}
+                        row_state = str(state.get("state") or "queued")
+                        error = str(state.get("error") or web_entry.get("error") or "")
+                        for target in analysis_item.get("targets", []):
+                            source_key = str(target.get("source_key") or "")
+                            if source_key not in live_rows_by_key:
+                                continue
+                            live_rows_by_key[source_key].update({
+                                "state": row_state,
+                                "message": str(state.get("message") or ""),
+                                "error": error,
+                                "model_result": str(web_entry.get("verdict") or ""),
+                            })
+                    write_result(job_id, _live_payload())
+
             result = process_address_list(
                 uploaded_filepath=str(csv_path),
                 job_id=chunk_job_id,
@@ -263,7 +381,7 @@ class BackgroundWorker:
                 should_cancel=lambda: should_cancel_job(job_id),
                 upload_file=lambda local_path, dest_blob: upload_file(local_path, dest_blob),
                 make_signed_url=lambda dest_blob, minutes=None: make_url(dest_blob),
-                write_partial_result=lambda data: write_json(chunk["partial_blob"], data),
+                write_partial_result=write_workbook_partial,
                 resume_results=resume,
             )
             if isinstance(result, dict) and result.get("error"):
@@ -335,6 +453,7 @@ class BackgroundWorker:
             "sheet_url": sheet_url,
             "count": len(entries),
             "needs_attention": needs_attention,
+            "live_rows": list(live_rows_by_key.values()),
         })
         update_job_status(
             job_id,
