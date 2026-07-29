@@ -1,24 +1,20 @@
-"""Phase 3 dual-VLM verification of YOLO cooling-tower detections.
+"""Gemini-first verification of YOLO cooling-tower detections.
 
-Public surface: a single function ``verify_detection`` that takes a satellite
-tile path, a YOLO bounding box, and a building-context dict, and returns a
-result dict describing whether the candidate is a real cooling tower on the
-target rooftop. Every call runs Gemini 3.1 Pro and Grok 4.3 in parallel and
-combines their verdicts via consensus: bucket-agreement on a confident answer
-= final verdict; disagreement OR below-threshold confidence = ``needs_review``.
-All recoverable failures map to ``needs_review``; configuration errors
-(missing ``GEMINI_API_KEY`` or ``XAI_API_KEY``) propagate as ``KeyError``.
+Gemini is the normal rooftop reviewer.  Grok is intentionally an emergency
+fallback only after Gemini has exhausted its retries because of a provider,
+transport, timeout, or structured-output failure.  Valid Gemini uncertainty is
+still a valid Gemini result and never spends on Grok.
 """
 
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import functools
 import io
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,7 +38,7 @@ _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
 
-_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 _DEFAULT_GROK_MODEL = "grok-4.3"
 _GROK_BASE_URL = "https://api.x.ai/v1"
 # Reasoning depth. Grok 4.3 defaults to "low" if unset; Gemini 3.x to "medium".
@@ -51,6 +47,118 @@ _GROK_REASONING_EFFORT = os.environ.get("GROK_REASONING_EFFORT", "high")
 _GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "high")
 _DEFAULT_TIMEOUT_S = 120
 _DEFAULT_CONSENSUS_THRESHOLD = 0.7
+
+_METRICS_LOCK = threading.Lock()
+_METRICS = {"gemini_only_reviews": 0, "grok_emergency_fallbacks": 0}
+_TECHNICAL_FAILURE_MARKERS = (
+    "timeout", "network", "connection error", "api ", "schema mismatch",
+    "empty response", "response shape", "authentication", "authorization",
+    "throttled", "invalid structured",
+)
+
+
+def _metric(name: str) -> None:
+    with _METRICS_LOCK:
+        _METRICS[name] = _METRICS.get(name, 0) + 1
+
+
+def metrics_snapshot() -> dict:
+    """Non-sensitive operational counters for health/audit reporting."""
+    with _METRICS_LOCK:
+        return dict(_METRICS)
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _grok_fallback_enabled() -> bool:
+    return _flag("GEMINI_GROK_EMERGENCY_FALLBACK_ENABLED", True)
+
+
+def _is_technical_gemini_failure(result: dict) -> bool:
+    """Only provider/transport/schema failures are allowed to invoke Grok."""
+    if not isinstance(result, dict) or result.get("verdict") != "needs_review":
+        return False
+    reasoning = str(result.get("reasoning") or "").lower()
+    return any(marker in reasoning for marker in _TECHNICAL_FAILURE_MARKERS)
+
+
+def _gemini_first_result(
+    gemini_result: dict, grok_result: dict | None = None, *, fallback_attempted: bool = False,
+) -> dict:
+    """Keep the historical result shape while exposing the model path used."""
+    if grok_result is None:
+        _metric("gemini_only_reviews")
+        return {
+            **gemini_result,
+            "gemini": gemini_result,
+            "grok": {},
+            # Retained for old CSV/review consumers. A Gemini-only result is
+            # not a two-model agreement, even when it is a valid final verdict.
+            "agreement": False,
+            "model_path": "gemini_only",
+            "grok_fallback_used": False,
+        }
+
+    if fallback_attempted:
+        _metric("grok_emergency_fallbacks")
+    if grok_result.get("verdict") != "needs_review":
+        return {
+            **grok_result,
+            "reasoning": (
+                "Gemini had a technical verification failure; Grok emergency fallback: "
+                f"{grok_result.get('reasoning', '')}"
+            ),
+            "gemini": gemini_result,
+            "grok": grok_result,
+            "agreement": False,
+            "model_path": "grok_emergency_fallback",
+            "grok_fallback_used": True,
+        }
+
+    return {
+        "verdict": "needs_review",
+        "confidence": 0.0,
+        "reasoning": (
+            "Gemini had a technical verification failure and the one allowed Grok "
+            f"fallback also failed. Gemini: {gemini_result.get('reasoning', '')} "
+            f"Grok: {grok_result.get('reasoning', '')}"
+        ),
+        "construction": False,
+        "is_house": False,
+        "image_unusable": bool(gemini_result.get("image_unusable") or grok_result.get("image_unusable")),
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
+        "gemini": gemini_result,
+        "grok": grok_result,
+        "agreement": False,
+        "model_path": "grok_fallback_failed",
+        "grok_fallback_used": True,
+    }
+
+
+def _grok_fallback_unavailable_result(gemini_result: dict) -> dict:
+    """Fail closed without pretending Grok ran when its exception path is off."""
+    return {
+        "verdict": "needs_review",
+        "confidence": 0.0,
+        "reasoning": (
+            "Gemini had a technical verification failure and Grok emergency fallback "
+            f"was unavailable. Gemini: {gemini_result.get('reasoning', '')}"
+        ),
+        "construction": False,
+        "is_house": False,
+        "image_unusable": bool(gemini_result.get("image_unusable")),
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
+        "gemini": gemini_result,
+        "grok": {},
+        "agreement": False,
+        "model_path": "grok_fallback_unavailable",
+        "grok_fallback_used": False,
+    }
 
 _POSITIVE_VERDICTS = frozenset({"confirmed", "likely", "cooling_tower_present", "cooling_tower_possible"})
 _NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only", "no_cooling_tower"})
@@ -837,6 +945,7 @@ def _verify_grok(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
+    max_attempts: int = 4,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -879,7 +988,7 @@ def _verify_grok(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(max(1, min(int(max_attempts), 4))):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -961,6 +1070,7 @@ def _verify_grok_rooftop(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
+    max_attempts: int = 4,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -1000,7 +1110,7 @@ def _verify_grok_rooftop(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(max(1, min(int(max_attempts), 4))):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1192,6 +1302,7 @@ def _verify_grok_address(
     timeout_s: int,
     context_image_path: str = None,
     closeup_image_path: str = None,
+    max_attempts: int = 4,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -1236,7 +1347,7 @@ def _verify_grok_address(
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(max(1, min(int(max_attempts), 4))):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1307,11 +1418,11 @@ def verify_address(
     context_image_path: str = None,
     closeup_image_path: str = None,
 ) -> dict:
-    """One dual-VLM pass per address. The VLM sees a single marked-up tile (target
+    """One Gemini-first pass per address. The reviewer sees a marked-up tile (target
     footprint in red, YOLO candidate boxes numbered) plus reference images, and
     returns one consensus verdict — verifying the boxes AND scanning for anything
     YOLO missed. Replaces the per-box verify_detection loop + the verify_rooftop
-    scan. Same output shape as verify_detection (the 7-key consensus dict)."""
+    scan. The result retains legacy per-model fields and adds ``model_path``."""
     if not isinstance(building_context, dict):
         return _needs_review(
             f"building_context must be a dict, got {type(building_context).__name__}."
@@ -1340,35 +1451,22 @@ def verify_address(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini_address(
+        image_path, building_context, n_boxes, timeout_s,
+        context_image_path, closeup_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini_address, image_path, building_context, n_boxes, timeout_s,
-            context_image_path, closeup_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok_address, image_path, building_context, n_boxes, timeout_s,
-            context_image_path, closeup_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(f"Gemini exceeded {timeout_s}s wall-clock timeout.")
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(f"Grok exceeded {timeout_s}s wall-clock timeout.")
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok_address(
+        image_path, building_context, n_boxes, timeout_s,
+        context_image_path, closeup_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)
 
 
 def _combine_verdicts(
@@ -1456,7 +1554,7 @@ def verify_detection(
     building_context: dict,
     context_image_path: str = None,
 ) -> dict:
-    """Verify a YOLO cooling-tower detection using parallel Gemini + Grok consensus.
+    """Verify a YOLO cooling-tower detection with Gemini first.
 
     Args:
         image_path: Path to the full 768x768 satellite tile (JPEG/PNG).
@@ -1470,38 +1568,15 @@ def verify_detection(
             the OSM footprint).
 
     Returns:
-        A dict with exactly seven keys. The first four are the consensus
-        result (backward-compatible with the prior single-model shape);
-        the remaining three expose per-model detail.
-
-        - ``verdict`` (str): consensus verdict, or ``"needs_review"`` when
-          the two models disagree, either falls below the confidence
-          threshold, or either failed via timeout/transport error.
-        - ``confidence`` (float): ``min(gemini_conf, grok_conf)`` when
-          consensus reached; ``0.0`` otherwise.
-        - ``reasoning`` (str): synthesized explanation that embeds both
-          models' raw reasoning. For ``needs_review`` it leads with the
-          reason ("Models disagreed.", "Below confidence threshold.", or
-          a per-model timeout/transport failure embedded in sub-detail).
-        - ``construction`` (bool): ``True`` only when both models flagged
-          active construction.
-        - ``gemini`` (dict): Gemini's own 4-key result dict.
-        - ``grok`` (dict): Grok's own 4-key result dict.
-        - ``agreement`` (bool): ``True`` iff the two models confidently
-          agreed on a bucket.
-
-        All recoverable failures (bad inputs, network errors, schema
-        mismatches, per-model timeouts, etc.) are mapped to ``needs_review``
-        in the relevant sub-dict; that naturally routes the top-level result
-        to ``needs_review`` via the disagreement rule. Pre-flight validation
-        failures (bad inputs, unreadable image, degenerate bbox) short-circuit
-        and return ``needs_review`` directly without calling either model
-        (and without the per-model sub-dicts).
+        A backward-compatible result with ``gemini``, an empty ``grok`` field
+        unless fallback actually ran, and a ``model_path`` marker. Valid
+        Gemini positives, negatives, low-confidence outcomes, and human-review
+        outcomes never invoke Grok. Technical provider/timeout/schema failures
+        can make one Grok emergency request; if that fails, the result is
+        ``needs_review``.
 
     Raises:
-        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
-            or empty. Both are required configuration; missing keys are
-            surfaced loudly rather than routed to ``needs_review``.
+        KeyError: If ``GEMINI_API_KEY`` is unset or empty.
     """
     if not isinstance(building_context, dict):
         return _needs_review(
@@ -1547,39 +1622,21 @@ def verify_detection(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini(
+        image_path, detection_bbox, building_context, timeout_s, context_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini, image_path, detection_bbox, building_context, timeout_s,
-            context_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok, image_path, detection_bbox, building_context, timeout_s,
-            context_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(
-                f"Gemini exceeded {timeout_s}s wall-clock timeout."
-            )
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(
-                f"Grok exceeded {timeout_s}s wall-clock timeout."
-            )
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok(
+        image_path, detection_bbox, building_context, timeout_s,
+        context_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)
 
 
 def verify_rooftop(
@@ -1604,16 +1661,13 @@ def verify_rooftop(
             sub-dict with ``osm_id``, ``tags``, and ``contains_point``.
 
     Returns:
-        A dict with exactly seven keys, matching the shape of
-        ``verify_detection``. The verdict literals come from the rooftop
+        A backward-compatible result matching ``verify_detection``. The verdict literals come from the rooftop
         schema: ``cooling_tower_present``, ``cooling_tower_possible``,
         ``no_cooling_tower``, or ``needs_review``. Construction is True only
-        when both models flagged active construction (same consensus rule
-        as ``verify_detection``).
+        when the active reviewer flags active construction.
 
     Raises:
-        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
-            or empty.
+        KeyError: If ``GEMINI_API_KEY`` is unset or empty.
     """
     if not isinstance(building_context, dict):
         return _needs_review(
@@ -1643,37 +1697,17 @@ def verify_rooftop(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini_rooftop(
+        image_path, building_context, timeout_s, context_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini_rooftop, image_path, building_context, timeout_s,
-            context_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok_rooftop, image_path, building_context, timeout_s,
-            context_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(
-                f"Gemini exceeded {timeout_s}s wall-clock timeout."
-            )
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(
-                f"Grok exceeded {timeout_s}s wall-clock timeout."
-            )
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
-
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok_rooftop(
+        image_path, building_context, timeout_s, context_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)

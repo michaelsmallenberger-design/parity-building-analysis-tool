@@ -46,7 +46,7 @@ ADDRESS
   4. IMAGERY        download satellite tile centered on the roof     (Google Static Maps / Mapbox)
   5. DETECT         YOLO vision model proposes cooling-tower boxes   (2× custom-trained YOLO)
   6. FILTER         keep only detections ON this building's roof     (Shapely point-in-polygon)
-  7. VERIFY         two AI vision models judge the evidence          (Google Gemini + xAI Grok)
+  7. VERIFY         Gemini judges the evidence                       (Grok only after technical failure)
   8. REPORT         verdict + annotated image + reasoning            (email-safe HTML + Excel)
 ```
 
@@ -85,18 +85,17 @@ polygon: inside / boundary / outside. Detections on a neighbor's roof are droppe
 In dense downtowns the gate is stricter ("roof-only").
 
 **7. Verification (the accuracy core)** — The annotated tile (+ the other zoom as
-context) is sent to **two independent AI vision models in parallel**: **Google
-Gemini** and **xAI Grok**. Each returns a structured verdict + confidence + written
-reasoning, and each is given **few-shot reference images** of real vs. fake cooling
-towers (vents, water tanks, RTUs). **Consensus rule:** both must agree AND both be
-confident → confirmed; both agree it's absent → negative; **disagreement or low
-confidence → `needs_review` (a human looks).**
+context) is sent to **Google Gemini** for the normal structured verdict, confidence,
+and written reasoning, with **few-shot reference images** of real vs. fake cooling
+towers (vents, water tanks, RTUs). Valid uncertainty becomes `needs_review`. **xAI
+Grok is a one-request emergency fallback only after a technical Gemini failure**;
+it is not called for an ordinary uncertain roof.
 
 **8. Report** — A self-contained, **email-safe HTML report**: one card per building,
 grouped by verdict, each showing the annotated image (red footprint outline + boxes),
-a **Google Maps / Earth / Bing link**, and **both models' reasoning side-by-side
-(Gemini in green, Grok in black)**. Plus an **Excel spreadsheet** of the tabular
-results.
+a **Google Maps / Earth / Bing link**, and the actual reviewer path: Gemini
+reasoning normally, with Grok shown only when the emergency fallback ran. Plus an
+**Excel spreadsheet** of the tabular results.
 
 ---
 
@@ -111,18 +110,16 @@ These are the points that make the tool *trustworthy*, which is what Alex cares 
 
 - **Recall-first CV + precision-first AI.** One model doing both jobs has to balance
   missing real towers vs. crying wolf. We split it: the **YOLO** stage is tuned to
-  *catch everything* (it's fine to over-propose), and the **dual-AI** stage is tuned
+  *catch everything* (it's fine to over-propose), and the **Gemini review** stage is tuned
   to *only confirm when sure*. Each stage does the job it's good at.
 
-- **Two independent AI models must agree.** Gemini and Grok are different models from
-  different companies; they fail in different ways. Requiring **consensus** turns two
-  good-but-imperfect models into one high-precision verdict. Crucially, their
-  **disagreements aren't errors — they're the signal**: those are the genuinely
-  ambiguous rooftops, which get routed to a human (`needs_review`) instead of a
-  confident wrong answer.
+- **Uncertainty and outages are handled differently.** A visually ambiguous roof is
+  routed to a human as `needs_review`; it is not sent to a second model to manufacture
+  confidence. A technical Gemini outage can use one bounded Grok request so a provider
+  failure does not silently drop the building.
 
 - **It's designed to never be silently wrong.** Every failure mode has an explicit
-  bucket: no footprint → `footprint_missing`; models disagree → `needs_review`;
+  bucket: no footprint → `footprint_missing`; visual uncertainty → `needs_review`;
   API timeout → flagged retryable. Nothing gets a fake "confident" answer.
 
 - **Provider fallbacks everywhere.** Geocoding (Google→Mapbox→OSM) and footprints
@@ -143,8 +140,8 @@ you must obtain/set an API key.
 |---|---|---|---|---|
 | **Google Maps Platform** (Geocoding + Static Maps + Address Validation APIs) | Stage 1 geocode, Stage 4 imagery, Stage 2 validation | `GOOGLE_MAPS_API_KEY` | Pay-per-call; Google gives a recurring monthly free credit that covers light use | **Yes** (default provider) |
 | **Mapbox** (Geocoding + Static Images) | Geocode fallback; **dense-urban imagery** | `MAPBOX_API_KEY` | Free tier (~50k loads/mo) then per-call | **Yes** (used downtown + fallback) |
-| **Google Gemini** (Generative Language / AI Studio API) | Stage 7 AI verification — model #1 | `GEMINI_API_KEY` | Pay-per-call (token-based); `gemini-3.5-flash` is cheap | **Yes** |
-| **xAI Grok** (OpenAI-compatible API) | Stage 7 AI verification — model #2 | `XAI_API_KEY` | Pay-per-call (token-based) | **Yes** |
+| **Google Gemini** (Generative Language / AI Studio API) | Normal Stage 7 AI verification | `GEMINI_API_KEY` | Pay-per-call (token-based); `gemini-3.6-flash` is the default | **Yes** |
+| **xAI Grok** (OpenAI-compatible API) | One emergency verification request after a technical Gemini failure | `XAI_API_KEY` | Pay-per-call (token-based) | Optional |
 | **OpenStreetMap Overpass API** | Stage 3 building footprints (primary) | none | Free, public, rate-limited | Yes (no key) |
 | **Nominatim (OSM)** | Geocode last-resort fallback | none | Free, 1 req/sec | No key |
 | **NYC planimetric / OpenData** | Footprint fallback in NYC | none | Free public data | No key |
@@ -163,7 +160,7 @@ a third-party service. This is a differentiator: the core CV is proprietary.
 - `GOOGLE_MAPS_API_KEY` — geocode + imagery + validation
 - `MAPBOX_API_KEY` — dense-urban imagery + fallback
 - `GEMINI_API_KEY` — Gemini verification
-- `XAI_API_KEY` — Grok verification
+- `XAI_API_KEY` — optional Grok emergency fallback
 - `ANALYZE_API_KEY` — a shared secret guarding the `/api/*` endpoints so they can't
   be called anonymously (they cost money per call)
 
@@ -216,7 +213,7 @@ report. This is the integration point if Parity ever wires it into another inter
 tool.
 
 ### The deliverable in all cases
-- **HTML report** — per-building cards, verdict-grouped, annotated images, both AIs'
+- **HTML report** — per-building cards, verdict-grouped, annotated images, AI
   reasoning, maps links. Renders in Gmail/Outlook (built email-safe).
 - **Excel spreadsheet** — sortable/filterable tabular results (address, verdict,
   confidence, each model's verdict + reasoning, detections, notes).
@@ -225,9 +222,9 @@ tool.
 
 ## 7. Cost (the money slide)
 
-- **AI verification:** ~**$0.10–$0.30 per address** (Gemini + Grok combined,
-  token-based). This is the dominant variable cost and scales linearly with list
-  size. *(1,000 addresses ≈ $100–$300 in AI spend.)*
+- **AI verification:** Gemini is the normal per-address variable expense. Grok
+  adds spend only on exceptional technical fallback calls. Measure provider
+  usage and retries before promising a fixed per-address budget.
 - **Geocoding / imagery:** small per-call (cents), largely covered by Google's
   recurring free monthly credit + Mapbox's free tier at this volume.
 - **Hosting (Render):** **$25/month** flat — Standard instance (2 GB RAM, 1 CPU),
@@ -235,16 +232,16 @@ tool.
 - **Footprints / OSM / Microsoft / NYC data:** **free.**
 - **n8n Cloud:** its own subscription if used for automation (free trial available).
 
-**Headline:** hosting is trivial ($5/mo); the real cost is per-address AI spend,
-which is predictable and proportional to how many buildings you analyze.
+**Headline:** hosting is a flat monthly expense; the main variable cost is
+per-address Gemini usage, with rare Grok fallback spend.
 
 ---
 
 ## 8. Accuracy, confidence & honest limits (the credibility slide)
 
-- **Confidence model:** the system reports a consensus confidence and, critically,
+- **Confidence model:** the system reports Gemini's confidence and, critically,
   **flags uncertainty (`needs_review`) instead of guessing.** That's the trust story.
-- **Two-model agreement** is the precision mechanism (see §3).
+- **Gemini review over recall-first CV** is the precision mechanism (see §3).
 - **Known limits (be upfront — it reads as credible):**
   - *Footprint coverage:* depends on OSM/NYC/Microsoft data; genuinely missing
     buildings are flagged, not guessed.
@@ -265,7 +262,7 @@ which is predictable and proportional to how many buildings you analyze.
 | Layer | Technology |
 |---|---|
 | Computer vision | Ultralytics YOLO — 2× custom cooling-tower models (~44 MB each) |
-| AI verification | Google Gemini + xAI Grok (dual-model consensus) |
+| AI verification | Google Gemini normally; one xAI Grok request only after a technical Gemini failure |
 | Geocoding / imagery | Google Maps + Mapbox (+ Nominatim/OSM fallback) |
 | Building footprints | OSM Overpass → NYC planimetric → Microsoft |
 | Geometry | Shapely (point-in-polygon, Web-Mercator math) |
@@ -302,10 +299,10 @@ A ~13-slide deck. Each bullet = the slide's job.
 3. **What it does (one line + the deliverable)** — addresses in → per-building
    yes/no with evidence → emailed report + Excel. Show a screenshot of a report card.
 4. **Live demo / sample output** — the actual report: 2 confirmed + 1 needs-review,
-   with the annotated images and the two AIs' reasoning.
+   with the annotated images and the AI reasoning.
 5. **How it works — the pipeline** — the 8-stage diagram (§2). One slide, visual.
-6. **Deep dive: the dual-AI verification** — the trust story: two independent models
-   must agree; disagreement → human review. (§3, the consensus bullet)
+6. **Deep dive: bounded AI verification** — Gemini normally; visual uncertainty →
+   human review; one Grok request only for a technical Gemini failure.
 7. **Why it's trustworthy** — recall-first CV + precision AI, footprint-centered,
    never-silently-wrong, fallbacks. (§3)
 8. **The automation (n8n)** — sheet → emailed report flow diagram. (§6 Path A)
@@ -315,7 +312,7 @@ A ~13-slide deck. Each bullet = the slide's job.
     cheap. (§7)
 11. **Accuracy & limits (honest)** — confidence + needs-review, known limits,
     validation status. (§8)
-12. **Tech stack** — the table; "Python + custom YOLO + two frontier AIs in Docker." (§9)
+12. **Tech stack** — the table; "Python + custom YOLO + Gemini with a bounded Grok fallback in Docker." (§9)
 13. **Status & the ask** — built + demo-proven; needs a Parity-owned host (~$5/mo) +
     a live n8n test run; clean handoff. (§10)
 
@@ -323,14 +320,15 @@ A ~13-slide deck. Each bullet = the slide's job.
 
 ## 12. Anticipated questions from Alex (prep the speaker)
 
-- **"How accurate is it?"** → Two-model agreement for precision; uncertain cases are
-  flagged for review, not guessed. Validated on NYC samples; scaling the measurement.
-- **"What does it cost to run?"** → ~$0.10–0.30 per address in AI calls + ~$5/mo
-  hosting. Predictable, scales with volume.
-- **"What happens when it's not sure?"** → It says `needs_review` and shows both
-  models' reasoning — a human decides. It does not fake confidence.
+- **"How accurate is it?"** → Uncertain cases are flagged for human review, not
+  guessed. Validated on NYC samples; scaling the measurement.
+- **"What does it cost to run?"** → Flat Render hosting plus per-address Gemini
+  usage; Grok adds cost only after exceptional technical failures. Measure a
+  representative batch before quoting a guaranteed per-address figure.
+- **"What happens when it's not sure?"** → It says `needs_review` and shows the
+  reasoning — a human decides. It does not fake confidence.
 - **"What do we depend on / what's the risk?"** → Commodity APIs (Google, Mapbox,
-  Gemini, Grok) each with fallbacks; the core detector is our own model. Main
+  Gemini, and optional Grok fallback); the core detector is our own model. Main
   dependency risk is API pricing/availability, mitigated by fallbacks.
 - **"What's left to go live?"** → Hosting is done — live on Render (Standard, 2 GB,
   $25/mo). Remaining: wire the n8n automation and run the end-to-end test.
@@ -344,7 +342,8 @@ A ~13-slide deck. Each bullet = the slide's job.
 ## 13. Key facts cheat-sheet (for accurate slides)
 
 - Detector: **custom-trained YOLO (YOLO26m)**, ensemble of 2, ~44 MB each, **ours**.
-- AI verifiers: **Google Gemini** (`gemini-3.5-flash`) + **xAI Grok** (`grok-4.3`).
+- AI review: **Google Gemini** (`gemini-3.6-flash`) normally; **xAI Grok**
+  (`grok-4.3`) only as a one-request technical fallback.
 - Geocode/imagery: **Google Maps** primary, **Mapbox** for dense urban + fallback.
 - Footprints: **OSM → NYC planimetric → Microsoft**.
 - Verdicts: confirmed / likely / **needs_review** / not_detected / no_cooling_tower /

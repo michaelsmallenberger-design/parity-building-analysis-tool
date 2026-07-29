@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Confirm workbook tabs{% endblock %}
+{% block content %}
+<main class="container" style="max-width:860px;margin:44px auto;padding:0 20px;">
+  <h1>Confirm the exceptional tabs</h1>
+  <p>
+    Parity stopped the entire workbook before analysis. Confirm each tab below;
+    the normal visible address tabs are already included and instruction tabs
+    are already recorded as ignored.
+  </p>
+  {% if error %}
+  <p style="background:#fff0f0;color:#a61b1b;padding:12px 14px;border-radius:9px;">{{ error }}</p>
+  {% endif %}
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% for tab in pending %}
+      {% set index = loop.index0 %}
+      {% set suggestion = tab.suggestion or tab.mapping or {} %}
+      <section style="background:white;border:1px solid #dce2e7;border-radius:12px;padding:18px;margin:16px 0;">
+        <h2 style="margin-top:0;">{{ tab.tab }}{% if tab.hidden %} <small>(hidden)</small>{% endif %}</h2>
+        <p style="color:#59636e;">{{ tab.reason }}</p>
+        <label><strong>How should this tab be handled?</strong></label>
+        <select name="classification_{{ index }}" style="display:block;margin:7px 0 15px;padding:8px;min-width:240px;">
+          <option value="address" {% if suggestion.classification != "ignore" %}selected{% endif %}>Include as address data</option>
+          <option value="ignore" {% if suggestion.classification == "ignore" %}selected{% endif %}>Ignore this tab</option>
+        </select>
+        <div style="display:grid;grid-template-columns:170px minmax(220px,1fr);gap:10px 14px;">
+          {% for field, label in [
+            ("address_column", "Address / street"),
+            ("city_column", "City (optional)"),
+            ("state_column", "State (optional)"),
+            ("zip_column", "ZIP (optional)")
+          ] %}
+          <label for="{{ field }}_{{ index }}">{{ label }}</label>
+          <select id="{{ field }}_{{ index }}" name="{{ field }}_{{ index }}" style="padding:8px;">
+            <option value="">—</option>
+            {% for header in tab.headers %}
+            <option value="{{ header }}" {% if suggestion[field] == header %}selected{% endif %}>{{ header }}</option>
+            {% endfor %}
+          </select>
+          {% endfor %}
+        </div>
+      </section>
+    {% endfor %}
+    <p>
+      No customer addresses are sent to Grok. After confirmation, Parity will
+      convert and verify the workbook, including every existing dropdown, before
+      any paid building analysis starts.
+    </p>
+    <button class="go" type="submit">Confirm all tabs and continue</button>
+  </form>
+</main>
+{% endblock %}
