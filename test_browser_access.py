@@ -49,6 +49,59 @@ def run():
     assert home.status_code == 200
     token = _csrf(home)
 
+    progress_page = client.get("/results/w-test?total=3")
+    progress_html = progress_page.get_data(as_text=True)
+    assert progress_page.status_code == 200
+    assert "Currently analyzing" in progress_html
+    assert "Finished addresses" in progress_html
+    assert "✓ All set" in progress_html
+    assert "Technical context for Claude Code" in progress_html
+    assert "Copy for Claude Code" in progress_html
+    assert "Towers Found" not in progress_html
+    assert "High Confidence" not in progress_html
+    assert "addr/min" not in progress_html
+
+    original_job_status = app_railway.get_job_status
+    original_result = app_railway.read_result
+    try:
+        app_railway.get_job_status = lambda _job_id: {
+            "status": "finished",
+            "progress": 1,
+            "total": 1,
+            "cancel_requested": False,
+            "message": "Ready for review",
+        }
+        app_railway.read_result = lambda _job_id: {
+            "live_rows": [
+                {
+                    "address": "1 Test St",
+                    "tab": "Washington",
+                    "source_row": 2,
+                    "state": "complete",
+                    "message": "Machine analysis finished",
+                    "error": "",
+                },
+                {
+                    "address": "2 Test St",
+                    "tab": "Virginia",
+                    "source_row": 2,
+                    "state": "attention",
+                    "message": "Imagery unavailable",
+                    "error": "Imagery unavailable",
+                },
+            ],
+            "review_url": "/review/w-test",
+            "sheet_url": "https://docs.google.com/spreadsheets/d/test/edit",
+        }
+        live_status = client.get("/status/w-test")
+        assert live_status.status_code == 200
+        assert live_status.json["total"] == 2
+        assert live_status.json["progress"] == 2
+        assert live_status.json["rows"][1]["error"] == "Imagery unavailable"
+    finally:
+        app_railway.get_job_status = original_job_status
+        app_railway.read_result = original_result
+
     original_exists = app_railway.file_exists
     original_read = app_railway.read_file
     try:

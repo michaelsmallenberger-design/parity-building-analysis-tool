@@ -1378,6 +1378,17 @@ def process_address_list(
 
     columns = df.columns
     results_by_index = {}   # i -> (web_entry, csv_row)
+    rows_by_index = {int(i): row for i, row in df.iterrows()}
+    state_by_index = {
+        index: {
+            "index": index,
+            "address": _compose_address(row, columns),
+            "state": "queued",
+            "message": "Waiting to be analyzed",
+            "error": "",
+        }
+        for index, row in rows_by_index.items()
+    }
     for raw_index, stored in (resume_results or {}).items():
         try:
             index = int(raw_index)
@@ -1392,11 +1403,61 @@ def process_address_list(
             continue
         if isinstance(web_entry, dict) and isinstance(csv_row, dict):
             results_by_index[index] = (web_entry, csv_row)
+            error = str(web_entry.get("error") or "")
+            state_by_index[index] = {
+                "index": index,
+                "address": (
+                    web_entry.get("address")
+                    or state_by_index.get(index, {}).get("address")
+                    or ""
+                ),
+                "state": "attention" if error else "complete",
+                "message": error or "Machine analysis finished",
+                "error": error,
+            }
     last_seen = {}          # i -> last (web_entry, csv_row) for transient-VLM rows
-    commit_lock = threading.Lock()
+    commit_lock = threading.RLock()
     done = len(results_by_index)
+
+    def _partial_payload_locked():
+        return {
+            "schema_version": 2,
+            "web_results": [
+                results_by_index[k][0] for k in sorted(results_by_index)
+            ],
+            "row_results": [
+                {
+                    "index": int(k),
+                    "web_entry": results_by_index[k][0],
+                    "csv_row": results_by_index[k][1],
+                }
+                for k in sorted(results_by_index)
+            ],
+            "address_states": [
+                state_by_index[k] for k in sorted(state_by_index)
+            ],
+        }
+
+    def _publish_locked():
+        if write_partial_result:
+            write_partial_result(_partial_payload_locked())
+
+    def _set_state(i, row, state, message="", error=""):
+        index = int(i)
+        with commit_lock:
+            state_by_index[index] = {
+                "index": index,
+                "address": _compose_address(row, columns),
+                "state": state,
+                "message": str(message or ""),
+                "error": str(error or ""),
+            }
+            _publish_locked()
+
     if done:
         progress_cb(done, total, f"Resumed {done} checkpointed address(es)")
+    with commit_lock:
+        _publish_locked()
 
     def _commit(i, web_entry, csv_row):
         nonlocal done
@@ -1405,23 +1466,21 @@ def process_address_list(
             if index in results_by_index:
                 return
             results_by_index[index] = (web_entry, csv_row)
+            error = str(web_entry.get("error") or "")
+            state_by_index[index] = {
+                "index": index,
+                "address": (
+                    web_entry.get("address")
+                    or state_by_index.get(index, {}).get("address")
+                    or ""
+                ),
+                "state": "attention" if error else "complete",
+                "message": error or "Machine analysis finished",
+                "error": error,
+            }
             done += 1
             progress_cb(done, total, None)
-            if write_partial_result:
-                snapshot = [results_by_index[k][0] for k in sorted(results_by_index)]
-                row_results = [
-                    {
-                        "index": int(k),
-                        "web_entry": results_by_index[k][0],
-                        "csv_row": results_by_index[k][1],
-                    }
-                    for k in sorted(results_by_index)
-                ]
-                write_partial_result({
-                    "schema_version": 2,
-                    "web_results": snapshot,
-                    "row_results": row_results,
-                })
+            _publish_locked()
             if done % 50 == 0 and total > 100:
                 import gc
                 gc.collect()
@@ -1430,10 +1489,16 @@ def process_address_list(
     def _run_round(batch):
         """Process a batch concurrently; return the rows that need retry."""
         retry = []
+
+        def _run_one(i, row):
+            _set_state(i, row, "analyzing", "Analyzing this address now")
+            return _process_one_address(
+                row, i, columns, total, job_id, upload_file, make_signed_url,
+            )
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
             futs = {
-                ex.submit(_process_one_address, row, i, columns, total,
-                          job_id, upload_file, make_signed_url): (i, row)
+                ex.submit(_run_one, i, row): (i, row)
                 for (i, row) in batch
             }
             for fut in concurrent.futures.as_completed(futs):
@@ -1445,15 +1510,25 @@ def process_address_list(
                     web_entry, csv_row = fut.result()
                 except TransientFootprintError:
                     log.warning(f"Row {i+1}/{total}: Overpass throttled (transient); queued for retry")
+                    _set_state(
+                        i, row, "retrying",
+                        "Building-footprint service was busy; retrying",
+                    )
                     retry.append((i, row))
                     continue
                 except Exception as e:
                     log.warning(f"Row {i+1}/{total}: unexpected error ({type(e).__name__}: {e}); queued for retry")
+                    detail = f"{type(e).__name__}: {e}"
+                    _set_state(i, row, "retrying", detail, detail)
                     retry.append((i, row))
                     continue
                 if _is_transient_vlm(web_entry):
                     last_seen[i] = (web_entry, csv_row)  # keep as fallback if retries don't clear it
                     log.info(f"Row {i+1}/{total}: transient VLM verdict; queued for retry")
+                    _set_state(
+                        i, row, "retrying",
+                        "Visual analysis was inconclusive; retrying",
+                    )
                     retry.append((i, row))
                     continue
                 _commit(i, web_entry, csv_row)
