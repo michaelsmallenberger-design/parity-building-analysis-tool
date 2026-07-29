@@ -50,6 +50,9 @@ def test_review_contract():
     assert HVAC_SYSTEMS == EXPECTED_HVAC
     assert FIT_OPTIONS == EXPECTED_LEGACY_FIT
     assert FIT_COLUMNS == ["Optimizer Fit", "Periscope Fit"]
+    assert DUAL_FIT_OPTIONS == [
+        "Customer", "Good", "Okay", "Bad", "Not Sure",
+    ]
 
     html = build_review_page([_entry()], job_id="t", title="Test")
 
