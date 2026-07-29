@@ -93,8 +93,8 @@ customer-facing Sheet column.
 
 Each building requires two independent product decisions:
 
-- **Optimizer Fit:** `Good`, `Bad`, or `Not Sure`
-- **Periscope Fit:** `Good`, `Bad`, or `Not Sure`
+- **Optimizer Fit:** `Customer`, `Good`, `Okay`, `Bad`, or `Not Sure`
+- **Periscope Fit:** `Customer`, `Good`, `Okay`, `Bad`, or `Not Sure`
 
 A building can be a good fit for both products, one product, or neither. The
 reviewer therefore never combines these decisions into one field.

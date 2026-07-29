@@ -1,8 +1,9 @@
 """Versioned human-review contracts shared by rendering, storage, and Sheets.
 
 New Parity workbooks use separate ``Optimizer Fit`` and ``Periscope Fit``
-columns. Each product is reviewed independently as Good, Bad, or Not Sure.
-Previously persisted single-``Fit`` batches remain readable and submittable.
+columns. Each product is reviewed independently using the source Sheet's five
+allowed values. Previously persisted single-``Fit`` batches remain readable
+and submittable.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ FIT_OPTIONS = ["Optimizer", "Periscope", "Unclear", "Bad"]
 OPT_FIT_COL = "Optimizer Fit"
 PERI_FIT_COL = "Periscope Fit"
 DUAL_FIT_COLUMNS = [OPT_FIT_COL, PERI_FIT_COL]
-DUAL_FIT_OPTIONS = ["Good", "Bad", "Not Sure"]
+DUAL_FIT_OPTIONS = ["Customer", "Good", "Okay", "Bad", "Not Sure"]
 CURRENT_REVIEW_SCHEMA = DUAL_FIT_SCHEMA
 
 
