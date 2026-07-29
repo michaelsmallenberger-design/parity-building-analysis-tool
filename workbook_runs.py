@@ -758,6 +758,12 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
             HVAC_SYSTEMS + [NONE_OPTION],
             FIT_OPTIONS,
         )
+        # File uploads are converted into a disposable working Sheet. Start
+        # each review blank even when its template contains stale selections;
+        # values-only clearing preserves every dropdown and all formatting.
+        # Live Google Sheet intake has no source_blob and stays untouched.
+        if run.get("source_blob"):
+            sheets_writer.clear_review_answers(binding)
     tab_counts = collections.Counter()
     grouped: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
     target_order = []

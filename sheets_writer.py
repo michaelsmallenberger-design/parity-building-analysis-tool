@@ -438,6 +438,46 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     return binding
 
 
+def clear_review_answers(binding, review_schema=SINGLE_FIT_SCHEMA) -> bool:
+    """Blank review answers in a converted copy without changing its controls.
+
+    The Sheets values API removes only cell values, so dropdown validation,
+    formatting, widths, and the untouched source workbook remain intact. Live
+    Google Sheet intake deliberately does not call this helper.
+    """
+    rows = [
+        int(row)
+        for row in binding.get("row_numbers", [])
+        if str(row).strip().isdigit() and int(row) >= 2
+    ]
+    if not rows:
+        return False
+    colmap = binding.get("colmap") or {}
+    review_columns = (
+        [HVAC_COL, OPT_FIT_COL, PERI_FIT_COL]
+        if review_schema == DUAL_FIT_SCHEMA
+        else [HVAC_COL, FIT_COL]
+    )
+    first_row, last_row = min(rows), max(rows)
+    ranges = [
+        _tab_range(
+            binding["tab"],
+            f"{_col_letter(colmap[column])}{first_row}:"
+            f"{_col_letter(colmap[column])}{last_row}",
+        )
+        for column in review_columns
+        if column in colmap
+    ]
+    if not ranges:
+        return False
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchClear(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"ranges": ranges},
+    ).execute()
+    return True
+
+
 def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit="",
                          note="", fit="") -> bool:
     """Write one reviewer decision into the bound team sheet. row_id is the
