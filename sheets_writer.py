@@ -24,6 +24,16 @@ import os
 import re
 import threading
 
+from review_contract import (
+    DUAL_FIT_OPTIONS,
+    DUAL_FIT_SCHEMA,
+    FIT_COL,
+    FIT_OPTIONS,
+    OPT_FIT_COL,
+    PERI_FIT_COL,
+    SINGLE_FIT_SCHEMA,
+)
+
 log = logging.getLogger("sheets")
 
 _SCOPES = [
@@ -34,7 +44,6 @@ _lock = threading.Lock()
 _services = None
 
 HVAC_COL, NOTES_COL, ID_COL = "HVAC Systems", "Notes", "Row_ID"
-OPT_FIT_COL, PERI_FIT_COL = "Optimizer Fit", "Periscope Fit"
 
 
 def enabled() -> bool:
@@ -79,13 +88,20 @@ def _col_letter(idx: int) -> str:
 # --- Run-in-place mode: analyze an EXISTING team Google Sheet and write review
 # --- decisions back into ITS rows (2026-07-13 directive: no new sheets).
 
-# The four columns we fill; anything else in the team's sheet is never touched.
-_FILL_SYNONYMS = {
+# The current columns we fill; anything else in the team's sheet is never touched.
+_SINGLE_FILL_SYNONYMS = {
+    HVAC_COL: ["hvac systems", "hvac system", "hvac"],
+    FIT_COL: ["fit", "fit type", "product fit"],
+    NOTES_COL: ["notes", "note"],
+}
+_DUAL_FILL_SYNONYMS = {
     HVAC_COL: ["hvac systems", "hvac system", "hvac"],
     OPT_FIT_COL: ["optimizer fit", "optimizer", "optimizer fit?"],
     PERI_FIT_COL: ["periscope fit", "periscope", "periscope fit?"],
     NOTES_COL: ["notes", "note"],
 }
+# Current callers and tests use the single-Fit contract by default.
+_FILL_SYNONYMS = _SINGLE_FILL_SYNONYMS
 
 
 def _norm(h) -> str:
@@ -332,19 +348,24 @@ def read_bound_sheet(sheet_url, address_variants):
 
 
 def ensure_review_columns(binding, headers, hvac_options, fit_options,
-                          review_url=""):
-    """Make sure the bound sheet has the four fill-out columns (matched by
+                          review_url="", review_schema=SINGLE_FIT_SCHEMA):
+    """Make sure the bound sheet has the review columns for its version (matched by
     name; missing ones are APPENDED after the last header so the team's layout
-    is untouched) and give them dropdowns. Stores the resulting column map
-    (fill column -> 0-based index) in the binding. Legacy 'Fit' columns are
-    ignored, not repurposed."""
+    is untouched) and give newly-created Fit columns dropdowns. Current workbooks
+    reuse their one existing ``Fit`` column; historical dual-product bindings
+    retain their separate columns."""
     sheets, _ = _get_services()
     sid, grid, tab = binding["spreadsheet_id"], binding["grid_id"], binding["tab"]
     norm_to_idx = {}
     for i, h in enumerate(headers):
         norm_to_idx.setdefault(_norm(h), i)
+    fill_synonyms = (
+        _DUAL_FILL_SYNONYMS
+        if review_schema == DUAL_FIT_SCHEMA
+        else _SINGLE_FILL_SYNONYMS
+    )
     colmap, missing = {}, []
-    for canon, syns in _FILL_SYNONYMS.items():
+    for canon, syns in fill_synonyms.items():
         idx = None
         for name in [_norm(canon)] + syns:
             if name in norm_to_idx:
@@ -396,7 +417,11 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     # the multi-select control, and its comma-joined result must not be shown
     # as invalid in the Sheet. Existing customer HVAC dropdowns remain intact.
     reqs = []
-    rules = [(OPT_FIT_COL, fit_options), (PERI_FIT_COL, fit_options)]
+    rules = (
+        [(OPT_FIT_COL, DUAL_FIT_OPTIONS), (PERI_FIT_COL, DUAL_FIT_OPTIONS)]
+        if review_schema == DUAL_FIT_SCHEMA
+        else [(FIT_COL, fit_options or FIT_OPTIONS)]
+    )
     for canon, options in rules:
         if canon not in created_columns:
             continue
@@ -406,7 +431,7 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
                       "startColumnIndex": c, "endColumnIndex": c + 1},
             "rule": {"condition": {"type": "ONE_OF_LIST",
                                    "values": [{"userEnteredValue": o} for o in options]},
-                     "strict": False, "showCustomUi": True}}})
+                     "strict": True, "showCustomUi": True}}})
     if reqs:
         sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
     binding["colmap"] = colmap
@@ -414,7 +439,7 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
 
 
 def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit="",
-                         note="") -> bool:
+                         note="", fit="") -> bool:
     """Write one reviewer decision into the bound team sheet. row_id is the
     1-based data-row position; binding['row_numbers'] maps it to the actual
     sheet row. Notes only written when non-empty."""
@@ -423,7 +448,12 @@ def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit=
     except (IndexError, ValueError, TypeError):
         return False
     colmap = binding.get("colmap") or {}
-    cells = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
+    cells = {
+        HVAC_COL: hvac,
+        FIT_COL: fit,
+        OPT_FIT_COL: optimizer_fit,
+        PERI_FIT_COL: periscope_fit,
+    }
     if note:
         cells[NOTES_COL] = note
     data = [{"range": _tab_range(binding["tab"], f"{_col_letter(colmap[k])}{row}"),
@@ -439,7 +469,7 @@ def write_decision_bound(binding, row_id, hvac, optimizer_fit="", periscope_fit=
 
 
 def write_decision_source(binding, source_row, hvac, optimizer_fit="",
-                          periscope_fit="", note="") -> bool:
+                          periscope_fit="", note="", fit="") -> bool:
     """Write a decision to an explicit physical row in one bound workbook tab."""
     try:
         row = int(source_row)
@@ -448,7 +478,12 @@ def write_decision_source(binding, source_row, hvac, optimizer_fit="",
     if row < 2:
         return False
     colmap = binding.get("colmap") or {}
-    cells = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
+    cells = {
+        HVAC_COL: hvac,
+        FIT_COL: fit,
+        OPT_FIT_COL: optimizer_fit,
+        PERI_FIT_COL: periscope_fit,
+    }
     if note:
         cells[NOTES_COL] = note
     data = [
@@ -559,8 +594,15 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
                                                   "gridProperties": {"frozenRowCount": 1}},
                                    "fields": "gridProperties.frozenRowCount"}},
     ]
-    for col_name, options in ((HVAC_COL, hvac_options), (OPT_FIT_COL, fit_options),
-                              (PERI_FIT_COL, fit_options)):
+    fit_rules = (
+        [(FIT_COL, fit_options or FIT_OPTIONS)]
+        if FIT_COL in headers
+        else [
+            (OPT_FIT_COL, DUAL_FIT_OPTIONS),
+            (PERI_FIT_COL, DUAL_FIT_OPTIONS),
+        ]
+    )
+    for col_name, options in [(HVAC_COL, hvac_options)] + fit_rules:
         if col_name in headers and n:
             if col_name == HVAC_COL:
                 continue
@@ -616,10 +658,15 @@ def write_row_values(sheet_url, headers, rows, row_id, mapping) -> bool:
 
 
 def write_decision(sheet_url, headers, rows, row_id, hvac,
-                   optimizer_fit="", periscope_fit="", note="") -> bool:
+                   optimizer_fit="", periscope_fit="", note="", fit="") -> bool:
     """Write one reviewer decision into its sheet row. Notes only written when
     non-empty so an uploaded sheet's existing note text is never wiped."""
-    mapping = {HVAC_COL: hvac, OPT_FIT_COL: optimizer_fit, PERI_FIT_COL: periscope_fit}
+    mapping = {
+        HVAC_COL: hvac,
+        FIT_COL: fit,
+        OPT_FIT_COL: optimizer_fit,
+        PERI_FIT_COL: periscope_fit,
+    }
     if note:
         mapping[NOTES_COL] = note
     return write_row_values(sheet_url, headers, rows, row_id, mapping)

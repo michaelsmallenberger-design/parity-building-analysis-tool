@@ -39,7 +39,13 @@ from job_queue import batch_size_limit, reserve_usage_limit
 from tasks_local import (_process_one_address, _build_web_entry, ADDRESS_VARIANTS,
                          _pick_excel_tab)
 from report_audit import build_audit_report
-from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS, LEGACY_FIT_VALUES
+from review_render import HVAC_SYSTEMS, NONE_OPTION, FIT_OPTIONS
+from review_contract import (
+    DUAL_FIT_OPTIONS,
+    FIT_COL,
+    SINGLE_FIT_SCHEMA,
+    entry_is_reviewed,
+)
 import review_store
 import sheets_writer
 import intake_resolver
@@ -476,12 +482,10 @@ def analyze():
 
 CANON_HVAC, CANON_NOTES, CANON_ID = "HVAC Systems", "Notes", "Row_ID"
 CANON_ADDR = "Property Address"
-# THE output sheet format (2026-07-13 directive): every batch sheet has exactly
-# these columns in this order, matching the team's TAM sheet. Upload columns are
-# mapped in by synonym; anything unrecognized is left blank — "we only care
-# about the ones we fill out" (Optimizer/Periscope Fit, HVAC Systems, Notes).
+# The output format uses the same single Fit field as the team's live workbook.
+# Upload columns are mapped by synonym; anything unrecognized is left blank.
 CANONICAL_COLUMNS = [
-    "Optimizer Fit", "Periscope Fit", CANON_HVAC, CANON_NOTES,
+    FIT_COL, CANON_HVAC, CANON_NOTES,
     "Property Name", CANON_ADDR, "City", "Market Name", "Units", "Stories",
     "Total Buildings", "Year Built", "Year Renovated", "Property Type",
     "Secondary Type", "Affordable Type", "True Owner Name",
@@ -490,8 +494,7 @@ CANONICAL_COLUMNS = [
 # Lower-cased upload-header synonyms for each canonical column. The canonical
 # name itself always matches; HVAC and the address column get special handling.
 COLUMN_SYNONYMS = {
-    "Optimizer Fit": ["optimizer", "optimizer fit?"],
-    "Periscope Fit": ["periscope", "periscope fit?"],
+    FIT_COL: ["fit type", "product fit"],
     CANON_NOTES: ["note", "comments", "comment"],
     "Property Name": ["building name", "name", "property"],
     "City": [],
@@ -522,10 +525,9 @@ def _detect_hvac_fit_columns(df):
     Optimizer/Periscope = Fit). Falls back to header-name variants for fresh uploads
     where the columns are still blank. Returns (hvac_col, fit_col); either may be None."""
     hvac_vocab = {s.lower() for s in HVAC_SYSTEMS}
-    # Legacy single-Fit vocabulary (Optimizer/Periscope/...) plus the current
-    # Good/Bad/Not Sure — so a filled fit column in ANY vintage of re-uploaded
-    # sheet is recognized and never mistaken for the HVAC column.
-    fit_vocab = {s.lower() for s in LEGACY_FIT_VALUES + FIT_OPTIONS}
+    # Recognize both current single-Fit and historical dual-product values so a
+    # filled classification column is never mistaken for HVAC.
+    fit_vocab = {s.lower() for s in FIT_OPTIONS + DUAL_FIT_OPTIONS}
 
     def content_score(col, vocab):
         vals = [str(v) for v in df[col].dropna().tolist() if str(v).strip()]
@@ -582,24 +584,40 @@ def _lean_table(results):
 
 
 def _table_from_df(df):
-    """Map ANY upload into THE canonical sheet format: exactly CANONICAL_COLUMNS
-    in order (+ hidden Row_ID), regardless of what was uploaded. Recognized
-    upload columns (by synonym, or by content for HVAC) carry their values
-    over; unrecognized ones are dropped; missing ones come out blank. A legacy
-    single-Fit column (Optimizer/Periscope values) is detected only so it is
-    never mistaken for HVAC — its values are not carried."""
+    """Map uploads into the canonical single-Fit sheet format.
+
+    Recognized current Fit values carry forward. Historical Good/Bad/Not Sure
+    product columns are detected so they are not mistaken for HVAC, but they
+    are not guessed into the mutually-exclusive current Fit field.
+    """
     hvac_col, fit_col = _detect_hvac_fit_columns(df)
+    single_fit_col = None
+    if fit_col is not None:
+        single_fit_values = {option.casefold() for option in FIT_OPTIONS}
+        fit_values = [
+            part.strip()
+            for value in df[fit_col].dropna().tolist()
+            for part in re.split(r"[,/;]", str(value))
+            if part.strip()
+        ]
+        if (
+            _norm_header(fit_col) in {_norm_header(name) for name in FIT_COL_NAMES}
+            or (
+                fit_values
+                and all(value.casefold() in single_fit_values for value in fit_values)
+            )
+        ):
+            single_fit_col = fit_col
     norm_cols = {}
     for c in df.columns:
         norm_cols.setdefault(_norm_header(c), c)
 
-    # fit_col is NOT excluded here: a column actually named "Optimizer Fit" /
-    # "Periscope" maps by name below; only a fit-content column with no
-    # recognizable name (legacy "Fit", "HVAC Systems.1") drops out naturally.
-    used = {hvac_col} if hvac_col is not None else set()
+    used = {column for column in (hvac_col, fit_col) if column is not None}
     mapping = {}
     if hvac_col is not None:
         mapping[CANON_HVAC] = hvac_col
+    if single_fit_col is not None:
+        mapping[FIT_COL] = single_fit_col
     addr_norms = [v.lower() for v in ADDRESS_VARIANTS]
     for canon in CANONICAL_COLUMNS:
         if canon in mapping:
@@ -670,6 +688,7 @@ def _finalize_batch(
                     sheets_writer.ensure_review_columns(
                         multi_binding, multi_binding.get("headers", []),
                         HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                        review_schema=SINGLE_FIT_SCHEMA,
                     )
                 multi_binding.pop("writeback_error", None)
             except Exception as e:
@@ -689,7 +708,8 @@ def _finalize_batch(
         try:
             sheets_writer.ensure_review_columns(
                 binding, binding.get("headers", []), HVAC_SYSTEMS + [NONE_OPTION],
-                FIT_OPTIONS, review_url=review_url if base else "")
+                FIT_OPTIONS, review_url=review_url if base else "",
+                review_schema=SINGLE_FIT_SCHEMA)
             sheet_url = binding["sheet_url"]
         except Exception as e:
             log.error("Bound-sheet setup failed for %s: %s", batch_id, e, exc_info=True)
@@ -707,7 +727,8 @@ def _finalize_batch(
                             sheet_bindings=sheet_bindings,
                             tab_inventory=tab_inventory,
                             schema_version=2 if sheet_bindings else 1,
-                            run_id=run_id)
+                            run_id=run_id,
+                            review_schema=SINGLE_FIT_SCHEMA)
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url
@@ -1188,16 +1209,14 @@ def batch_rerun(batch_id):
     remaining = len(_entry_failures(b))
     if b.get("run_id"):
         try:
-            def complete_human(entry):
-                human = entry.get("human") or {}
-                return all(str(human.get(key) or "").strip() for key in (
-                    "hvac_systems", "optimizer_fit", "periscope_fit",
-                ))
-
             entries = b.get("entries", [])
+            review_schema = b.get("review_schema", SINGLE_FIT_SCHEMA)
             workbook_runs.update_review_progress(
                 b["run_id"],
-                sum(1 for entry in entries if complete_human(entry)),
+                sum(
+                    1 for entry in entries
+                    if entry_is_reviewed(entry, review_schema)
+                ),
                 len(entries),
                 writeback_failures=sum(
                     1 for entry in entries
@@ -1205,7 +1224,10 @@ def batch_rerun(batch_id):
                 ),
                 needs_attention=sum(
                     1 for entry in entries
-                    if _entry_is_failure(entry) and not complete_human(entry)
+                    if (
+                        _entry_is_failure(entry)
+                        and not entry_is_reviewed(entry, review_schema)
+                    )
                 ),
             )
         except Exception:

@@ -28,6 +28,13 @@ from tasks_local import ADDRESS_VARIANTS
 from review_render import (
     FIT_OPTIONS, HVAC_SYSTEMS, NONE_OPTION, build_review_page,
 )
+from review_contract import (
+    DUAL_FIT_OPTIONS,
+    DUAL_FIT_SCHEMA,
+    FIT_COL,
+    SINGLE_FIT_SCHEMA,
+    entry_is_reviewed,
+)
 import review_store
 import sheets_writer
 import intake_resolver
@@ -930,6 +937,7 @@ def review_page(job_id):
         webhook_url="/api/review",  # same-origin relay -> no browser CORS
         title=batch.get("title", "Cooling Tower Review"),
         csrf_token=_csrf_token(),
+        review_schema=batch.get("review_schema", SINGLE_FIT_SCHEMA),
     )
     return Response(html, mimetype="text/html")
 
@@ -956,6 +964,7 @@ def api_review():
         for item in existing_batch.get("entries", [])
     ):
         return jsonify({"error": "unknown batch/row"}), 404
+    review_schema = existing_batch.get("review_schema", SINGLE_FIT_SCHEMA)
     hvac_value = str(payload.get("hvac_systems") or "").strip()
     if not hvac_value:
         return jsonify({"error": "choose at least one HVAC system or None"}), 400
@@ -966,19 +975,28 @@ def api_review():
         or (NONE_OPTION in systems and len(systems) > 1)
     ):
         return jsonify({"error": "invalid HVAC selection"}), 400
-    if payload.get("optimizer_fit") not in FIT_OPTIONS:
-        return jsonify({"error": "Optimizer Fit is required"}), 400
-    if payload.get("periscope_fit") not in FIT_OPTIONS:
-        return jsonify({"error": "Periscope Fit is required"}), 400
+    if review_schema == DUAL_FIT_SCHEMA:
+        if payload.get("optimizer_fit") not in DUAL_FIT_OPTIONS:
+            return jsonify({"error": "Optimizer Fit is required"}), 400
+        if payload.get("periscope_fit") not in DUAL_FIT_OPTIONS:
+            return jsonify({"error": "Periscope Fit is required"}), 400
+    elif payload.get("fit") not in FIT_OPTIONS:
+        return jsonify({"error": "Fit is required"}), 400
     if len(str(payload.get("note") or "")) > 2000:
         return jsonify({"error": "note is too long"}), 400
 
-    batch = review_store.record_decision(job_id, row_id, {
+    decision = {
         "hvac_systems": payload.get("hvac_systems", ""),
-        "optimizer_fit": payload.get("optimizer_fit", ""),
-        "periscope_fit": payload.get("periscope_fit", ""),
         "note": payload.get("note", ""),
-    })
+    }
+    if review_schema == DUAL_FIT_SCHEMA:
+        decision.update({
+            "optimizer_fit": payload.get("optimizer_fit", ""),
+            "periscope_fit": payload.get("periscope_fit", ""),
+        })
+    else:
+        decision["fit"] = payload.get("fit", "")
+    batch = review_store.record_decision(job_id, row_id, decision)
     if not batch:
         return jsonify({"error": "unknown batch/row"}), 404
 
@@ -1016,10 +1034,15 @@ def api_review():
             sheet_error = "Source tab binding was not found"
         elif sheet != "error":
             try:
-                if not binding.get("colmap"):
+                needs_columns = not binding.get("colmap")
+                if review_schema == SINGLE_FIT_SCHEMA:
+                    needs_columns = needs_columns or FIT_COL not in binding.get("colmap", {})
+                if needs_columns:
                     sheets_writer.ensure_review_columns(
                         binding, binding.get("headers", []),
-                        HVAC_SYSTEMS + [NONE_OPTION], FIT_OPTIONS,
+                        HVAC_SYSTEMS + [NONE_OPTION],
+                        FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                        review_schema=review_schema,
                     )
                 ok = sheets_writer.write_decision_source(
                     binding, entry.get("source_row"),
@@ -1027,6 +1050,7 @@ def api_review():
                     optimizer_fit=payload.get("optimizer_fit", ""),
                     periscope_fit=payload.get("periscope_fit", ""),
                     note=payload.get("note", ""),
+                    fit=payload.get("fit", ""),
                 )
                 sheet = "updated" if ok else "row_not_found"
                 if not ok:
@@ -1041,12 +1065,28 @@ def api_review():
     elif batch.get("sheet_binding") and sheets_writer.enabled():
         # Run-in-place batch: write straight into the team's own sheet row.
         try:
+            binding = batch["sheet_binding"]
+            if (
+                not binding.get("colmap")
+                or (
+                    review_schema == SINGLE_FIT_SCHEMA
+                    and FIT_COL not in binding.get("colmap", {})
+                )
+            ):
+                sheets_writer.ensure_review_columns(
+                    binding,
+                    binding.get("headers", []),
+                    HVAC_SYSTEMS + [NONE_OPTION],
+                    FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                    review_schema=review_schema,
+                )
             ok = sheets_writer.write_decision_bound(
-                batch["sheet_binding"], row_id,
+                binding, row_id,
                 hvac=payload.get("hvac_systems", ""),
                 optimizer_fit=payload.get("optimizer_fit", ""),
                 periscope_fit=payload.get("periscope_fit", ""),
-                note=payload.get("note", ""))
+                note=payload.get("note", ""),
+                fit=payload.get("fit", ""))
             sheet = "updated" if ok else "row_not_found"
         except Exception as e:
             log.error(f"Bound sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)
@@ -1060,7 +1100,8 @@ def api_review():
                 hvac=payload.get("hvac_systems", ""),
                 optimizer_fit=payload.get("optimizer_fit", ""),
                 periscope_fit=payload.get("periscope_fit", ""),
-                note=payload.get("note", ""))
+                note=payload.get("note", ""),
+                fit=payload.get("fit", ""))
             sheet = "updated" if ok else "row_not_found"
         except Exception as e:
             log.error(f"Sheet write failed for {job_id}/{row_id}: {e}", exc_info=True)
@@ -1080,22 +1121,18 @@ def api_review():
     run_id = batch.get("run_id")
     if run_id:
         try:
-            import workbook_runs
             entries = batch.get("entries", [])
-
-            def complete_human(entry):
-                human = entry.get("human") or {}
-                return all(str(human.get(key) or "").strip() for key in (
-                    "hvac_systems", "optimizer_fit", "periscope_fit",
-                ))
-
-            reviewed = sum(1 for entry in entries if complete_human(entry))
+            reviewed = sum(
+                1 for entry in entries
+                if entry_is_reviewed(entry, review_schema)
+            )
             writeback_failures = sum(
                 1 for entry in entries
                 if (entry.get("writeback") or {}).get("status") == "error"
             )
             unresolved_attention = sum(
-                1 for entry in entries if entry.get("error") and not complete_human(entry)
+                1 for entry in entries
+                if entry.get("error") and not entry_is_reviewed(entry, review_schema)
             )
             workbook_runs.update_review_progress(
                 run_id, reviewed, len(entries),

@@ -739,7 +739,8 @@ def test_grouped_review_and_exact_tab_writeback():
     html = review_render.build_review_page(entries, "w-test")
     assert "<h2>Washington</h2>" in html and "<h2>Virginia</h2>" in html
     assert 'data-rid="g10:r2"' in html and 'data-rid="g20:r2"' in html
-    assert "choose both Optimizer Fit and Periscope Fit" in html
+    assert "choose one Fit: Optimizer, Periscope, Unclear, or Bad" in html
+    assert "Optimizer Fit:" not in html and "Periscope Fit:" not in html
 
     class FakeSheets:
         def __init__(self):
@@ -764,10 +765,10 @@ def test_grouped_review_and_exact_tab_writeback():
                 {
                     "spreadsheet_id": "sheet", "grid_id": grid, "tab": tab,
                     "colmap": {
-                        "HVAC Systems": 2, "Optimizer Fit": 3, "Periscope Fit": 4,
+                        "HVAC Systems": 2, "Fit": 3,
                     },
                 },
-                2, "None", "Bad", "Good",
+                2, "None", fit="Bad",
             )
         ranges = [
             item["range"]
@@ -776,6 +777,8 @@ def test_grouped_review_and_exact_tab_writeback():
         ]
         assert any("'Washington'!C2" == value for value in ranges)
         assert any("'Virginia'!C2" == value for value in ranges)
+        assert any("'Washington'!D2" == value for value in ranges)
+        assert any("'Virginia'!D2" == value for value in ranges)
         assert sheets_writer.write_source_values(
             {
                 "spreadsheet_id": "sheet", "grid_id": 20, "tab": "Virginia",
@@ -789,6 +792,82 @@ def test_grouped_review_and_exact_tab_writeback():
             for update in fake.updates
             for item in update["body"]["data"]
         )
+    finally:
+        sheets_writer._get_services = original
+
+
+def test_single_fit_column_is_reused_or_appended_once():
+    class FakeSheets:
+        def __init__(self):
+            self.value_updates = []
+            self.grid_updates = []
+
+        def spreadsheets(self):
+            return self
+
+        def values(self):
+            return self
+
+        def update(self, **kwargs):
+            self.value_updates.append(kwargs)
+            return FakeRequest({})
+
+        def batchUpdate(self, **kwargs):
+            self.grid_updates.append(kwargs)
+            return FakeRequest({})
+
+    original = sheets_writer._get_services
+    try:
+        existing = FakeSheets()
+        sheets_writer._get_services = lambda: (existing, None)
+        binding = {
+            "spreadsheet_id": "sheet",
+            "grid_id": 10,
+            "tab": "Washington",
+            "row_numbers": [2, 3],
+        }
+        sheets_writer.ensure_review_columns(
+            binding,
+            ["Property Address", "HVAC Systems", "Fit", "Notes"],
+            review_render.HVAC_SYSTEMS + [review_render.NONE_OPTION],
+            review_render.FIT_OPTIONS,
+        )
+        assert binding["colmap"] == {
+            "HVAC Systems": 1,
+            "Fit": 2,
+            "Notes": 3,
+        }
+        assert existing.value_updates == []
+        assert existing.grid_updates == []
+
+        missing = FakeSheets()
+        sheets_writer._get_services = lambda: (missing, None)
+        binding = {
+            "spreadsheet_id": "sheet",
+            "grid_id": 20,
+            "tab": "Virginia",
+            "row_numbers": [2, 3],
+        }
+        sheets_writer.ensure_review_columns(
+            binding,
+            ["Property Address", "HVAC Systems", "Notes"],
+            review_render.HVAC_SYSTEMS + [review_render.NONE_OPTION],
+            review_render.FIT_OPTIONS,
+        )
+        assert missing.value_updates[0]["body"]["values"] == [["Fit"]]
+        validation_requests = [
+            request["setDataValidation"]
+            for update in missing.grid_updates
+            for request in update["body"]["requests"]
+            if "setDataValidation" in request
+        ]
+        assert len(validation_requests) == 1
+        options = [
+            item["userEnteredValue"]
+            for item in validation_requests[0]["rule"]["condition"]["values"]
+        ]
+        assert options == ["Optimizer", "Periscope", "Unclear", "Bad"]
+        assert validation_requests[0]["rule"]["strict"] is True
     finally:
         sheets_writer._get_services = original
 
@@ -985,6 +1064,7 @@ if __name__ == "__main__":
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()
     test_grouped_review_and_exact_tab_writeback()
+    test_single_fit_column_is_reused_or_appended_once()
     test_versioned_async_api_contract()
     test_costless_approval_ui_is_enabled()
     test_n8n_async_workflow_contract()
