@@ -1,0 +1,25 @@
+FROM node:24-alpine AS dashboard-builder
+
+WORKDIR /app/market_dashboard/frontend
+COPY market_dashboard/frontend/package.json market_dashboard/frontend/package-lock.json ./
+RUN npm ci
+COPY market_dashboard/frontend/ ./
+RUN npm run build
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements_dashboard.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY market_dashboard/__init__.py market_dashboard/app.py market_dashboard/routes.py market_dashboard/store.py market_dashboard/
+COPY market_dashboard/templates/ market_dashboard/templates/
+COPY --from=dashboard-builder /app/market_dashboard/dist/ market_dashboard/dist/
+
+RUN mkdir -p /var/data/market_dashboard
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 8 --timeout 60 market_dashboard.app:app

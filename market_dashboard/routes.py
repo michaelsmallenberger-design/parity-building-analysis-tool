@@ -102,7 +102,7 @@ def dashboard_data():
     if record is None:
         return jsonify(
             {
-                "status": "using_embedded_default",
+                "status": "not_published",
                 "version": None,
                 "data": None,
             }
@@ -129,8 +129,8 @@ def dashboard_versions():
 
 @dashboard.post("/market-runway/rollback/<version_id>")
 def dashboard_rollback(version_id: str):
-    # The parent Flask app's browser gate applies the shared session and CSRF
-    # checks before this route is reached.
+    # The standalone dashboard app applies session and CSRF checks before this
+    # route is reached.
     try:
         record = _store().rollback(version_id)
     except (FileNotFoundError, ValueError):

@@ -10,7 +10,7 @@ does not share the Sheet with Render and does not use a service account.
    `appsscript.json`.
 5. Save, reload the Sheet, and use **Dashboard → Set up dashboard tabs**.
 6. Use **Dashboard → Configure secure publishing** once. The URL defaults to
-   `https://building-analyzer.onrender.com/api/market-dashboard/publish`.
+   `https://parity-market-dashboard.onrender.com/api/market-dashboard/publish`.
    Paste the same secret stored in Render as
    `MARKET_DASHBOARD_PUBLISH_SECRET`.
 7. Edit the normalized dashboard tabs and choose

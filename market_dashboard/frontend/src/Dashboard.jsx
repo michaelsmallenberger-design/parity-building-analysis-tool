@@ -31,81 +31,6 @@ const fmtShort = (n) => {
   return `${n}`;
 };
 
-const DEFAULT_SUMMARY = {
-  total_properties: 5646,
-  optimizer_good_fits: 799,
-  periscope_good_fits: 1951,
-  current_customers: 102,
-  tam_properties: 5646,
-  sam_properties: 1449,
-  tam_revenue: 931590000,
-  sam_revenue: 169287500,
-  current_revenue: 16830000,
-  // Install vs ARR breakdown
-  opt_install: 115000,
-  opt_arr_annual: 10000,
-  opt_contract: 165000,
-  per_install: 32500,
-  per_arr_annual: 3500,
-  per_contract: 50000,
-  sync_arr_annual: 7500,
-  sync_contract: 37500,
-  sam_install: 99480000,
-  sam_arr_annual: 13961500,
-  // Region stats
-  region_properties: 3175,
-  region_opt_fits: 635,
-  region_per_fits: 814,
-};
-
-const DEFAULT_METRO_DATA = [
-  { metro: "New York", opt: 459, per: 68, cust: 72, optRev: 75735000, perRev: 3400000, syncRev: 17212500, totalRev: 96347500 },
-  { metro: "DMV", opt: 62, per: 180, cust: 3, optRev: 10230000, perRev: 9000000, syncRev: 2325000, totalRev: 21555000 },
-  { metro: "Los Angeles", opt: 25, per: 150, cust: 0, optRev: 4125000, perRev: 7500000, syncRev: 937500, totalRev: 12562500 },
-  { metro: "Seattle Area", opt: 30, per: 90, cust: 1, optRev: 4950000, perRev: 4500000, syncRev: 1125000, totalRev: 10575000 },
-  { metro: "Boston Area", opt: 33, per: 83, cust: 10, optRev: 5445000, perRev: 4150000, syncRev: 1237500, totalRev: 10832500 },
-  { metro: "Houston", opt: 8, per: 97, cust: 0, optRev: 1320000, perRev: 4850000, syncRev: 300000, totalRev: 6470000 },
-  { metro: "DFW", opt: 8, per: 80, cust: 0, optRev: 1320000, perRev: 4000000, syncRev: 300000, totalRev: 5620000 },
-  { metro: "San Francisco", opt: 10, per: 77, cust: 0, optRev: 1650000, perRev: 3850000, syncRev: 375000, totalRev: 5875000 },
-  { metro: "Denver", opt: 8, per: 84, cust: 0, optRev: 1320000, perRev: 4200000, syncRev: 300000, totalRev: 5820000 },
-  { metro: "Atlanta", opt: 6, per: 84, cust: 0, optRev: 990000, perRev: 4200000, syncRev: 225000, totalRev: 5415000 },
-  { metro: "Charlotte", opt: 2, per: 78, cust: 0, optRev: 330000, perRev: 3900000, syncRev: 75000, totalRev: 4305000 },
-  { metro: "Chicago", opt: 45, per: 22, cust: 0, optRev: 7425000, perRev: 1100000, syncRev: 1687500, totalRev: 10212500 },
-  { metro: "Austin", opt: 10, per: 64, cust: 0, optRev: 1650000, perRev: 3200000, syncRev: 375000, totalRev: 5225000 },
-  { metro: "Philadelphia", opt: 17, per: 43, cust: 0, optRev: 2805000, perRev: 2150000, syncRev: 637500, totalRev: 5592500 },
-  { metro: "Miami/Ft. Laud.", opt: 16, per: 43, cust: 0, optRev: 2640000, perRev: 2150000, syncRev: 600000, totalRev: 5390000 },
-];
-
-const DEFAULT_COMPANY_DATA = [
-  { company: "Greystar PM", total: 2279, opt: 208, per: 1399, cust: 4, optRev: 34320000, perRev: 69950000, totalRev: 104270000, penetration: 1.9 },
-  { company: "FirstService", total: 312, opt: 137, per: 0, cust: 18, optRev: 22605000, perRev: 0, totalRev: 22605000, penetration: 13.1 },
-  { company: "Brookfield", total: 345, opt: 68, per: 97, cust: 6, optRev: 11220000, perRev: 4850000, totalRev: 16070000, penetration: 8.8 },
-  { company: "AKAM", total: 629, opt: 88, per: 0, cust: 7, optRev: 14520000, perRev: 0, totalRev: 14520000, penetration: 8.0 },
-  { company: "Douglas Elliman", total: 289, opt: 79, per: 0, cust: 10, optRev: 13035000, perRev: 0, totalRev: 13035000, penetration: 12.7 },
-  { company: "Greystar Owned", total: 453, opt: 25, per: 152, cust: 1, optRev: 4125000, perRev: 7600000, totalRev: 11725000, penetration: 4.0 },
-  { company: "Halstead", total: 195, opt: 70, per: 0, cust: 18, optRev: 11550000, perRev: 0, totalRev: 11550000, penetration: 25.7 },
-  { company: "AvalonBay", total: 301, opt: 27, per: 99, cust: 16, optRev: 4455000, perRev: 4950000, totalRev: 9405000, penetration: 59.3 },
-  { company: "UDR", total: 183, opt: 27, per: 63, cust: 10, optRev: 4455000, perRev: 3150000, totalRev: 7605000, penetration: 37.0 },
-  { company: "GID", total: 170, opt: 20, per: 76, cust: 10, optRev: 3300000, perRev: 3800000, totalRev: 7100000, penetration: 50.0 },
-  { company: "Blackstone", total: 169, opt: 25, per: 33, cust: 1, optRev: 4125000, perRev: 1650000, totalRev: 5775000, penetration: 4.0 },
-  { company: "FPA", total: 321, opt: 23, per: 34, cust: 1, optRev: 3795000, perRev: 1700000, totalRev: 5495000, penetration: 4.3 },
-];
-
-const DEFAULT_COMPANY_REGION_DATA = [
-  { company: "Greystar PM", total: 874, opt: 116, per: 533, cust: 4, penetration: 3.4, optRev: 19140000, perRev: 26650000, syncRev: 4350000, totalRev: 50140000 },
-  { company: "FirstService", total: 312, opt: 137, per: 0, cust: 18, penetration: 13.1, optRev: 22605000, perRev: 0, syncRev: 5137500, totalRev: 27742500 },
-  { company: "AKAM", total: 629, opt: 88, per: 0, cust: 7, penetration: 8.0, optRev: 14520000, perRev: 0, syncRev: 3300000, totalRev: 17820000 },
-  { company: "Douglas Elliman", total: 289, opt: 79, per: 0, cust: 10, penetration: 12.7, optRev: 13035000, perRev: 0, syncRev: 2962500, totalRev: 15997500 },
-  { company: "Halstead", total: 195, opt: 70, per: 0, cust: 18, penetration: 25.7, optRev: 11550000, perRev: 0, syncRev: 2625000, totalRev: 14175000 },
-  { company: "Brookfield", total: 149, opt: 47, per: 44, cust: 6, penetration: 12.8, optRev: 7755000, perRev: 2200000, syncRev: 1762500, totalRev: 11717500 },
-  { company: "AvalonBay", total: 245, opt: 27, per: 85, cust: 16, penetration: 59.3, optRev: 4455000, perRev: 4250000, syncRev: 1012500, totalRev: 9717500 },
-  { company: "UDR", total: 118, opt: 27, per: 43, cust: 10, penetration: 37.0, optRev: 4455000, perRev: 2150000, syncRev: 1012500, totalRev: 7617500 },
-  { company: "Greystar Owned", total: 131, opt: 10, per: 56, cust: 1, penetration: 10.0, optRev: 1650000, perRev: 2800000, syncRev: 375000, totalRev: 4825000 },
-  { company: "GID", total: 68, opt: 14, per: 30, cust: 10, penetration: 71.4, optRev: 2310000, perRev: 1500000, syncRev: 525000, totalRev: 4335000 },
-  { company: "Blackstone", total: 60, opt: 11, per: 12, cust: 1, penetration: 9.1, optRev: 1815000, perRev: 600000, syncRev: 412500, totalRev: 2827500 },
-  { company: "FPA", total: 105, opt: 9, per: 11, cust: 1, penetration: 11.1, optRev: 1485000, perRev: 550000, syncRev: 337500, totalRev: 2372500 },
-];
-
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
@@ -144,6 +69,34 @@ const SectionTitle = ({ title, subtitle }) => (
 
 const tabs = ["Overview", "Revenue", "By Metro", "By Company"];
 
+const NoPublishedData = ({ message }) => (
+  <div style={{
+    minHeight: "100vh",
+    display: "grid",
+    placeItems: "center",
+    padding: 24,
+    background: COLORS.bg,
+    fontFamily: "'DM Sans', sans-serif",
+  }}>
+    <div style={{
+      width: "min(100%, 560px)",
+      padding: 36,
+      border: `1px solid ${COLORS.border}`,
+      borderRadius: 14,
+      background: COLORS.card,
+      textAlign: "center",
+    }}>
+      <div style={{ color: COLORS.accent, fontSize: 12, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+        Parity
+      </div>
+      <h1 style={{ margin: "12px 0 10px", color: COLORS.text, fontFamily: "'Playfair Display', serif" }}>
+        Market Runway Dashboard
+      </h1>
+      <p style={{ margin: 0, color: COLORS.muted, lineHeight: 1.6 }}>{message}</p>
+    </div>
+  </div>
+);
+
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState("Overview");
   const [somPercent, setSomPercent] = useState(50);
@@ -170,33 +123,26 @@ export default function Dashboard() {
           setSomPercent(payload.data.assumptions?.som_percent ?? 50);
           setDataStatus("Published from Google Sheets");
         } else {
-          setDataStatus("Embedded starting version · publish from Google Sheets to update");
+          setDataStatus("No dashboard data has been published from Google Sheets yet.");
         }
       })
       .catch((error) => {
         if (error.name !== "AbortError") {
-          setDataStatus("Embedded starting version · published data is temporarily unavailable");
+          setDataStatus("Published dashboard data is temporarily unavailable. Please try again.");
         }
       });
     return () => controller.abort();
   }, []);
 
-  const summary = publishedSnapshot?.summary || DEFAULT_SUMMARY;
-  const assumptions = publishedSnapshot?.assumptions || {
-    som_percent: 50,
-    cad_rate: 1.37,
-    opt_install: DEFAULT_SUMMARY.opt_install,
-    opt_arr_annual: DEFAULT_SUMMARY.opt_arr_annual,
-    opt_contract: DEFAULT_SUMMARY.opt_contract,
-    per_install: DEFAULT_SUMMARY.per_install,
-    per_arr_annual: DEFAULT_SUMMARY.per_arr_annual,
-    per_contract: DEFAULT_SUMMARY.per_contract,
-    sync_arr_annual: DEFAULT_SUMMARY.sync_arr_annual,
-    sync_contract: DEFAULT_SUMMARY.sync_contract,
-  };
-  const metroData = publishedSnapshot?.metros || DEFAULT_METRO_DATA;
-  const companyData = publishedSnapshot?.companies || DEFAULT_COMPANY_DATA;
-  const companyRegionData = publishedSnapshot?.company_regions || DEFAULT_COMPANY_REGION_DATA;
+  if (!publishedSnapshot) {
+    return <NoPublishedData message={dataStatus} />;
+  }
+
+  const summary = publishedSnapshot.summary;
+  const assumptions = publishedSnapshot.assumptions;
+  const metroData = publishedSnapshot.metros;
+  const companyData = publishedSnapshot.companies;
+  const companyRegionData = publishedSnapshot.company_regions;
 
   const CAD_RATE = assumptions.cad_rate;
   const conv = (v) => currency === "CAD" ? v * CAD_RATE : v;

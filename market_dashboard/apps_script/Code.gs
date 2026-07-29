@@ -7,7 +7,7 @@
 
 const PARITY_DASHBOARD_SCHEMA_VERSION = 1;
 const PARITY_DEFAULT_PUBLISH_URL =
-  "https://building-analyzer.onrender.com/api/market-dashboard/publish";
+  "https://parity-market-dashboard.onrender.com/api/market-dashboard/publish";
 
 const PARITY_TABS = Object.freeze({
   control: "Dashboard Control",

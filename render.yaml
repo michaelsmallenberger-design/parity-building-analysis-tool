@@ -15,10 +15,6 @@ services:
     envVars:
       - key: STORAGE_DIR
         value: /var/data/storage
-      - key: MARKET_DASHBOARD_STORAGE_DIR
-        value: /var/data/storage/market_dashboard
-      - key: MARKET_DASHBOARD_PUBLISH_SECRET
-        sync: false
       - key: JOBS_DB_PATH
         value: /var/data/storage/jobs.db
       - key: GOOGLE_MAPS_API_KEY
@@ -91,3 +87,30 @@ services:
         value: "0.18"
       - key: APP_URL
         value: https://building-analyzer.onrender.com
+
+  - type: web
+    name: parity-market-dashboard
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.market-dashboard
+    dockerContext: .
+    healthCheckPath: /api/market-dashboard/health
+    autoDeploy: true
+    numInstances: 1
+    disk:
+      name: market-dashboard-storage
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: MARKET_DASHBOARD_STORAGE_DIR
+        value: /var/data/market_dashboard
+      - key: MARKET_DASHBOARD_PUBLISH_SECRET
+        sync: false
+      - key: DASHBOARD_ACCESS_PASSWORD
+        sync: false
+      - key: DASHBOARD_SESSION_SECRET
+        generateValue: true
+      - key: DASHBOARD_COOKIE_SECURE
+        value: "true"
+      - key: DASHBOARD_SESSION_HOURS
+        value: "12"

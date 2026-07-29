@@ -24,7 +24,6 @@ from storage_helpers import init_storage, upload_file, get_file_path, read_resul
 from worker import start_worker
 from api_analyze import (api as api_blueprint, _read_csv_with_fallback,
                          _read_excel_with_worker_tab_selection, _read_excel_tabs)
-from market_dashboard.routes import dashboard as market_dashboard_blueprint
 from tasks_local import ADDRESS_VARIANTS
 from review_render import (
     FIT_OPTIONS, HVAC_SYSTEMS, NONE_OPTION, build_review_page,
@@ -46,7 +45,6 @@ import requests
 # Initialize Flask app
 app = Flask(__name__)
 app.register_blueprint(api_blueprint)
-app.register_blueprint(market_dashboard_blueprint)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
