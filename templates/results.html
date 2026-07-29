@@ -1,653 +1,426 @@
 {% extends "base.html" %}
 
-{% block title %}Processing Results{% endblock %}
+{% block title %}Analyzing Addresses{% endblock %}
 
 {% block styles %}
 <style>
-    .header { text-align: center; margin-bottom: 2rem; }
-    #status-container { display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: bold; margin-bottom: 1.5rem; }
-    .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
-    /* Dashboard Progress Tracker */
-    .progress-dashboard {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border-radius: 12px;
-        padding: 2rem;
-        margin: 2rem auto;
-        max-width: 600px;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+    :root {
+        color-scheme: dark;
+        --bg: #0d0f12;
+        --panel: #161a20;
+        --border: #282e37;
+        --text: #eef0f3;
+        --muted: #929ba6;
+        --green: #37b24d;
+        --red: #ff6b6b;
+        --blue: #4d9fff;
     }
-    .progress-dashboard.complete {
-        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    .progress-title {
-        font-size: 1.1rem;
-        margin-bottom: 1rem;
-        text-align: center;
-        font-weight: 600;
+    .page { max-width: 820px; margin: 0 auto; padding: 42px 18px 80px; }
+    .topline {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 42px;
     }
-    .progress-bar-container {
-        background-color: rgba(255, 255, 255, 0.3);
-        border-radius: 10px;
-        height: 30px;
-        margin: 1rem 0;
+    .brand {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 750;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+    }
+    .quiet-link { color: var(--muted); text-decoration: none; font-size: 13px; }
+    .quiet-link:hover { color: var(--text); }
+    .counter {
+        margin: 0;
+        font-size: clamp(54px, 10vw, 88px);
+        line-height: .95;
+        letter-spacing: -.055em;
+        font-weight: 780;
+    }
+    .counter .denominator { color: #59616c; }
+    .run-label { color: var(--muted); margin: 13px 0 34px; font-size: 17px; }
+    .current {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 18px;
+        margin-bottom: 18px;
+    }
+    .section-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+    }
+    .current-address {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        padding: 10px 0;
+        border-top: 1px solid var(--border);
+        font-weight: 650;
+        overflow-wrap: anywhere;
+    }
+    .current-address:first-of-type { border-top: 0; padding-top: 0; }
+    .current-address:last-child { padding-bottom: 0; }
+    .pulse {
+        width: 9px;
+        height: 9px;
+        flex: 0 0 9px;
+        border-radius: 50%;
+        background: var(--blue);
+        animation: pulse 1.2s infinite;
+    }
+    .empty { color: var(--muted); }
+    .finished {
         overflow: hidden;
-        position: relative;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
     }
-    .progress-bar-fill {
-        background: linear-gradient(90deg, #fff 0%, #f0f0f0 100%);
-        height: 100%;
-        transition: width 0.5s ease;
-        display: flex;
+    .finished-head {
+        padding: 14px 17px;
+        border-bottom: 1px solid var(--border);
+    }
+    .finished-head h2 { font-size: 14px; margin: 0; }
+    .result-row {
+        display: grid;
+        grid-template-columns: 112px minmax(0, 1fr);
+        gap: 14px;
+        padding: 14px 17px;
+        border-bottom: 1px solid var(--border);
+        align-items: start;
+    }
+    .result-row:last-child { border-bottom: 0; }
+    .result-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 13px;
+        font-weight: 750;
+        white-space: nowrap;
+    }
+    .result-status.ok { color: var(--green); }
+    .result-status.error { color: var(--red); }
+    .address { font-weight: 650; overflow-wrap: anywhere; }
+    .source { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .reason { color: #ffb5b5; font-size: 13px; margin-top: 5px; overflow-wrap: anywhere; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+    .button {
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-weight: bold;
-        color: #667eea;
-        font-size: 0.85rem;
-    }
-    .progress-stats {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 1rem;
-        margin-top: 1.5rem;
-    }
-    .stat-item {
-        background-color: rgba(255, 255, 255, 0.15);
-        padding: 0.75rem;
+        min-height: 42px;
+        padding: 9px 16px;
         border-radius: 8px;
-        text-align: center;
-    }
-    .stat-label {
-        font-size: 0.85rem;
-        opacity: 0.9;
-        margin-bottom: 0.25rem;
-    }
-    .stat-value {
-        font-size: 1.4rem;
-        font-weight: bold;
-    }
-    .progress-main-stat {
-        text-align: center;
-        font-size: 1.1rem;
-        margin-top: 1rem;
-        opacity: 0.95;
-    }
-
-    /* Filter Controls */
-    .filter-controls {
-        display: flex;
-        justify-content: center;
-        gap: 1rem;
-        margin: 2rem 0;
-        flex-wrap: wrap;
-    }
-    .filter-btn {
-        padding: 10px 20px;
-        border: 2px solid #ddd;
-        background: white;
-        border-radius: 8px;
+        border: 1px solid #343b46;
+        color: var(--text);
+        background: #1d222a;
+        text-decoration: none;
+        font-weight: 700;
         cursor: pointer;
-        font-weight: 600;
-        transition: all 0.3s ease;
     }
-    .filter-btn:hover {
-        background: #f8f9fa;
-        transform: translateY(-2px);
-    }
-    .filter-btn.active {
-        background: #667eea;
-        color: white;
-        border-color: #667eea;
-    }
-
-    /* Results Grid - Now 3 columns */
-    .results-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-        gap: 2rem;
-        margin-top: 2rem;
-    }
-    .result-group {
-        background-color: white;
-        border-radius: 10px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-        padding: 1.5rem;
-    }
-    .result-group.hidden {
+    .button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .button.cancel { color: #ffc2c2; border-color: #623038; background: transparent; }
+    .button[hidden], .actions[hidden] { display: none; }
+    .job-error {
         display: none;
-    }
-    .result-group h2 {
-        margin-top: 0;
-        color: #2c3e50;
-        padding-bottom: 0.5rem;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    .result-group.high-confidence h2 {
-        border-bottom: 3px solid #27ae60;
-        color: #27ae60;
-    }
-    .result-group.needs-review h2 {
-        border-bottom: 3px solid #f39c12;
-        color: #e67e22;
-    }
-    .result-group.low-confidence h2 {
-        border-bottom: 3px solid #95a5a6;
-        color: #7f8c8d;
-    }
-
-    /* Confidence Badges */
-    .confidence-badge {
-        display: inline-block;
-        padding: 4px 10px;
+        margin-bottom: 18px;
+        padding: 15px 17px;
+        border: 1px solid #743239;
         border-radius: 12px;
-        font-size: 0.85rem;
-        font-weight: bold;
+        background: #2b171b;
+        color: #ffd0d0;
     }
-    .confidence-high {
-        background: #d4edda;
-        color: #155724;
+    .job-error.show { display: block; }
+    .retry-form { margin-top: 12px; }
+    .diagnostic {
+        margin-top: 14px;
+        padding-top: 13px;
+        border-top: 1px solid #743239;
     }
-    .confidence-medium {
-        background: #fff3cd;
-        color: #856404;
+    .diagnostic-summary { color: #ffd0d0; margin-bottom: 9px; }
+    .diagnostic details { color: #ffb5b5; }
+    .diagnostic summary { cursor: pointer; font-weight: 700; }
+    .diagnostic pre {
+        margin: 10px 0;
+        padding: 12px;
+        max-height: 260px;
+        overflow: auto;
+        border: 1px solid #603038;
+        border-radius: 8px;
+        background: #120b0d;
+        color: #f4dfe2;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
     }
-    .confidence-low {
-        background: #f8d7da;
-        color: #721c24;
+    @keyframes pulse { 50% { opacity: .28; transform: scale(.75); } }
+    @media (max-width: 560px) {
+        .page { padding-top: 28px; }
+        .topline { margin-bottom: 32px; }
+        .result-row { grid-template-columns: 1fr; gap: 5px; }
     }
-
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
-    th:first-child, td:first-child { width: 40px; text-align: center; }
-    th { background-color: #f9f9f9; }
-    .download-buttons { display: flex; gap: 1rem; margin-top: 1.5rem; flex-wrap: wrap; justify-content: center; }
-    .download-button { display: inline-block; background-color: #27ae60; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold; transition: all 0.3s ease; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-    .download-button:hover { background-color: #229954; transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
-    .download-button.primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-    .download-button.primary:hover { background: linear-gradient(135deg, #5568d3 0%, #6a4191 100%); }
-    .download-button.secondary { background-color: #3498db; }
-    .download-button.secondary:hover { background-color: #2980b9; }
-    .cancel-button { display: inline-block; margin-left: 1rem; background-color: #e74c3c; color: white; padding: 8px 15px; text-decoration: none; border-radius: 5px; font-size: 0.9rem; font-weight: bold; transition: background-color 0.3s ease; cursor: pointer; border: none; }
-    .cancel-button:hover { background-color: #c0392b; }
-
-    /* Result thumbnail + click-to-expand lightbox (manual analysis) */
-    .thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 4px; cursor: zoom-in; border: 1px solid #ddd; display: block; margin-bottom: 4px; transition: transform .12s ease, box-shadow .12s ease; }
-    .thumb:hover { transform: scale(1.05); box-shadow: 0 2px 10px rgba(0,0,0,.25); }
-    .img-links { font-size: .85rem; }
-    .img-links a { cursor: zoom-in; }
-    .lightbox-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none; align-items: center; justify-content: center; z-index: 1000; }
-    .lightbox-overlay.open { display: flex; }
-    .lightbox-overlay img { max-width: 70vw; max-height: 70vh; border-radius: 4px; box-shadow: 0 0 40px rgba(0,0,0,.6); }
-    .lightbox-close { position: absolute; top: 16px; right: 28px; background: none; border: none; color: #fff; font-size: 2.6rem; line-height: 1; font-weight: bold; cursor: pointer; }
-    .lightbox-close:hover { color: #ff6b6b; }
 </style>
 {% endblock %}
 
 {% block content %}
-<div class="header">
-    <h1>Processing Addresses</h1>
-    <div id="status-container">
-        <div id="loader" class="loader"></div>
-        <span id="status">Waiting for job to start...</span>
+<main class="page">
+    <div class="topline">
+        <div class="brand">Parity building analysis</div>
+        <a class="quiet-link" href="{{ url_for('index') }}">Analyze another Sheet</a>
     </div>
-    <p><a href="{{ url_for('index') }}">Process Another List</a></p>
-</div>
 
-<div id="progress-dashboard" class="progress-dashboard">
-    <div class="progress-title">Progress</div>
-    <div class="progress-bar-container">
-        <div id="progress-bar-fill" class="progress-bar-fill" style="width: 0%">0%</div>
-    </div>
-    <div class="progress-main-stat" id="progress-main-stat">0 / 0 addresses processed</div>
+    <h1 class="counter">
+        <span id="numerator">0</span>
+        <span class="denominator">/ <span id="denominator">{{ total_count | default(0) }}</span></span>
+    </h1>
+    <p id="run-label" class="run-label">Starting analysis…</p>
 
-    <div class="progress-stats">
-        <div class="stat-item">
-            <div class="stat-label">✅ Towers Found</div>
-            <div class="stat-value" id="stat-towers-found">0 (0%)</div>
+    <div id="job-error" class="job-error" role="alert">
+        <strong>✕ Run stopped</strong>
+        <div id="job-error-text"></div>
+        <div id="diagnostic" class="diagnostic" hidden>
+            <div id="diagnostic-summary" class="diagnostic-summary"></div>
+            <details>
+                <summary>Technical context for Claude Code</summary>
+                <pre id="claude-context"></pre>
+                <button id="copy-diagnostic" class="button" type="button">Copy for Claude Code</button>
+            </details>
         </div>
-        <div class="stat-item">
-            <div class="stat-label">❌ No Towers</div>
-            <div class="stat-value" id="stat-no-towers">0 (0%)</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-label">⏱️ Avg Speed</div>
-            <div class="stat-value" id="stat-speed">-- addr/min</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-label">🕒 Time Remaining</div>
-            <div class="stat-value" id="stat-eta">Calculating...</div>
-        </div>
-    </div>
-</div>
-
-<hr>
-
-<div class="filter-controls">
-    <button class="filter-btn active" data-filter="all">Show All</button>
-    <button class="filter-btn" data-filter="high">High Confidence Only</button>
-    <button class="filter-btn" data-filter="review">Needs Review</button>
-    <button class="filter-btn" data-filter="low">Low/No Detection</button>
-</div>
-
-<div class="results-grid">
-    <div class="result-group high-confidence" data-category="high">
-        <h2 id="high-confidence-heading">
-            <span>✅ High Confidence</span>
-            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(70%+)</span>
-        </h2>
-        <table id="high-confidence-table">
-            <thead><tr><th>#</th><th>Address</th><th>Confidence</th><th>Images</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        {% if job_id.startswith('w-') %}
+        <form class="retry-form" method="post" action="/workbook/{{ job_id }}/retry">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button primary" type="submit">Retry unfinished addresses</button>
+        </form>
+        {% endif %}
     </div>
 
-    <div class="result-group needs-review" data-category="review">
-        <h2 id="needs-review-heading">
-            <span>⚠️ Needs Review</span>
-            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(40-69%)</span>
-        </h2>
-        <table id="needs-review-table">
-            <thead><tr><th>#</th><th>Address</th><th>Confidence</th><th>Images</th></tr></thead>
-            <tbody></tbody>
-        </table>
-    </div>
+    <section id="current-panel" class="current" aria-live="polite">
+        <div class="section-label">Currently analyzing</div>
+        <div id="current-addresses"><div class="empty">Waiting for the worker…</div></div>
+    </section>
 
-    <div class="result-group low-confidence" data-category="low">
-        <h2 id="low-confidence-heading">
-            <span>❌ Low/No Detection</span>
-            <span style="font-size: 0.9rem; font-weight: normal; color: #7f8c8d;">(&lt;40%)</span>
-        </h2>
-        <table id="low-confidence-table">
-            <thead><tr><th>#</th><th>Address</th><th>Status</th><th>Image</th></tr></thead>
-            <tbody></tbody>
-        </table>
-    </div>
-</div>
+    <section id="finished-panel" class="finished" hidden>
+        <div class="finished-head"><h2>Finished addresses</h2></div>
+        <div id="finished-addresses"></div>
+    </section>
 
-<!-- Click-to-expand image overlay: close via X, backdrop click, or Esc -->
-<div id="lightbox" class="lightbox-overlay" role="dialog" aria-modal="true">
-    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
-    <img id="lightbox-img" src="" alt="expanded satellite view">
-</div>
+    <div id="complete-actions" class="actions" hidden>
+        <a id="review-link" class="button primary" href="#">Open review</a>
+        <a id="sheet-link" class="button" href="#" target="_blank" rel="noopener">Open Google Sheet</a>
+    </div>
+    <div id="running-actions" class="actions">
+        <button id="cancel-button" class="button cancel" type="button">Cancel run</button>
+    </div>
+</main>
 {% endblock %}
 
 {% block scripts %}
 <script>
-    const jobId = "{{ job_id }}";
+    const jobId = {{ job_id | tojson }};
     const initialTotal = {{ total_count | default(0) }};
-    const statusContainer = document.getElementById('status-container');
-    const statusElement = document.getElementById('status');
-    const loaderElement = document.getElementById('loader');
-    const headerElement = document.querySelector('.header');
-    const highConfidenceTableBody = document.querySelector('#high-confidence-table tbody');
-    const needsReviewTableBody = document.querySelector('#needs-review-table tbody');
-    const lowConfidenceTableBody = document.querySelector('#low-confidence-table tbody');
-    const highConfidenceHeading = document.getElementById('high-confidence-heading');
-    const needsReviewHeading = document.getElementById('needs-review-heading');
-    const lowConfidenceHeading = document.getElementById('low-confidence-heading');
-
-    // Dashboard elements
-    const progressDashboard = document.getElementById('progress-dashboard');
-    const progressBarFill = document.getElementById('progress-bar-fill');
-    const progressMainStat = document.getElementById('progress-main-stat');
-    const statTowersFound = document.getElementById('stat-towers-found');
-    const statNoTowers = document.getElementById('stat-no-towers');
-    const statSpeed = document.getElementById('stat-speed');
-    const statEta = document.getElementById('stat-eta');
-
-    let highConfidenceCount = 0;
-    let needsReviewCount = 0;
-    let lowConfidenceCount = 0;
+    const csrfToken = {{ csrf_token | tojson }};
+    const numerator = document.getElementById('numerator');
+    const denominator = document.getElementById('denominator');
+    const runLabel = document.getElementById('run-label');
+    const currentPanel = document.getElementById('current-panel');
+    const currentAddresses = document.getElementById('current-addresses');
+    const finishedPanel = document.getElementById('finished-panel');
+    const finishedAddresses = document.getElementById('finished-addresses');
+    const completeActions = document.getElementById('complete-actions');
+    const runningActions = document.getElementById('running-actions');
+    const reviewLink = document.getElementById('review-link');
+    const sheetLink = document.getElementById('sheet-link');
+    const cancelButton = document.getElementById('cancel-button');
+    const jobError = document.getElementById('job-error');
+    const jobErrorText = document.getElementById('job-error-text');
+    const diagnostic = document.getElementById('diagnostic');
+    const diagnosticSummary = document.getElementById('diagnostic-summary');
+    const claudeContext = document.getElementById('claude-context');
+    const copyDiagnostic = document.getElementById('copy-diagnostic');
     let pollingInterval;
-    let startTime = Date.now();
-    let lastProgress = 0;
-    let displayedResultsCount = 0;  // Track how many results we've already displayed
+    let fetchFailures = 0;
 
-    // --- Image lightbox: click a thumbnail/link to expand; X / backdrop / Esc to close ---
-    const lightbox = document.getElementById('lightbox');
-    const lightboxImg = document.getElementById('lightbox-img');
-    const lightboxClose = document.getElementById('lightbox-close');
-    function openLightbox(url) {
-        if (!url) return;
-        lightboxImg.src = url;
-        lightbox.classList.add('open');
-    }
-    function closeLightbox() {
-        lightbox.classList.remove('open');
-        lightboxImg.src = '';
-    }
-    lightboxClose.addEventListener('click', closeLightbox);
-    lightbox.addEventListener('click', function (e) { if (e.target === lightbox) closeLightbox(); });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeLightbox(); });
-
-    // Build an Images cell: thumbnail of the most relevant image + expand links.
-    function imgCell(resultUrl, originalUrl) {
-        const thumbUrl = resultUrl || originalUrl;
-        if (!thumbUrl) return 'N/A';
-        const esc = (u) => (u || '').replace(/'/g, "\\'");
-        let links = '';
-        if (originalUrl) links += `<a href="#" onclick="openLightbox('${esc(originalUrl)}');return false;">Original</a>`;
-        if (resultUrl) links += `${originalUrl ? ' | ' : ''}<a href="#" onclick="openLightbox('${esc(resultUrl)}');return false;">Result</a>`;
-        return `<img class="thumb" src="${thumbUrl}" alt="view" loading="lazy" onclick="openLightbox('${esc(thumbUrl)}')">`
-             + `<div class="img-links">${links}</div>`;
-    }
-    window.openLightbox = openLightbox;
-
-    if (initialTotal > 0) {
-        statusElement.textContent = `Processing... (0 of ${initialTotal} complete)`;
-        progressMainStat.textContent = `0 / ${initialTotal} addresses processed`;
+    function sourceText(item) {
+        const bits = [];
+        if (item.tab) bits.push(item.tab);
+        if (item.source_row) bits.push(`row ${item.source_row}`);
+        return bits.join(' · ');
     }
 
-    function updateDashboard(progress, total) {
-        const percentage = total > 0 ? Math.round((progress / total) * 100) : 0;
-
-        // Update progress bar
-        progressBarFill.style.width = `${percentage}%`;
-        progressBarFill.textContent = `${percentage}%`;
-
-        // Update main stat
-        progressMainStat.textContent = `${progress} / ${total} addresses processed`;
-
-        // Calculate statistics using displayedResultsCount for real-time accuracy
-        const processedCount = displayedResultsCount;
-        const detectedTotal = highConfidenceCount + needsReviewCount;
-        const towersFoundPct = processedCount > 0 ? Math.round((detectedTotal / processedCount) * 100) : 0;
-        const noTowersPct = processedCount > 0 ? Math.round((lowConfidenceCount / processedCount) * 100) : 0;
-
-        statTowersFound.textContent = `${detectedTotal} (${towersFoundPct}%)`;
-        statNoTowers.textContent = `${lowConfidenceCount} (${noTowersPct}%)`;
-
-        // Calculate speed (addresses per minute)
-        const elapsedMs = Date.now() - startTime;
-        const elapsedMin = elapsedMs / 60000;
-        const speed = elapsedMin > 0 ? (progress / elapsedMin) : 0;
-
-        if (progress > 0 && speed > 0) {
-            statSpeed.textContent = `${speed.toFixed(1)} addr/min`;
-
-            // Calculate ETA
-            const remaining = total - progress;
-            const etaMin = remaining / speed;
-
-            if (etaMin < 1) {
-                statEta.textContent = `< 1 min`;
-            } else if (etaMin < 60) {
-                statEta.textContent = `~${Math.round(etaMin)} min`;
-            } else {
-                const hours = Math.floor(etaMin / 60);
-                const mins = Math.round(etaMin % 60);
-                statEta.textContent = `~${hours}h ${mins}m`;
-            }
-        } else {
-            statSpeed.textContent = `--`;
-            statEta.textContent = `Calculating...`;
+    function renderCurrent(rows) {
+        const active = rows.filter(row => row.state === 'analyzing' || row.state === 'retrying');
+        currentAddresses.replaceChildren();
+        if (!active.length) {
+            const empty = document.createElement('div');
+            empty.className = 'empty';
+            empty.textContent = 'Waiting for the next address…';
+            currentAddresses.appendChild(empty);
+            return 0;
         }
-    }
-
-    function displayNewResults(web_results) {
-        // Only display results we haven't shown yet
-        if (!web_results || web_results.length <= displayedResultsCount) {
-            return;
-        }
-
-        const staticBase = `{{ url_for('static', filename='') }}`;
-        const isAbs = (u) => typeof u === 'string' && (/^https?:\/\//.test(u) || u.startsWith('/'));
-        // Google Maps deep-link keyed off the ADDRESS (not our centroid) so an analyst
-        // can reach the correct building even if we targeted/showed the wrong one.
-        const mapsLink = (addr) =>
-            `<a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}" target="_blank" rel="noopener" title="Open address in Google Maps">${addr}</a>`;
-
-        // Process only new results
-        for (let i = displayedResultsCount; i < web_results.length; i++) {
-            const item = web_results[i];
-            const row = document.createElement('tr');
-
-            // Handle errors (geocoding/image download failures)
-            if (item.error) {
-                lowConfidenceCount++;
-                row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${item.error}</td><td>N/A</td>`;
-                lowConfidenceTableBody.appendChild(row);
-            } else {
-                const originalImgUrl = item.original_image_url && isAbs(item.original_image_url)
-                    ? item.original_image_url
-                    : staticBase + (item.original_image_url || '');
-
-                if (item.confidence_score) {
-                    const percentage = (item.confidence_score * 100).toFixed(1);
-                    const confidenceValue = item.confidence_score * 100;
-                    const resultImgUrl = item.result_image_url && isAbs(item.result_image_url)
-                        ? item.result_image_url
-                        : staticBase + (item.result_image_url || '');
-
-                    // Categorize by confidence level
-                    if (confidenceValue >= 70) {
-                        // High Confidence (70%+)
-                        highConfidenceCount++;
-                        const badge = `<span class="confidence-badge confidence-high">${percentage}%</span>`;
-                        row.innerHTML = `<td>${highConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
-                        highConfidenceTableBody.appendChild(row);
-                    } else if (confidenceValue >= 40) {
-                        // Needs Review (40-69%)
-                        needsReviewCount++;
-                        const badge = `<span class="confidence-badge confidence-medium">${percentage}%</span>`;
-                        row.innerHTML = `<td>${needsReviewCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
-                        needsReviewTableBody.appendChild(row);
-                    } else {
-                        // Low Confidence (<40%)
-                        lowConfidenceCount++;
-                        const badge = `<span class="confidence-badge confidence-low">${percentage}%</span>`;
-                        row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>${badge}</td><td>${imgCell(resultImgUrl, originalImgUrl)}</td>`;
-                        lowConfidenceTableBody.appendChild(row);
-                    }
-                } else {
-                    // No detection
-                    lowConfidenceCount++;
-                    row.innerHTML = `<td>${lowConfidenceCount}</td><td>${mapsLink(item.address)}</td><td>No system detected</td><td>${imgCell(null, originalImgUrl)}</td>`;
-                    lowConfidenceTableBody.appendChild(row);
-                }
-            }
-        }
-
-        displayedResultsCount = web_results.length;
-
-        // Update table headings with counts
-        highConfidenceHeading.querySelector('span:first-child').textContent = `✅ High Confidence (${highConfidenceCount})`;
-        needsReviewHeading.querySelector('span:first-child').textContent = `⚠️ Needs Review (${needsReviewCount})`;
-        lowConfidenceHeading.querySelector('span:first-child').textContent = `❌ Low/No Detection (${lowConfidenceCount})`;
-    }
-
-    const cancelButton = document.createElement('button');
-    cancelButton.textContent = 'Cancel Job';
-    cancelButton.className = 'cancel-button';
-    cancelButton.onclick = function() {
-        fetch(`/cancel/${jobId}`, {
-            method: 'POST',
-            headers: { 'X-CSRF-Token': '{{ csrf_token }}' }
-        })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'cancelled') {
-                    statusElement.textContent = 'Job Cancelled by User.';
-                    loaderElement.style.display = 'none';
-                    cancelButton.style.display = 'none';
-                    clearInterval(pollingInterval);
-                    highConfidenceTableBody.innerHTML = '';
-                    needsReviewTableBody.innerHTML = '';
-                    lowConfidenceTableBody.innerHTML = '';
-                } else {
-                    alert('Could not cancel job.');
-                }
-            });
-    };
-    statusContainer.appendChild(cancelButton);
-
-    let fetchRetries = 0;
-    const MAX_FETCH_RETRIES = 3;
-
-    function checkJobStatus() {
-        // Add timeout to fetch (30 seconds)
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000);
-
-        fetch(`/status/${jobId}`, { signal: controller.signal })
-            .then(response => {
-                clearTimeout(timeoutId);
-                return response.json();
-            })
-            .then(data => {
-                // Reset retry counter on success
-                fetchRetries = 0;
-
-                if (data.status === 'processing') {
-                    const progress = data.progress || 0;
-                    const total = data.total || initialTotal;
-                    statusElement.textContent = `Processing... (${progress} of ${total} complete)`;
-
-                    // Display new results as they come in
-                    if (data.result && data.result.web_results) {
-                        displayNewResults(data.result.web_results);
-                    }
-
-                    // Update dashboard
-                    updateDashboard(progress, total);
-                } else if (data.status === 'finished') {
-                    clearInterval(pollingInterval);
-                    statusElement.textContent = 'Analysis Complete!';
-                    loaderElement.style.display = 'none';
-                    cancelButton.style.display = 'none';
-
-                    // Mark dashboard as complete
-                    progressDashboard.classList.add('complete');
-                    progressBarFill.style.width = '100%';
-                    progressBarFill.textContent = '100%';
-                    statEta.textContent = 'Complete!';
-
-                    const finalResult = data.result;
-
-                    // Display any remaining results
-                    if (finalResult && finalResult.web_results) {
-                        displayNewResults(finalResult.web_results);
-                    }
-
-                    // Primary hand-off: the review page + live Google Sheet.
-                    if (finalResult && finalResult.review_url && !headerElement.querySelector('.review-handoff')) {
-                        const banner = document.createElement('div');
-                        banner.className = 'review-handoff';
-                        const sheetBtn = finalResult.sheet_url
-                            ? `<a href="${finalResult.sheet_url}" target="_blank" rel="noopener" class="download-button secondary">📄 Open Google Sheet</a>`
-                            : '';
-                        banner.innerHTML = `
-                            <div style="background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 1rem 1.5rem; margin: 1.5rem 0; border-radius: 4px;">
-                                <strong style="color: #2e7d32; font-size: 1.1rem;">✅ Ready for review</strong>
-                                <p style="margin: 0.5rem 0 0.8rem 0; color: #333;">
-                                    Review each building below — every Submit writes straight into the Google Sheet.
-                                    You can stop and finish later; progress is saved per building.
-                                </p>
-                                <div class="download-buttons" style="justify-content:flex-start; margin-top:0;">
-                                    <a href="${finalResult.review_url}" class="download-button primary">🏢 Open Review Page</a>
-                                    ${sheetBtn}
-                                </div>
-                            </div>
-                        `;
-                        headerElement.appendChild(banner);
-                    }
-
-                    // Fallback hand-off (no Sheets credential): copy-paste instructions
-                    if (!(finalResult && finalResult.review_url) && !headerElement.querySelector('.copy-paste-instructions')) {
-                        const instructionBanner = document.createElement('div');
-                        instructionBanner.className = 'copy-paste-instructions';
-                        instructionBanner.innerHTML = `
-                            <div style="background: #e7f3ff; border-left: 4px solid #2196F3; padding: 1rem 1.5rem; margin: 1.5rem 0; border-radius: 4px;">
-                                <strong style="color: #1976D2; font-size: 1.1rem;">📋 Copy to Google Sheets</strong>
-                                <p style="margin: 0.5rem 0 0 0; color: #333;">
-                                    Select the table below (click and drag or Ctrl+A), copy (Ctrl+C / Cmd+C), then paste into Google Sheets.
-                                    Image URLs are clickable for verification.
-                                </p>
-                                <p style="margin: 0.5rem 0 0 0; color: #d32f2f; font-size: 0.9rem;">
-                                    ⚠️ <strong>Important:</strong> Image URLs will stop working when the app is updated/redeployed.
-                                    Verify addresses promptly or save images separately for permanent access.
-                                </p>
-                            </div>
-                        `;
-                        headerElement.appendChild(instructionBanner);
-                    }
-
-                    // Update dashboard with final counts
-                    const finalTotal = data.total || initialTotal;
-                    updateDashboard(finalTotal, finalTotal);
-                } else if (data.status === 'failed') {
-                    clearInterval(pollingInterval);
-                    const errorMsg = data.message || 'Check the worker terminal for errors.';
-                    statusElement.textContent = `Job Failed: ${errorMsg}`;
-                    statusElement.style.color = '#dc3545';
-                    loaderElement.style.display = 'none';
-                    cancelButton.style.display = 'none';
-                    if (jobId.startsWith('w-') && !headerElement.querySelector('.workbook-retry')) {
-                        const retryForm = document.createElement('form');
-                        retryForm.className = 'workbook-retry';
-                        retryForm.method = 'POST';
-                        retryForm.action = `/workbook/${jobId}/retry`;
-                        retryForm.innerHTML = `
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                            <button type="submit" class="download-button primary">
-                                Retry unfinished rows
-                            </button>
-                            <p>Completed checkpoints will be skipped and the workbook will not be reserved twice.</p>
-                        `;
-                        headerElement.appendChild(retryForm);
-                    }
-                }
-            })
-            .catch(err => {
-                clearTimeout(timeoutId);
-
-                // Retry logic for transient errors
-                fetchRetries++;
-                if (fetchRetries < MAX_FETCH_RETRIES) {
-                    console.warn(`Fetch failed (attempt ${fetchRetries}/${MAX_FETCH_RETRIES}), retrying...`, err);
-                    // Don't show error to user, just retry on next interval
-                    return;
-                }
-
-                // Only show error after max retries
-                console.error('Error fetching status after retries:', err);
-                statusElement.textContent = 'Connection issue - refresh page to check status';
-                statusElement.style.color = '#ff9800';
-                // Don't stop polling - let it continue trying
-            });
-    }
-
-    // Filter button functionality
-    const filterButtons = document.querySelectorAll('.filter-btn');
-    const resultGroups = document.querySelectorAll('.result-group');
-
-    filterButtons.forEach(btn => {
-        btn.addEventListener('click', () => {
-            // Update active button
-            filterButtons.forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-
-            const filter = btn.dataset.filter;
-
-            // Show/hide result groups based on filter
-            resultGroups.forEach(group => {
-                const category = group.dataset.category;
-                if (filter === 'all') {
-                    group.classList.remove('hidden');
-                } else if (filter === category) {
-                    group.classList.remove('hidden');
-                } else {
-                    group.classList.add('hidden');
-                }
-            });
+        active.forEach(item => {
+            const row = document.createElement('div');
+            row.className = 'current-address';
+            const pulse = document.createElement('span');
+            pulse.className = 'pulse';
+            const text = document.createElement('span');
+            text.textContent = item.address || 'Address unavailable';
+            row.appendChild(pulse);
+            row.appendChild(text);
+            currentAddresses.appendChild(row);
         });
+        return active.length;
+    }
+
+    function renderFinished(rows) {
+        const terminal = rows.filter(row =>
+            row.state === 'complete' || row.state === 'attention' || row.state === 'failed'
+        );
+        finishedAddresses.replaceChildren();
+        finishedPanel.hidden = terminal.length === 0;
+        terminal.forEach(item => {
+            const hasError = item.state === 'attention' || item.state === 'failed';
+            const row = document.createElement('div');
+            row.className = 'result-row';
+
+            const status = document.createElement('div');
+            status.className = `result-status ${hasError ? 'error' : 'ok'}`;
+            status.textContent = hasError ? '✕ Error' : '✓ All set';
+
+            const details = document.createElement('div');
+            const address = document.createElement('div');
+            address.className = 'address';
+            address.textContent = item.address || 'Address unavailable';
+            details.appendChild(address);
+            const source = sourceText(item);
+            if (source) {
+                const meta = document.createElement('div');
+                meta.className = 'source';
+                meta.textContent = source;
+                details.appendChild(meta);
+            }
+            if (hasError) {
+                const reason = document.createElement('div');
+                reason.className = 'reason';
+                reason.textContent = item.error || item.message || 'The address could not be analyzed.';
+                details.appendChild(reason);
+            }
+            row.appendChild(status);
+            row.appendChild(details);
+            finishedAddresses.appendChild(row);
+        });
+        return {
+            terminal: terminal.length,
+            errors: terminal.filter(row => row.state === 'attention' || row.state === 'failed').length,
+        };
+    }
+
+    function showFinished(data, counts, total) {
+        currentPanel.hidden = true;
+        runningActions.hidden = true;
+        numerator.textContent = total;
+        runLabel.textContent = counts.errors
+            ? `Finished with ${counts.errors} error${counts.errors === 1 ? '' : 's'}.`
+            : 'All addresses are ready for review.';
+        const result = data.result || {};
+        if (result.review_url) {
+            reviewLink.href = result.review_url;
+            completeActions.hidden = false;
+        }
+        if (result.sheet_url) {
+            sheetLink.href = result.sheet_url;
+            sheetLink.hidden = false;
+        } else {
+            sheetLink.hidden = true;
+        }
+    }
+
+    function showFailed(data) {
+        clearInterval(pollingInterval);
+        currentPanel.hidden = true;
+        runningActions.hidden = true;
+        runLabel.textContent = 'The run stopped before every address finished.';
+        jobError.classList.add('show');
+        jobErrorText.textContent = data.message || 'The worker stopped before it could finish.';
+        const details = (data.result || {}).diagnostic || {};
+        if (details.claude_code_context) {
+            diagnostic.hidden = false;
+            diagnosticSummary.textContent = details.diagnostic_summary || 'A sanitized diagnostic packet is ready.';
+            claudeContext.textContent = details.claude_code_context;
+        }
+    }
+
+    copyDiagnostic.addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(claudeContext.textContent || '');
+            copyDiagnostic.textContent = 'Copied';
+        } catch (error) {
+            copyDiagnostic.textContent = 'Select the text above and copy it';
+        }
     });
 
-    pollingInterval = setInterval(checkJobStatus, 3000);
-    checkJobStatus();
+    async function checkStatus() {
+        try {
+            const response = await fetch(`/status/${encodeURIComponent(jobId)}`);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.message || 'Could not read run status');
+            fetchFailures = 0;
+            const total = Number(data.total || initialTotal || 0);
+            const progress = Number(data.progress || 0);
+            const rows = Array.isArray(data.rows) ? data.rows : [];
+            denominator.textContent = total;
+            numerator.textContent = progress;
+            const activeCount = renderCurrent(rows);
+            const counts = renderFinished(rows);
+
+            if (data.status === 'queued') {
+                runLabel.textContent = 'Waiting for the worker…';
+            } else if (data.status === 'processing') {
+                runLabel.textContent = activeCount
+                    ? `${activeCount} address${activeCount === 1 ? '' : 'es'} analyzing now.`
+                    : 'Analyzing addresses…';
+            } else if (data.status === 'finished') {
+                clearInterval(pollingInterval);
+                showFinished(data, counts, total);
+            } else if (data.status === 'failed') {
+                showFailed(data);
+            }
+        } catch (error) {
+            fetchFailures += 1;
+            if (fetchFailures >= 3) {
+                runLabel.textContent = 'Connection interrupted. Retrying automatically…';
+            }
+        }
+    }
+
+    cancelButton.addEventListener('click', async () => {
+        cancelButton.disabled = true;
+        const response = await fetch(`/cancel/${encodeURIComponent(jobId)}`, {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrfToken },
+        });
+        if (!response.ok) {
+            cancelButton.disabled = false;
+            jobError.classList.add('show');
+            jobErrorText.textContent = 'The cancellation request could not be saved. Refresh and try again.';
+            return;
+        }
+        runLabel.textContent = 'Cancellation requested…';
+    });
+
+    pollingInterval = setInterval(checkStatus, 2000);
+    checkStatus();
 </script>
 {% endblock %}
