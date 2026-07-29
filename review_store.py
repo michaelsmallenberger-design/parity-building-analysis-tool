@@ -11,6 +11,11 @@ from datetime import datetime
 import threading
 
 from storage_helpers import write_json, read_json, get_file_path
+from review_contract import (
+    SINGLE_FIT_SCHEMA,
+    entry_is_reviewed,
+    infer_review_schema,
+)
 
 
 _locks_guard = threading.Lock()
@@ -52,13 +57,17 @@ def list_batches() -> list:
         if not b:
             continue
         entries = b.get("entries", [])
+        review_schema = infer_review_schema(b)
         out.append({
             "batch_id": b.get("job_id", p.stem),
             "title": b.get("title", ""),
             "created": b.get("created", ""),
             "sheet_url": b.get("sheet_url", ""),
             "count": len(entries),
-            "reviewed": sum(1 for e in entries if e.get("human")),
+            "reviewed": sum(
+                1 for entry in entries
+                if entry_is_reviewed(entry, review_schema)
+            ),
         })
     return out
 
@@ -67,7 +76,8 @@ def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
                table_headers: list = None, table_rows: list = None,
                sheet_binding: dict = None, sheet_bindings: list = None,
                tab_inventory: list = None, schema_version: int = 1,
-               run_id: str = None) -> None:
+               run_id: str = None,
+               review_schema: str = SINGLE_FIT_SCHEMA) -> None:
     """Persist a batch's web_entries (with images) for the review page, plus the
     ORIGINAL uploaded table (headers + rows, all the user's columns) so the finished
     Google Sheet can be assembled from the human picks later. sheet_binding is set
@@ -81,6 +91,7 @@ def save_batch(job_id: str, title: str, entries: list, sheet_url: str = "",
             "sheet_bindings": sheet_bindings or [],
             "tab_inventory": tab_inventory or [],
             "schema_version": int(schema_version),
+            "review_schema": str(review_schema or SINGLE_FIT_SCHEMA),
             "run_id": run_id,
             "created": datetime.utcnow().isoformat(),
             "table_headers": table_headers or [],
@@ -95,19 +106,31 @@ def decisions_for(job_id: str) -> list:
     batch = load_batch(job_id)
     if not batch:
         return []
+    review_schema = infer_review_schema(batch)
     out = []
     for e in batch.get("entries", []):
         h = e.get("human")
-        if h:
-            out.append({"row_id": _rid(e), "hvac_systems": h.get("hvac_systems", ""),
-                        "optimizer_fit": h.get("optimizer_fit", ""),
-                        "periscope_fit": h.get("periscope_fit", ""),
-                        "note": h.get("note", "")})
+        if not entry_is_reviewed(e, review_schema):
+            continue
+        decision = {
+            "row_id": _rid(e),
+            "hvac_systems": h.get("hvac_systems", ""),
+            "note": h.get("note", ""),
+        }
+        if review_schema == SINGLE_FIT_SCHEMA:
+            decision["fit"] = h.get("fit", "")
+        else:
+            decision["optimizer_fit"] = h.get("optimizer_fit", "")
+            decision["periscope_fit"] = h.get("periscope_fit", "")
+        out.append(decision)
     return out
 
 
 def load_batch(job_id: str):
-    return read_json(_path(job_id))
+    batch = read_json(_path(job_id))
+    if batch:
+        batch["review_schema"] = infer_review_schema(batch)
+    return batch
 
 
 def save_raw(job_id: str, batch: dict) -> None:

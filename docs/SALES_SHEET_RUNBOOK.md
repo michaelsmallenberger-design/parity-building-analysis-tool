@@ -81,7 +81,7 @@ For each building:
 
 1. Look at the imagery and map links.
 2. Select every HVAC system you can actually see, or select **None**.
-3. Choose both **Optimizer Fit** and **Periscope Fit**.
+3. Choose one **Fit**: **Optimizer**, **Periscope**, **Unclear**, or **Bad**.
 4. Add a note only when it would help the next person.
 5. Click **Submit**.
 
@@ -91,12 +91,12 @@ customer-facing Sheet column.
 
 ## Fit Standard
 
-Each building requires two separate decisions: **Optimizer Fit** and
-**Periscope Fit**. Each uses the current review choices:
+Each building requires one mutually exclusive **Fit** decision:
 
-- `Good`
+- `Optimizer`
+- `Periscope`
+- `Unclear`
 - `Bad`
-- `Not Sure`
 
 ## What Changes in the Sales Sheet
 
@@ -111,12 +111,12 @@ are not reformatted or replaced.
 ## When the Work Is Complete
 
 The run is complete only when every eligible row has a terminal machine result,
-both Fit decisions and an HVAC decision have been submitted, and no Sheet
+one Fit decision and an HVAC decision have been submitted, and no Sheet
 write-back remains failed. Open the resulting Google Sheet and spot-check rows
 on several tabs:
 
 - the original Sales data is still present;
-- HVAC/Optimizer Fit/Periscope Fit/Notes appear on the intended rows; and
+- HVAC/Fit/Notes appear on the intended rows; and
 - the Sheet still looks like Sales's Sheet.
 
 There is no second Sheet to merge. A live Google Sheet input is updated in

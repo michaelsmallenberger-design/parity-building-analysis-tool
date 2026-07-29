@@ -1,14 +1,19 @@
-"""Interactive review page: dark cards with a ‹ › image carousel, map links, and
-a multi-select of the HVAC system taxonomy used in the Washington Gas sheet
-(Cooling Tower, Exhaust Fan, RTU, VRF, AHU, PTAC, Heat Pump, Unclear). Each Submit
-POSTs {job_id,row_id,address,ai_verdict,hvac_systems,note} to an n8n webhook, which
-writes the comma-joined systems back to the sheet's HVAC Systems column.
+"""Interactive review page with imagery, map links, HVAC multi-select, and Fit.
 
-Prototype renderer — moves into the Render app once the shape is approved.
+Current workbooks submit one mutually-exclusive Fit value. Historical batches
+that genuinely target two product-fit columns keep their versioned interface.
 """
 import html as _html
 import json
 import urllib.parse
+
+from review_contract import (
+    DUAL_FIT_OPTIONS,
+    DUAL_FIT_SCHEMA,
+    FIT_OPTIONS,
+    SINGLE_FIT_SCHEMA,
+    entry_is_reviewed,
+)
 
 # Exact HVAC Systems data-validation dropdown from the Washington Gas sheet
 # (Good fits / All Buildings / Building Analysis / Tracker), in the sheet's order.
@@ -18,14 +23,10 @@ HVAC_SYSTEMS = ["Cooling Tower", "Chiller", "Exhaust Fan", "RTU", "AHU", "PTAC",
 # Reviewers sometimes see no relevant HVAC at all; "None" is a submittable answer,
 # mutually exclusive with the systems above. Not part of the taxonomy itself.
 NONE_OPTION = "None"
-# Two per-product fit classifications (single choice each) — the sheet's
-# "Optimizer Fit" and "Periscope Fit" dropdowns, mirroring the team's TAM
-# sheet format (2026-07-13 directive; replaces the old single Fit column).
-FIT_COLUMNS = ["Optimizer Fit", "Periscope Fit"]
-FIT_OPTIONS = ["Good", "Bad", "Not Sure"]
-# Vocabulary of the RETIRED single Fit column — still needed to recognize a
-# legacy fit column in re-uploaded sheets (so it isn't mistaken for HVAC).
-LEGACY_FIT_VALUES = ["Optimizer", "Periscope", "Unclear", "Bad"]
+# Current workbooks use the one existing Fit dropdown.
+FIT_COLUMNS = ["Fit"]
+# Compatibility export used by upload schema detection.
+LEGACY_FIT_VALUES = FIT_OPTIONS
 # AI verdicts that mean "cooling tower present" -> pre-check Cooling Tower for the reviewer.
 _AI_POSITIVE = {"confirmed", "registry_confirmed", "likely", "cooling_tower_present"}
 _IMG_SLOTS = [
@@ -68,12 +69,12 @@ def _model_boxes(e, reasoning):
     return out
 
 
-def _card(e):
+def _card(e, review_schema=SINGLE_FIT_SCHEMA):
     # A batch entry carries a "human" decision once reviewed (review_store); render
     # such cards in the exact state a live Submit leaves them in, so reopening the
     # page mid-batch shows what's already done.
     human = e.get("human") or {}
-    reviewed = bool(human)
+    reviewed = entry_is_reviewed(e, review_schema)
     writeback = e.get("writeback") or {}
     writeback_error = writeback.get("status") == "error"
     picked = {s.strip() for s in str(human.get("hvac_systems", "")).split(",") if s.strip()}
@@ -113,22 +114,28 @@ def _card(e):
     submit_dis = " disabled" if reviewed and not writeback_error else ""
     chips = ""
     for s in HVAC_SYSTEMS + [NONE_OPTION]:
-        if reviewed:
+        if human:
             pre = " sel" if s in picked else ""
         else:
             pre = " sel" if (s == "Cooling Tower" and ai in _AI_POSITIVE) else ""
         chips += f'<button type="button" class="chip{pre}"{controls_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
-    fit_keys = {"Optimizer Fit": "optimizer_fit", "Periscope Fit": "periscope_fit"}
     fitrows = ""
-    for col in FIT_COLUMNS:
-        picked_fit = human.get(fit_keys[col], "") if reviewed else ""
+    if review_schema == DUAL_FIT_SCHEMA:
+        fit_specs = [
+            ("Optimizer Fit", "optimizer_fit", DUAL_FIT_OPTIONS),
+            ("Periscope Fit", "periscope_fit", DUAL_FIT_OPTIONS),
+        ]
+    else:
+        fit_specs = [("Fit", "fit", FIT_OPTIONS)]
+    for col, fit_key, fit_options in fit_specs:
+        picked_fit = str(human.get(fit_key) or "")
         chips_f = ""
-        for fo in FIT_OPTIONS:
+        for fo in fit_options:
             pre = " sel" if fo == picked_fit else ""
             chips_f += (f'<button type="button" class="fitchip{pre}"{controls_dis} '
                         f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>')
         fitrows += (f'<div class="label">{_html.escape(col)}:</div>'
-                    f'<div class="fitchips" data-col="{fit_keys[col]}">{chips_f}</div>')
+                    f'<div class="fitchips" data-col="{fit_key}">{chips_f}</div>')
 
     if writeback_error:
         status = (
@@ -137,11 +144,13 @@ def _card(e):
         )
     elif reviewed:
         saved = "✓ saved: " + str(human.get("hvac_systems", ""))
-        for col in FIT_COLUMNS:
-            v = human.get(fit_keys[col])
+        for col, fit_key, _fit_options in fit_specs:
+            v = human.get(fit_key)
             if v:
-                saved += f" · {col.split()[0]}: {v}"
+                saved += f" · {col}: {v}"
         status = f'<span class="status ok">{_html.escape(saved)}</span>'
+    elif human and review_schema == SINGLE_FIT_SCHEMA:
+        status = '<span class="status err">HVAC saved; choose Fit to complete</span>'
     else:
         status = '<span class="status"></span>'
 
@@ -177,31 +186,41 @@ def _card(e):
 </article>'''
 
 
-def build_review_page(entries, job_id, webhook_url="", title="Cooling Tower Review", csrf_token=""):
+def build_review_page(
+    entries, job_id, webhook_url="", title="Cooling Tower Review",
+    csrf_token="", review_schema=SINGLE_FIT_SCHEMA,
+):
     grouped = {}
     for entry in entries:
         grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
     if len(grouped) == 1 and "" in grouped:
-        cards = "\n".join(_card(e) for e in entries)
+        cards = "\n".join(_card(e, review_schema) for e in entries)
     else:
         sections = []
         for tab, tab_entries in grouped.items():
-            tab_done = sum(1 for entry in tab_entries if entry.get("human"))
+            tab_done = sum(
+                1 for entry in tab_entries
+                if entry_is_reviewed(entry, review_schema)
+            )
             sections.append(
                 f'<section class="tab-group"><div class="tab-head">'
                 f'<h2>{_html.escape(tab or "Other")}</h2>'
                 f'<span class="tab-progress">{len(tab_entries)}/{len(tab_entries)} analyzed '
                 f'· {tab_done}/{len(tab_entries)} reviewed</span></div>'
-                + "\n".join(_card(entry) for entry in tab_entries)
+                + "\n".join(_card(entry, review_schema) for entry in tab_entries)
                 + "</section>"
             )
         cards = "\n".join(sections)
     total = len(entries)
-    done0 = sum(1 for e in entries if e.get("human"))
-    attention0 = sum(1 for e in entries if e.get("error") and not e.get("human"))
+    done0 = sum(1 for e in entries if entry_is_reviewed(e, review_schema))
+    attention0 = sum(
+        1 for e in entries
+        if e.get("error") and not entry_is_reviewed(e, review_schema)
+    )
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
+    schema_json = json.dumps(str(review_schema))
     return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_html.escape(title)}</title>
@@ -261,13 +280,13 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 <div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · {attention0} need attention · every Submit writes to the source tab</div></header>
 <div class="wrap">{cards}</div>
 <div class="bulk-review">
-  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>). Incomplete cards are skipped so nothing is guessed.</div>
+  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>) and a Fit choice. Incomplete cards are skipped so nothing is guessed.</div>
   <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed</button>
   <span id="bulk-status" class="bulk-status"></span>
 </div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
 <script>
-const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf};let done={done0};
+const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json};let done={done0};
 function zoom(s){{document.getElementById('lbi').src=s;document.getElementById('lb').style.display='block';}}
 function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
   imgs.forEach((im,k)=>im.classList.toggle('cur',k==i));
@@ -288,13 +307,18 @@ async function submitCard(btn){{
   if(!sys.length){{status.textContent='pick at least one system (or None)';status.className='status err';return 'incomplete';}}
   const fits={{}};
   card.querySelectorAll('.fitchips').forEach(g=>{{const s=g.querySelector('.fitchip.sel');fits[g.dataset.col]=s?s.dataset.fit:'';}});
-  if(!fits.optimizer_fit || !fits.periscope_fit){{
+  if(REVIEW_SCHEMA==='single_fit_v1' && !fits.fit){{
+    status.textContent='choose one Fit: Optimizer, Periscope, Unclear, or Bad';
+    status.className='status err';return 'incomplete';
+  }}
+  if(REVIEW_SCHEMA==='dual_product_fit_v1' && (!fits.optimizer_fit || !fits.periscope_fit)){{
     status.textContent='choose both Optimizer Fit and Periscope Fit';
     status.className='status err';return 'incomplete';
   }}
   const payload={{job_id:JOB,row_id:card.dataset.rid,address:card.dataset.addr,ai_verdict:card.dataset.ai,
-    hvac_systems:sys.join(', '),optimizer_fit:fits.optimizer_fit||'',periscope_fit:fits.periscope_fit||'',
-    note:card.querySelector('.note').value}};
+    hvac_systems:sys.join(', '),note:card.querySelector('.note').value}};
+  if(REVIEW_SCHEMA==='single_fit_v1')payload.fit=fits.fit||'';
+  else{{payload.optimizer_fit=fits.optimizer_fit||'';payload.periscope_fit=fits.periscope_fit||'';}}
   btn.disabled=true;status.textContent='saving…';status.className='status';
   try{{
     let reply={{}};
@@ -309,7 +333,7 @@ async function submitCard(btn){{
       }}
     }}
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
-    status.textContent='✓ saved: '+payload.hvac_systems+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
+    status.textContent='✓ saved: '+payload.hvac_systems+(payload.fit?' · Fit: '+payload.fit:'')+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
     const wasReviewed=card.dataset.reviewed==='1';
     card.classList.add('done');card.classList.remove('writeback-error');
     card.dataset.reviewed='1';card.querySelectorAll('.chip,.fitchip,.note').forEach(c=>c.disabled=true);
@@ -327,10 +351,14 @@ function setBulkStatus(message, kind){{
 async function submitAll(){{
   const bulk=document.getElementById('submit-all');
   const pending=[...document.querySelectorAll('.card')].filter(c=>!c.classList.contains('done'));
-  const ready=pending.filter(c=>c.querySelectorAll('.chip.sel').length>0);
+  const ready=pending.filter(c=>{{
+    if(!c.querySelectorAll('.chip.sel').length)return false;
+    const fits=[...c.querySelectorAll('.fitchips')];
+    return fits.length>0 && fits.every(g=>g.querySelector('.fitchip.sel'));
+  }});
   const skipped=pending.length-ready.length;
   if(!ready.length){{
-    setBulkStatus(pending.length?'Nothing submitted - choose an HVAC system or None first.':'Everything is already reviewed.','err');
+    setBulkStatus(pending.length?'Nothing submitted - choose HVAC and Fit first.':'Everything is already reviewed.','err');
     return;
   }}
   bulk.disabled=true;setBulkStatus('Saving '+ready.length+' completed card'+(ready.length===1?'':'s')+'...');
@@ -341,7 +369,7 @@ async function submitAll(){{
   }}
   bulk.disabled=false;
   const parts=[saved+' saved'];
-  if(skipped)parts.push(skipped+' skipped - needs a selection');
+  if(skipped)parts.push(skipped+' skipped - needs HVAC or Fit');
   if(failed)parts.push(failed+' need retry');
   setBulkStatus(parts.join(' Â· '),(skipped||failed)?'err':'ok');
 }}
