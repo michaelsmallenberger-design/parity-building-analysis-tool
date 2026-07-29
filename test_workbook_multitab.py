@@ -897,6 +897,50 @@ def test_single_fit_column_is_reused_or_appended_once():
         sheets_writer._get_services = original
 
 
+def test_converted_copy_review_answers_are_cleared_without_rule_changes():
+    class FakeSheets:
+        def __init__(self):
+            self.clears = []
+
+        def spreadsheets(self):
+            return self
+
+        def values(self):
+            return self
+
+        def batchClear(self, **kwargs):
+            self.clears.append(kwargs)
+            return FakeRequest({})
+
+    original = sheets_writer._get_services
+    try:
+        fake = FakeSheets()
+        sheets_writer._get_services = lambda: (fake, None)
+        binding = {
+            "spreadsheet_id": "sheet",
+            "grid_id": 20,
+            "tab": "Road Trip Chaos",
+            "row_numbers": [2, 3, 11],
+            "colmap": {
+                "HVAC Systems": 8,
+                "Fit": 9,
+                "Notes": 10,
+            },
+        }
+        assert sheets_writer.clear_review_answers(binding)
+        assert fake.clears == [{
+            "spreadsheetId": "sheet",
+            "body": {
+                "ranges": [
+                    "'Road Trip Chaos'!I2:I11",
+                    "'Road Trip Chaos'!J2:J11",
+                ],
+            },
+        }]
+    finally:
+        sheets_writer._get_services = original
+
+
 def test_corrected_rerun_uses_exact_multitab_source(root):
     with IsolatedState(root):
         batch_id = "w-rerun-source"
@@ -1090,6 +1134,7 @@ if __name__ == "__main__":
     test_dropdown_conversion_fails_closed()
     test_grouped_review_and_exact_tab_writeback()
     test_single_fit_column_is_reused_or_appended_once()
+    test_converted_copy_review_answers_are_cleared_without_rule_changes()
     test_versioned_async_api_contract()
     test_costless_approval_ui_is_enabled()
     test_n8n_async_workflow_contract()
