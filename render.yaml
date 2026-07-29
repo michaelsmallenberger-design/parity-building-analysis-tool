@@ -15,6 +15,10 @@ services:
     envVars:
       - key: STORAGE_DIR
         value: /var/data/storage
+      - key: MARKET_DASHBOARD_STORAGE_DIR
+        value: /var/data/storage/market_dashboard
+      - key: MARKET_DASHBOARD_PUBLISH_SECRET
+        sync: false
       - key: JOBS_DB_PATH
         value: /var/data/storage/jobs.db
       - key: GOOGLE_MAPS_API_KEY

@@ -1,5 +1,11 @@
-# Optimized Dockerfile for the Render deployment (filename kept for continuity)
-# Reduces build time from 16 minutes to ~6-8 minutes
+# Build the market dashboard into static, same-origin assets.
+FROM node:24-alpine AS market-dashboard-builder
+
+WORKDIR /app/market_dashboard/frontend
+COPY market_dashboard/frontend/package.json market_dashboard/frontend/package-lock.json ./
+RUN npm ci
+COPY market_dashboard/frontend/ ./
+RUN npm run build
 
 FROM python:3.11-slim
 
@@ -32,6 +38,8 @@ COPY models/ models/
 COPY reference_images/ reference_images/
 COPY static/ static/
 COPY templates/ templates/
+COPY market_dashboard/ market_dashboard/
+COPY --from=market-dashboard-builder /app/market_dashboard/dist/ market_dashboard/dist/
 
 # Create storage directory
 RUN mkdir -p storage
