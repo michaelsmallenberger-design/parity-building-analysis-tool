@@ -25,6 +25,7 @@ demo_report*.html
 registry_options.html
 results.xlsx
 Existing_Market_TAM.xlsx
+addresses.csv
 training/addresses.csv
 training_images/
 training_setup/
