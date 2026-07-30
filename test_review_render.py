@@ -83,6 +83,113 @@ def test_review_contract():
     assert "both Optimizer Fit and Periscope Fit choices" in html
 
 
+def test_carousel_only_sources_first_image_until_navigation():
+    page = build_review_page([_entry()], job_id="lazy-images")
+
+    assert len(re.findall(r'<img src="data:image/jpeg;base64,AAAA"', page)) == 1
+    assert len(re.findall(r'<img data-src="data:image/jpeg;base64,AAAA"', page)) == 2
+    assert page.count('decoding="async"') == 3
+    assert (
+        "if(!current.getAttribute('src')&&current.dataset.src)"
+        "current.src=current.dataset.src"
+    ) in page
+
+
+def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
+    entries = []
+    for number in range(1, 16):
+        entry = {
+            **_entry(),
+            "i": number,
+            "row_id": f"row-{number}",
+            "address": f"{number} Pagination Test Ave",
+            "source_tab": "DC" if number <= 7 else "NYC",
+            "source_row": number + 1,
+            "result_image_url": f"https://images.example/image-{number:03d}-primary.jpg",
+            "result_image_url_wide": f"https://images.example/image-{number:03d}-wide.jpg",
+            "result_image_url_streetview": f"https://images.example/image-{number:03d}-street.jpg",
+        }
+        if number in {1, 2, 8}:
+            entry["human"] = {
+                "hvac_systems": "Cooling Tower",
+                "optimizer_fit": "Good",
+                "periscope_fit": "Bad",
+            }
+        entries.append(entry)
+
+    page = build_review_page(
+        entries,
+        job_id="paged",
+        page=2,
+        page_size=5,
+        page_url="/review/paged?mode=compact&page=99",
+    )
+
+    assert page.count("<article ") == 5
+    for number in range(6, 11):
+        assert f"{number} Pagination Test Ave" in page
+    assert "5 Pagination Test Ave" not in page
+    assert "11 Pagination Test Ave" not in page
+    assert "image-005-primary.jpg" not in page
+    assert "image-011-primary.jpg" not in page
+    assert len(re.findall(r'<img src="https://images\.example/', page)) == 5
+    assert len(re.findall(r'<img data-src="https://images\.example/', page)) == 10
+
+    assert '<span id="done">3</span>/15 reviewed' in page
+    assert (
+        'data-total="7" data-reviewed="2">7/7 analyzed '
+        '· 2/7 reviewed · 2 on this page'
+    ) in page
+    assert (
+        'data-total="8" data-reviewed="1">8/8 analyzed '
+        '· 1/8 reviewed · 3 on this page'
+    ) in page
+    assert "Buildings 6–10 of 15 · page 2 of 3" in page
+    assert 'href="/review/paged?mode=compact&amp;page=1"' in page
+    assert 'href="/review/paged?mode=compact&amp;page=3"' in page
+    assert "Submit all completed on this page" in page
+    assert "const totalInGroup=+progress.dataset.total" in page
+
+
+def test_pagination_is_opt_in_for_legacy_callers():
+    entries = [{**_entry(), "i": number, "address": f"Legacy {number}"} for number in range(12)]
+    page = build_review_page(entries, job_id="legacy-unpaged")
+
+    assert page.count("<article ") == 12
+    assert 'class="pagination"' not in page
+    assert "Submit all completed on this page" not in page
+    assert "Submit all completed</button>" in page
+
+
+def test_191_building_page_stays_bounded():
+    entries = [
+        {
+            **_entry(),
+            "i": number,
+            "row_id": f"large-{number}",
+            "address": f"Pagination Large {number}",
+            "result_image_url": f"https://images.example/{number}-primary.jpg",
+            "result_image_url_wide": f"https://images.example/{number}-wide.jpg",
+            "result_image_url_streetview": f"https://images.example/{number}-street.jpg",
+        }
+        for number in range(1, 192)
+    ]
+    page = build_review_page(
+        entries,
+        job_id="large",
+        page=1,
+        page_size=10,
+        page_url="/review/large",
+    )
+
+    assert page.count("<article ") == 10
+    assert "Pagination Large 10" in page
+    assert "Pagination Large 11" not in page
+    assert len(page.encode("utf-8")) < 100_000
+    assert len(re.findall(r'<img src="https://images\.example/', page)) == 10
+    assert len(re.findall(r'<img data-src="https://images\.example/', page)) == 20
+
+
 def test_positive_result_defaults_cooling_tower_and_optimizer_only():
     page = build_review_page([_entry()], job_id="positive")
 
@@ -271,6 +378,10 @@ def test_legacy_single_batch_stays_compatible():
 
 if __name__ == "__main__":
     test_review_contract()
+    test_carousel_only_sources_first_image_until_navigation()
+    test_server_pagination_limits_dom_and_keeps_global_tab_progress()
+    test_pagination_is_opt_in_for_legacy_callers()
+    test_191_building_page_stays_bounded()
     test_positive_result_defaults_cooling_tower_and_optimizer_only()
     test_possible_cooling_tower_uses_the_same_review_defaults()
     test_saved_human_choices_override_positive_defaults()

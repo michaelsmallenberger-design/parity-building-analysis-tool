@@ -250,7 +250,17 @@
     const diagnosticSummary = document.getElementById('diagnostic-summary');
     const claudeContext = document.getElementById('claude-context');
     const copyDiagnostic = document.getElementById('copy-diagnostic');
-    let pollingInterval;
+    const VISIBLE_POLL_DELAY_MS = 2000;
+    const HIDDEN_POLL_DELAY_MS = 15000;
+    const STATUS_REQUEST_TIMEOUT_MS = 15000;
+    let pollingTimer = null;
+    let pollingStopped = false;
+    let requestInFlight = false;
+    let renderedRowsVersion = '';
+    let currentRowsSignature = '';
+    let finishedRowsSignature = '';
+    let currentActiveCount = 0;
+    let finishedCounts = { terminal: 0, errors: 0 };
     let fetchFailures = 0;
 
     function sourceText(item) {
@@ -327,7 +337,47 @@
         };
     }
 
+    function updateAddressLists(rows) {
+        const activeRows = rows.filter(row =>
+            row.state === 'analyzing' || row.state === 'retrying'
+        );
+        const terminalRows = rows.filter(row =>
+            row.state === 'complete' || row.state === 'attention' || row.state === 'failed'
+        );
+        const nextCurrentSignature = JSON.stringify(activeRows);
+        const nextFinishedSignature = JSON.stringify(terminalRows);
+
+        if (nextCurrentSignature !== currentRowsSignature) {
+            currentActiveCount = renderCurrent(activeRows);
+            currentRowsSignature = nextCurrentSignature;
+        }
+        if (nextFinishedSignature !== finishedRowsSignature) {
+            finishedCounts = renderFinished(terminalRows);
+            finishedRowsSignature = nextFinishedSignature;
+        }
+    }
+
+    function stopPolling() {
+        pollingStopped = true;
+        if (pollingTimer !== null) {
+            clearTimeout(pollingTimer);
+            pollingTimer = null;
+        }
+    }
+
+    function scheduleNextPoll(delay) {
+        if (pollingStopped || pollingTimer !== null || requestInFlight) return;
+        const nextDelay = Number.isFinite(delay)
+            ? delay
+            : (document.hidden ? HIDDEN_POLL_DELAY_MS : VISIBLE_POLL_DELAY_MS);
+        pollingTimer = setTimeout(() => {
+            pollingTimer = null;
+            checkStatus();
+        }, nextDelay);
+    }
+
     function showFinished(data, counts, total) {
+        stopPolling();
         currentPanel.hidden = true;
         runningActions.hidden = true;
         numerator.textContent = total;
@@ -348,7 +398,7 @@
     }
 
     function showFailed(data) {
-        clearInterval(pollingInterval);
+        stopPolling();
         currentPanel.hidden = true;
         runningActions.hidden = true;
         runLabel.textContent = 'The run stopped before every address finished.';
@@ -372,28 +422,46 @@
     });
 
     async function checkStatus() {
+        if (pollingStopped || requestInFlight) return;
+        requestInFlight = true;
+        const controller = new AbortController();
+        const requestTimeout = setTimeout(
+            () => controller.abort(),
+            STATUS_REQUEST_TIMEOUT_MS,
+        );
         try {
-            const response = await fetch(`/status/${encodeURIComponent(jobId)}`);
+            const statusUrl = new URL(
+                `/status/${encodeURIComponent(jobId)}`,
+                window.location.origin,
+            );
+            statusUrl.searchParams.set('compact', '1');
+            if (renderedRowsVersion) {
+                statusUrl.searchParams.set('rows_version', renderedRowsVersion);
+            }
+            const response = await fetch(
+                `${statusUrl.pathname}${statusUrl.search}`,
+                { signal: controller.signal },
+            );
             const data = await response.json();
             if (!response.ok) throw new Error(data.message || 'Could not read run status');
             fetchFailures = 0;
             const total = Number(data.total || initialTotal || 0);
             const progress = Number(data.progress || 0);
-            const rows = Array.isArray(data.rows) ? data.rows : [];
             denominator.textContent = total;
             numerator.textContent = progress;
-            const activeCount = renderCurrent(rows);
-            const counts = renderFinished(rows);
+            if (data.rows_changed !== false && Array.isArray(data.rows)) {
+                updateAddressLists(data.rows);
+                renderedRowsVersion = data.rows_version || JSON.stringify(data.rows);
+            }
 
             if (data.status === 'queued') {
                 runLabel.textContent = 'Waiting for the worker…';
             } else if (data.status === 'processing') {
-                runLabel.textContent = activeCount
-                    ? `${activeCount} address${activeCount === 1 ? '' : 'es'} analyzing now.`
+                runLabel.textContent = currentActiveCount
+                    ? `${currentActiveCount} address${currentActiveCount === 1 ? '' : 'es'} analyzing now.`
                     : 'Analyzing addresses…';
             } else if (data.status === 'finished') {
-                clearInterval(pollingInterval);
-                showFinished(data, counts, total);
+                showFinished(data, finishedCounts, total);
             } else if (data.status === 'failed') {
                 showFailed(data);
             }
@@ -402,6 +470,10 @@
             if (fetchFailures >= 3) {
                 runLabel.textContent = 'Connection interrupted. Retrying automatically…';
             }
+        } finally {
+            clearTimeout(requestTimeout);
+            requestInFlight = false;
+            scheduleNextPoll();
         }
     }
 
@@ -420,7 +492,20 @@
         runLabel.textContent = 'Cancellation requested…';
     });
 
-    pollingInterval = setInterval(checkStatus, 2000);
+    document.addEventListener('visibilitychange', () => {
+        if (pollingStopped) return;
+        if (pollingTimer !== null) {
+            clearTimeout(pollingTimer);
+            pollingTimer = null;
+        }
+        if (requestInFlight) return;
+        if (document.hidden) {
+            scheduleNextPoll(HIDDEN_POLL_DELAY_MS);
+        } else {
+            checkStatus();
+        }
+    });
+
     checkStatus();
 </script>
 {% endblock %}
