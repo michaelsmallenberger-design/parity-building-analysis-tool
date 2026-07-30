@@ -35,12 +35,16 @@ _REFERENCE_DIR_POSITIVE = "reference_images/positive"
 _REFERENCE_DIR_NEGATIVE = "reference_images/negative"
 _REFERENCE_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
+_REFERENCE_MEDIA_RESOLUTION = (
+    types.PartMediaResolutionLevel.MEDIA_RESOLUTION_MEDIUM
+)
 _POSITIVE_REFERENCE_LABEL = (
     "--- Reference: confirmed cooling tower (positive example) ---"
 )
 _NEGATIVE_REFERENCE_LABEL = (
     "--- Reference: human-reviewed RTU / rooftop-unit false positive; "
-    "green boxes are rejected YOLO candidates; NOT a cooling tower ---"
+    "negative because a human rejected the equipment, not because its "
+    "neutral YOLO candidate box is green; NOT a cooling tower ---"
 )
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
@@ -185,11 +189,19 @@ RTU / PACKAGED ROOFTOP UNIT vs COOLING TOWER — a recurring YOLO false positive
 - One circular fan, several small fan grilles, or a box selected by YOLO is NOT
   enough evidence. YOLO frequently boxes RTUs, VRF condensers, exhaust fans,
   and air handlers as cooling towers.
-- Use a positive cooling-tower verdict only when you can cite at least TWO
-  cooling-tower-specific features beyond "it has a fan." If the object more
-  closely matches a human-reviewed negative reference, return the appropriate
-  negative verdict and explicitly identify it in the reasoning as a likely RTU,
-  rooftop condenser, exhaust fan, or air handler.
+- Every numbered YOLO candidate box is green regardless of what equipment it
+  contains; green is a neutral locator, never evidence of an RTU, a negative
+  result, or a cooling tower.
+- Cooling towers and RTU/VRF equipment are NOT mutually exclusive; the same
+  target roof may contain both. Judge each distinct unit independently (and
+  every numbered box when present). A negative-reference match rejects only
+  that matched unit; it must not cancel a separate unit with at least TWO
+  cooling-tower-specific features.
+- For whole-roof/address verdicts, return the appropriate positive verdict if
+  any real cooling tower serves the target, even when RTUs are also present;
+  return a negative verdict only when none does. For a single-candidate verdict,
+  judge only the current candidate. In the reasoning, identify both types when
+  both are visible.
 """.strip()
 
 
@@ -270,7 +282,7 @@ When evaluating the candidate in Image A, compare its features against the posit
 
 _REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
 
 Treat these as strong exclusion anchors. If the candidate in Image A more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "not_detected" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
 
@@ -345,9 +357,9 @@ When scanning the target rooftop in the satellite tile, compare what you see aga
 
 _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
 
-Treat these as strong exclusion anchors. If equipment on the target rooftop more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "no_cooling_tower" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
+Treat these as strong exclusion anchors for each matching unit, not for the roof as a whole. Reject equipment that resembles these compact, solid-topped rooftop units or small fan grids, explicitly identifying it as a likely RTU, rooftop condenser, exhaust fan, or air handler, then continue scanning the rest of the target. Use "no_cooling_tower" only when no separate real cooling tower serves the target."""
 
 _ADDRESS_REFERENCE_BLOCK_POSITIVE = """
 
@@ -357,9 +369,9 @@ Compare every numbered box and any unboxed equipment on the target rooftop again
 
 _ADDRESS_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
 
-Treat these as strong exclusion anchors. If a numbered box or other equipment on the target rooftop more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "not_detected" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
+Treat these as strong exclusion anchors for each matching unit, not for the address as a whole. Reject a numbered box or other equipment that resembles these compact, solid-topped rooftop units or small fan grids, explicitly identifying it as a likely RTU, rooftop condenser, exhaust fan, or air handler, then continue checking every other box and unboxed roof area. Use "not_detected" only when no separate real cooling tower serves the target."""
 
 
 class _VerificationResponse(BaseModel):
@@ -474,6 +486,7 @@ def _append_gemini_reference_parts(
             types.Part.from_bytes(
                 data=image_bytes,
                 mime_type=_image_mime_type(image_bytes),
+                media_resolution=_REFERENCE_MEDIA_RESOLUTION,
             )
         )
     for image_bytes in negative_images:
@@ -482,6 +495,7 @@ def _append_gemini_reference_parts(
             types.Part.from_bytes(
                 data=image_bytes,
                 mime_type=_image_mime_type(image_bytes),
+                media_resolution=_REFERENCE_MEDIA_RESOLUTION,
             )
         )
 
