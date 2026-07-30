@@ -23,6 +23,11 @@ PERI_FIT_COL = "Periscope Fit"
 DUAL_FIT_COLUMNS = [OPT_FIT_COL, PERI_FIT_COL]
 DUAL_FIT_OPTIONS = ["Customer", "Good", "Okay", "Bad", "Not Sure"]
 CURRENT_REVIEW_SCHEMA = DUAL_FIT_SCHEMA
+MACHINE_ATTENTION_VERDICTS = frozenset({
+    "ambiguous_footprint",
+    "likely_residential",
+    "needs_review",
+})
 
 
 def _norm(value: Any) -> str:
@@ -107,3 +112,30 @@ def human_is_complete(human: dict[str, Any] | None, review_schema: str) -> bool:
 
 def entry_is_reviewed(entry: dict[str, Any], review_schema: str) -> bool:
     return human_is_complete(entry.get("human"), review_schema)
+
+
+def entry_has_machine_attention(entry: dict[str, Any] | None) -> bool:
+    """Whether the machine result needs a human disposition.
+
+    A completed human review resolves this condition; Sheet write-back errors
+    are tracked separately because they remain actionable after review.
+    """
+    entry = entry or {}
+    if str(entry.get("error") or "").strip():
+        return True
+    if not str(entry.get("address") or "").strip():
+        return True
+    verdict = _norm(entry.get("verdict"))
+    return not verdict or verdict in MACHINE_ATTENTION_VERDICTS
+
+
+def entry_needs_attention(
+    entry: dict[str, Any] | None,
+    review_schema: str,
+) -> bool:
+    """Machine attention that has not yet been human-dispositioned."""
+    entry = entry or {}
+    return (
+        entry_has_machine_attention(entry)
+        and not entry_is_reviewed(entry, review_schema)
+    )

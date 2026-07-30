@@ -7,13 +7,16 @@ import html as _html
 import json
 import urllib.parse
 
+from failure_diagnostics import sanitize_failure_text
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_COLUMNS,
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
     FIT_OPTIONS,
+    MACHINE_ATTENTION_VERDICTS,
     SINGLE_FIT_SCHEMA,
+    entry_has_machine_attention,
     entry_is_reviewed,
 )
 
@@ -47,6 +50,12 @@ VERDICT_COLOR = {
     "neighbor_only": "#f59f00", "needs_review": "#f59f00",
     "likely_residential": "#868e96", "not_detected": "#e8590c", "": "#868e96",
 }
+_REVIEW_STATE_ORDER = ("reviewed", "pending", "attention")
+_REVIEW_STATE_LABELS = {
+    "reviewed": "Completed reviews",
+    "pending": "Still needs review",
+    "attention": "Needs attention",
+}
 
 
 def _fmt_conf(c):
@@ -77,7 +86,64 @@ def _model_boxes(e, reasoning):
     return out
 
 
-def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
+def _machine_attention_reason(e):
+    """Return a safe, operator-facing reason when a row is not review-ready."""
+    writeback = e.get("writeback") or {}
+    if writeback.get("status") == "error":
+        detail = sanitize_failure_text(
+            writeback.get("error") or "Google Sheet write-back failed",
+            limit=240,
+        )
+        return f"Review saved locally, but the Sheet was not updated: {detail}"
+
+    error = str(e.get("error") or "").strip()
+    if error:
+        return sanitize_failure_text(error, limit=240)
+
+    address = str(e.get("address") or "").strip()
+    if not address:
+        return "No usable address was available for this source row."
+
+    verdict = str(e.get("verdict") or "").strip().casefold()
+    if not verdict:
+        return "No machine verdict was produced for this address."
+    if verdict in MACHINE_ATTENTION_VERDICTS:
+        detail = str(e.get("notes") or e.get("reasoning") or "").strip()
+        if detail:
+            return sanitize_failure_text(detail, limit=240)
+        return {
+            "ambiguous_footprint": (
+                "The address could not be matched confidently to one building footprint."
+            ),
+            "likely_residential": (
+                "The footprint size gate skipped visual model verification; "
+                "manual confirmation is required."
+            ),
+            "needs_review": "The machine result requires manual confirmation.",
+        }[verdict]
+    return ""
+
+
+def _review_state(e, review_schema):
+    """Classify without mutating persisted entry order or human decisions."""
+    if (e.get("writeback") or {}).get("status") == "error":
+        return "attention", _machine_attention_reason(e)
+    if entry_is_reviewed(e, review_schema):
+        return "reviewed", ""
+    if entry_has_machine_attention(e):
+        return "attention", _machine_attention_reason(e)
+    return (
+        "pending",
+        "Analysis is complete, but this row has not been submitted to the Sheet.",
+    )
+
+
+def _card(
+    e,
+    review_schema=CURRENT_REVIEW_SCHEMA,
+    review_state=None,
+    issue_reason="",
+):
     # A batch entry carries a "human" decision once reviewed (review_store); render
     # such cards in the exact state a live Submit leaves them in, so reopening the
     # page mid-batch shows what's already done.
@@ -89,8 +155,10 @@ def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
     rid = _html.escape(str(
         e.get("row_id") if e.get("row_id") is not None else e.get("i", "")
     ))
-    addr = str(e.get("address", ""))
-    addr_e = _html.escape(addr)
+    addr = str(e.get("address", "")).strip()
+    addr_display = addr or "(address unavailable)"
+    addr_e = _html.escape(addr_display)
+    addr_attr = _html.escape(addr, quote=True)
     ai = str(e.get("verdict") or "")
     ai_positive = ai.strip().casefold() in _AI_POSITIVE
     ai_color = VERDICT_COLOR.get(ai, "#868e96")
@@ -180,13 +248,31 @@ def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
             f'· row {_html.escape(str(e.get("source_row") or ""))}</div>'
         )
     button_text = "Retry Sheet write-back" if writeback_error else "Submit"
+    review_state = review_state or _review_state(e, review_schema)[0]
+    state_class = (
+        f" {review_state}"
+        if review_state in {"pending", "attention"}
+        else ""
+    )
+    issue = ""
+    if issue_reason:
+        issue_label = (
+            "Needs attention"
+            if review_state == "attention"
+            else "Still needs review"
+        )
+        issue = (
+            f'<div class="issue {review_state}"><strong>{issue_label}:</strong> '
+            f'{_html.escape(issue_reason)}</div>'
+        )
 
     return f'''
-<article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_error else ''}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-addr="{addr_e}" data-ai="{_html.escape(ai)}">
+<article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_error else ''}{state_class}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-review-state="{review_state}" data-addr="{addr_attr}" data-ai="{_html.escape(ai)}">
   <div class="head">
     <div><div class="addr">{addr_e}</div>{source}</div>
     <div class="ai">model: <span class="badge" style="background:{ai_color}">{_html.escape(ai) or '—'}</span></div>
   </div>
+  {issue}
   {carousel}
   <div class="links">
     <a href="{gmaps}" target="_blank" rel="noopener">\U0001f4cd Google Maps</a>
@@ -218,6 +304,16 @@ def build_review_page(
     """
     entries = list(entries)
     total = len(entries)
+    entry_records = [
+        (entry, *_review_state(entry, review_schema))
+        for entry in entries
+    ]
+    ordered_records = [
+        record
+        for state in _REVIEW_STATE_ORDER
+        for record in entry_records
+        if record[1] == state
+    ]
     pagination_enabled = (
         isinstance(page_size, int)
         and not isinstance(page_size, bool)
@@ -231,24 +327,37 @@ def build_review_page(
             current_page = 1
         current_page = min(max(current_page, 1), total_pages)
         page_start = (current_page - 1) * page_size
-        visible_entries = entries[page_start:page_start + page_size]
+        visible_records = ordered_records[page_start:page_start + page_size]
     else:
         total_pages = 1
         current_page = 1
         page_start = 0
-        visible_entries = entries
+        visible_records = ordered_records
+    visible_entries = [record[0] for record in visible_records]
 
     all_grouped = {}
     for entry in entries:
         all_grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
-    visible_grouped = {}
-    for entry in visible_entries:
-        visible_grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
-    if len(all_grouped) == 1 and "" in all_grouped:
-        cards = "\n".join(_card(e, review_schema) for e in visible_entries)
-    else:
-        sections = []
-        for tab, tab_entries in visible_grouped.items():
+    sections = []
+    for state in _REVIEW_STATE_ORDER:
+        state_records = [record for record in visible_records if record[1] == state]
+        if not state_records:
+            continue
+        state_total = sum(1 for record in entry_records if record[1] == state)
+        state_visible = len(state_records)
+        state_context = (
+            f" · {state_visible} on this page"
+            if pagination_enabled and state_visible != state_total
+            else ""
+        )
+        visible_grouped = {}
+        for entry, _entry_state, reason in state_records:
+            visible_grouped.setdefault(
+                str(entry.get("source_tab") or ""), []
+            ).append((entry, reason))
+        state_sections = []
+        for tab, tab_records in visible_grouped.items():
+            tab_entries = [record[0] for record in tab_records]
             all_tab_entries = all_grouped[tab]
             tab_done = sum(
                 1 for entry in all_tab_entries
@@ -259,21 +368,33 @@ def build_review_page(
                 if pagination_enabled and len(tab_entries) != len(all_tab_entries)
                 else ""
             )
-            sections.append(
-                f'<section class="tab-group"><div class="tab-head">'
-                f'<h2>{_html.escape(tab or "Other")}</h2>'
-                f'<span class="tab-progress" data-total="{len(all_tab_entries)}" '
-                f'data-reviewed="{tab_done}">{len(all_tab_entries)}/{len(all_tab_entries)} analyzed '
-                f'· {tab_done}/{len(all_tab_entries)} reviewed{page_context}</span></div>'
-                + "\n".join(_card(entry, review_schema) for entry in tab_entries)
+            tab_heading = ""
+            if len(all_grouped) > 1 or tab:
+                tab_heading = (
+                    f'<div class="tab-head"><h2>{_html.escape(tab or "Other")}</h2>'
+                    f'<span class="tab-progress" data-total="{len(all_tab_entries)}" '
+                    f'data-reviewed="{tab_done}">{len(all_tab_entries)}/{len(all_tab_entries)} analyzed '
+                    f'· {tab_done}/{len(all_tab_entries)} reviewed{page_context}</span></div>'
+                )
+            state_sections.append(
+                f'<section class="tab-group">{tab_heading}'
+                + "\n".join(
+                    _card(entry, review_schema, state, reason)
+                    for entry, reason in tab_records
+                )
                 + "</section>"
             )
-        cards = "\n".join(sections)
+        sections.append(
+            f'<section class="review-state-group {state}">'
+            f'<div class="state-head"><h2>{_REVIEW_STATE_LABELS[state]}</h2>'
+            f'<span>{state_total}{state_context}</span></div>'
+            + "\n".join(state_sections)
+            + "</section>"
+        )
+    cards = "\n".join(sections)
     done0 = sum(1 for e in entries if entry_is_reviewed(e, review_schema))
-    attention0 = sum(
-        1 for e in entries
-        if e.get("error") and not entry_is_reviewed(e, review_schema)
-    )
+    pending0 = sum(1 for record in entry_records if record[1] == "pending")
+    attention0 = sum(1 for record in entry_records if record[1] == "attention")
     if pagination_enabled:
         base_url = str(page_url or "")
 
@@ -338,14 +459,25 @@ body{{margin:0;background:#0d0f12;color:#e6e8eb;font:15px/1.5 -apple-system,Sego
 header{{position:sticky;top:0;z-index:5;background:#12151a;border-bottom:1px solid #262b33;padding:14px 20px}}
 header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;margin-top:2px}}
 .wrap{{max-width:900px;margin:0 auto;padding:18px}}
+.review-state-group{{margin:0 0 28px}}
+.state-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;
+ margin:6px 2px 14px;padding:10px 12px;border-radius:10px;background:#161a20;border:1px solid #262b33}}
+.state-head h2{{margin:0;font-size:18px}}.state-head span{{color:#9aa3ad;font-size:12px}}
+.review-state-group.pending .state-head{{border-color:#375a7f}}
+.review-state-group.attention .state-head{{border-color:#c92a2a;background:#271416}}
 .tab-group{{margin:0 0 28px}}.tab-head{{display:flex;justify-content:space-between;align-items:center;
  gap:12px;margin:6px 2px 12px;padding-bottom:8px;border-bottom:1px solid #333b45}}
 .tab-head h2{{margin:0;font-size:18px}}.tab-head span,.source{{color:#9aa3ad;font-size:12px}}
 .card{{background:#161a20;border:1px solid #262b33;border-radius:12px;padding:16px;margin:0 0 16px}}
 .card.done{{border-color:#2f9e44;opacity:.85}}
 .card.writeback-error{{border-color:#f59f00;opacity:1}}
+.card.pending{{border-color:#375a7f}}
+.card.attention{{border-color:#e03131;opacity:1}}
 .head{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
 .addr{{font-weight:600}}.badge{{color:#0d0f12;font-weight:700;font-size:12px;padding:2px 8px;border-radius:20px}}
+.issue{{margin:12px 0;padding:10px 12px;border-radius:8px;font-size:13px}}
+.issue.pending{{background:#10243a;border:1px solid #375a7f;color:#d7e9fb}}
+.issue.attention{{background:#321719;border:1px solid #e03131;color:#ffd8d8}}
 .carousel{{position:relative;margin:12px 0;background:#0b0d10;border:1px solid #222833;border-radius:10px}}
 .frame{{text-align:center;min-height:320px;display:flex;align-items:center;justify-content:center}}
 .frame img{{display:none;max-width:100%;max-height:60vh;border-radius:8px;cursor:zoom-in}}
@@ -391,7 +523,7 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 @media(max-width:560px){{.pagination{{gap:8px}}.page-link{{font-size:12px}}.page-summary{{font-size:11px}}}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
-<div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · {attention0} need attention · every Submit writes to the source tab</div></header>
+<div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · <span id="pending-count">{pending0}</span> still need review · <span id="attention-count">{attention0}</span> need attention · every Submit writes to the source tab</div></header>
 <div class="wrap">{pagination}{cards}</div>
 <div class="bulk-review">
   <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card{' on this page' if pagination_enabled else ''} that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
@@ -415,7 +547,7 @@ function toggle(chip){{
 }}
 function pickFit(chip){{chip.parentElement.querySelectorAll('.fitchip').forEach(c=>c.classList.remove('sel'));chip.classList.add('sel');}}
 document.querySelectorAll('.carousel').forEach(setCap);
-async function submitCard(btn){{
+async function submitCard(btn,reloadAfterSave=true){{
   const card=btn.closest('.card');
   const sys=[...card.querySelectorAll('.chip.sel')].map(c=>c.dataset.sys);
   const status=card.querySelector('.status');
@@ -450,17 +582,25 @@ async function submitCard(btn){{
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
     status.textContent='✓ saved: '+payload.hvac_systems+(payload.fit?' · Fit: '+payload.fit:'')+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
     const wasReviewed=card.dataset.reviewed==='1';
-    card.classList.add('done');card.classList.remove('writeback-error');
+    const previousState=card.dataset.reviewState||'';
+    card.classList.add('done');card.classList.remove('writeback-error','pending','attention');
+    card.dataset.reviewState='reviewed';
+    const issue=card.querySelector('.issue');if(issue)issue.remove();
+    if(previousState==='pending'||previousState==='attention'){{
+      const stateCount=document.getElementById(previousState+'-count');
+      if(stateCount)stateCount.textContent=Math.max(0,(+stateCount.textContent||0)-1);
+    }}
     card.dataset.reviewed='1';card.querySelectorAll('.chip,.fitchip,.note').forEach(c=>c.disabled=true);
     if(!wasReviewed){{done++;document.getElementById('done').textContent=done;}}
     const group=card.closest('.tab-group');
     if(group&&!wasReviewed){{const progress=group.querySelector('.tab-progress');
-      const totalInGroup=+progress.dataset.total;
-      const doneInGroup=(+progress.dataset.reviewed)+1;
-      progress.dataset.reviewed=doneInGroup;
-      const onPage=group.querySelectorAll('.card').length;
-      const pageContext=onPage!==totalInGroup?' · '+onPage+' on this page':'';
-      progress.textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed'+pageContext;}}
+      if(progress){{const totalInGroup=+progress.dataset.total;
+        const doneInGroup=(+progress.dataset.reviewed)+1;
+        progress.dataset.reviewed=doneInGroup;
+        const onPage=group.querySelectorAll('.card').length;
+        const pageContext=onPage!==totalInGroup?' · '+onPage+' on this page':'';
+        progress.textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed'+pageContext;}}}}
+    if(reloadAfterSave)window.location.reload();
     return 'saved';
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
 }}
@@ -483,7 +623,7 @@ async function submitAll(){{
   bulk.disabled=true;setBulkStatus('Saving '+ready.length+' completed card'+(ready.length===1?'':'s')+'...');
   let saved=0,failed=0;
   for(const card of ready){{
-    const result=await submitCard(card.querySelector('.submit'));
+    const result=await submitCard(card.querySelector('.submit'),false);
     if(result==='saved')saved++;else failed++;
   }}
   bulk.disabled=false;
@@ -491,6 +631,7 @@ async function submitAll(){{
   if(skipped)parts.push(skipped+' skipped - needs HVAC or Fit');
   if(failed)parts.push(failed+' need retry');
   setBulkStatus(parts.join(' Â· '),(skipped||failed)?'err':'ok');
+  if(saved)window.location.reload();
 }}
 </script></body></html>'''
 

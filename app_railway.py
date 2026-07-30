@@ -40,6 +40,7 @@ from review_contract import (
     FIT_COL,
     SINGLE_FIT_SCHEMA,
     entry_is_reviewed,
+    entry_needs_attention,
 )
 import review_store
 import sheets_writer
@@ -1268,7 +1269,7 @@ def api_review():
             )
             unresolved_attention = sum(
                 1 for entry in entries
-                if entry.get("error") and not entry_is_reviewed(entry, review_schema)
+                if entry_needs_attention(entry, review_schema)
             )
             workbook_runs.update_review_progress(
                 run_id, reviewed, len(entries),

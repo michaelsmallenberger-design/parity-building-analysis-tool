@@ -35,6 +35,13 @@ _REFERENCE_DIR_POSITIVE = "reference_images/positive"
 _REFERENCE_DIR_NEGATIVE = "reference_images/negative"
 _REFERENCE_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
+_POSITIVE_REFERENCE_LABEL = (
+    "--- Reference: confirmed cooling tower (positive example) ---"
+)
+_NEGATIVE_REFERENCE_LABEL = (
+    "--- Reference: human-reviewed RTU / rooftop-unit false positive; "
+    "green boxes are rejected YOLO candidates; NOT a cooling tower ---"
+)
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
 _MAX_PROVIDER_ATTEMPTS = 3  # initial request plus at most two retries
@@ -164,6 +171,33 @@ def _grok_fallback_unavailable_result(gemini_result: dict) -> dict:
 _POSITIVE_VERDICTS = frozenset({"confirmed", "likely", "cooling_tower_present", "cooling_tower_possible"})
 _NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only", "no_cooling_tower"})
 
+_RTU_VS_COOLING_TOWER_GUIDANCE = """
+RTU / PACKAGED ROOFTOP UNIT vs COOLING TOWER — a recurring YOLO false positive:
+
+- An RTU, VRF condenser, or air-cooled rooftop unit is usually a low rectangular
+  sheet-metal cabinet with one or more small circular condenser-fan grilles on
+  a mostly solid top. It may connect to ducts or sit on a roof curb. A row or
+  grid of small fans on compact cabinets is still often RTU/VRF equipment.
+- A real cooling tower needs cooling-tower-specific heat-rejection structure,
+  not merely a visible fan: an elevated fan stack or shroud, large open/louvered
+  intake faces, tower-cell and basin geometry, visible wet-fill or coil banks,
+  and/or large connected tower piping.
+- One circular fan, several small fan grilles, or a box selected by YOLO is NOT
+  enough evidence. YOLO frequently boxes RTUs, VRF condensers, exhaust fans,
+  and air handlers as cooling towers.
+- Use a positive cooling-tower verdict only when you can cite at least TWO
+  cooling-tower-specific features beyond "it has a fan." If the object more
+  closely matches a human-reviewed negative reference, return the appropriate
+  negative verdict and explicitly identify it in the reasoning as a likely RTU,
+  rooftop condenser, exhaust fan, or air handler.
+""".strip()
+
+
+def _system_instruction(base_prompt: str) -> str:
+    """Apply the same RTU false-positive guard to every VLM verification path."""
+    return f"{base_prompt}\n\n{_RTU_VS_COOLING_TOWER_GUIDANCE}"
+
+
 _SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
 
 Your task is to verify whether a candidate detection by a YOLO computer-vision model on satellite imagery is a real cooling tower on a specific target building. Your verdict drives a B2B sales pipeline; accuracy matters, and ambiguous cases should be flagged honestly rather than guessed.
@@ -223,12 +257,12 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 
 Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest")."""
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest"). For "confirmed" or "likely", cite at least two cooling-tower-specific features and explain why the object is not an RTU. For "not_detected", name the false-positive equipment type when visible, especially RTU, rooftop condenser, exhaust fan, or air handler."""
 
 _REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the candidate tile may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
+Along with Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the candidate tile may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -236,7 +270,9 @@ When evaluating the candidate in Image A, compare its features against the posit
 
 _REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if the candidate in Image A more closely resembles a negative reference than any positive reference, lean toward "not_detected"."""
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors. If the candidate in Image A more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "not_detected" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
 
 
 _ROOFTOP_SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
@@ -296,12 +332,12 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 
 Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. For "cooling_tower_present" or "cooling_tower_possible", cite at least two cooling-tower-specific features and explain why the equipment is not an RTU. For "no_cooling_tower", name the lookalike when visible, especially RTU, rooftop condenser, exhaust fan, or air handler. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
 
 _ROOFTOP_REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the tile you are scanning may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
+Along with the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the tile you are scanning may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -309,7 +345,21 @@ When scanning the target rooftop in the satellite tile, compare what you see aga
 
 _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if equipment on the target rooftop more closely resembles a negative reference than any positive reference, lean toward "no_cooling_tower"."""
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors. If equipment on the target rooftop more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "no_cooling_tower" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
+
+_ADDRESS_REFERENCE_BLOCK_POSITIVE = """
+
+You will also receive {n_pos} confirmed-positive reference image(s) showing real cooling towers from overhead. These examples are visual anchors for cooling-tower-specific structure, such as substantial fan stacks or shrouds, large louvered/open intake faces, tower-cell and basin geometry, and connected tower piping.
+
+Compare every numbered box and any unboxed equipment on the target rooftop against these positive examples. Use "confirmed" or "likely" only when the target equipment shares at least two cooling-tower-specific features."""
+
+_ADDRESS_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
+
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. Each GREEN box marks a YOLO proposal that the human reviewer rejected, and a crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors. If a numbered box or other equipment on the target rooftop more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "not_detected" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
 
 
 class _VerificationResponse(BaseModel):
@@ -369,11 +419,19 @@ def _strip_md_fences(text: str) -> str:
     return s.strip()
 
 
-def _to_image_url_part(jpeg_bytes: bytes) -> dict:
-    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+def _image_mime_type(image_bytes: bytes) -> str:
+    """Identify the two repository-supported image formats without decoding."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    return "image/jpeg"
+
+
+def _to_image_url_part(image_bytes: bytes) -> dict:
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    mime_type = _image_mime_type(image_bytes)
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
     }
 
 
@@ -404,6 +462,40 @@ def _load_reference_dir(dir_path: str) -> list[bytes]:
 
 def _load_reference_images() -> tuple[list[bytes], list[bytes]]:
     return _load_reference_dir(_REFERENCE_DIR_POSITIVE), _load_reference_dir(_REFERENCE_DIR_NEGATIVE)
+
+
+def _append_gemini_reference_parts(
+    contents: list, positive_images: list[bytes], negative_images: list[bytes],
+) -> None:
+    """Append few-shot images with labels that explain human-reviewed negatives."""
+    for image_bytes in positive_images:
+        contents.append(_POSITIVE_REFERENCE_LABEL)
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=_image_mime_type(image_bytes),
+            )
+        )
+    for image_bytes in negative_images:
+        contents.append(_NEGATIVE_REFERENCE_LABEL)
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=_image_mime_type(image_bytes),
+            )
+        )
+
+
+def _append_openai_reference_parts(
+    content_parts: list, positive_images: list[bytes], negative_images: list[bytes],
+) -> None:
+    """Mirror Gemini's labeled references for the emergency Grok fallback."""
+    for image_bytes in positive_images:
+        content_parts.append({"type": "text", "text": _POSITIVE_REFERENCE_LABEL})
+        content_parts.append(_to_image_url_part(image_bytes))
+    for image_bytes in negative_images:
+        content_parts.append({"type": "text", "text": _NEGATIVE_REFERENCE_LABEL})
+        content_parts.append(_to_image_url_part(image_bytes))
 
 
 def _encode_jpeg(img: Image.Image) -> bytes:
@@ -498,8 +590,8 @@ def _build_prompt(
     reference_block = ""
     if n_pos > 0:
         reference_block = _REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+    if n_neg > 0:
+        reference_block += _REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -549,8 +641,8 @@ def _build_rooftop_prompt(
     reference_block = ""
     if n_pos > 0:
         reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+    if n_neg > 0:
+        reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _ROOFTOP_USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -631,7 +723,7 @@ Set "image_unusable": true ONLY if you cannot properly judge the target building
 
 Set "frame_inadequate": true ONLY when you are about to call "not_detected" or "neighbor_only" AND the image is zoomed in tightly enough that a GROUND-MOUNTED cooling tower serving the target could be sitting just outside the frame — i.e. the target building fills most of the view and you cannot see the immediately-adjacent ground, pads, yards, alleys, or mechanical enclosures where such a unit would sit. This tells the system to re-pull a WIDER view and look again. Think this through deliberately before setting it: if the surroundings you can ALREADY see are enough to rule out a ground-mounted unit, set false. And if you have ALREADY found a real cooling tower serving the target (a "confirmed" or "likely" verdict), set it false — you already have the information you need, so there is no reason to look elsewhere. This is separate from "image_unusable" (which is about the target's roof not being visible at all).
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). For "confirmed" or "likely", cite at least two cooling-tower-specific features and explain why the equipment is not an RTU. For "not_detected", name the false-positive equipment type when visible, especially RTU, rooftop condenser, exhaust fan, or air handler. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
 
 
 _ADDRESS_CLOSEUP_BLOCK = """
@@ -681,9 +773,9 @@ def _build_address_prompt(
 
     reference_block = ""
     if n_pos > 0:
-        reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+        reference_block = _ADDRESS_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
+    if n_neg > 0:
+        reference_block += _ADDRESS_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _ADDRESS_USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -760,12 +852,7 @@ def _verify_gemini(
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Image A (candidate crop) ---")
     contents.append(types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"))
     contents.append("--- Image B (full satellite tile) ---")
@@ -776,7 +863,7 @@ def _verify_gemini(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -870,12 +957,7 @@ def _verify_gemini_rooftop(
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Satellite tile (target building centered) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
     if context_bytes is not None:
@@ -884,7 +966,7 @@ def _verify_gemini_rooftop(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_ROOFTOP_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_ROOFTOP_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_RooftopResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -981,12 +1063,7 @@ def _verify_grok(
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Image A (candidate crop) ---"})
     content_parts.append(_to_image_url_part(crop_bytes))
     content_parts.append({"type": "text", "text": "--- Image B (full satellite tile) ---"})
@@ -996,7 +1073,7 @@ def _verify_grok(
         content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 
@@ -1112,12 +1189,7 @@ def _verify_grok_rooftop(
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Satellite tile (target building centered) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
     if context_bytes is not None:
@@ -1125,7 +1197,7 @@ def _verify_grok_rooftop(
         content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
-        {"role": "system", "content": _ROOFTOP_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_ROOFTOP_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 
@@ -1244,12 +1316,7 @@ def _verify_gemini_address(
                                    has_closeup=closeup_bytes is not None)
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Satellite tile (target footprint in red, YOLO candidates numbered) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
     if context_bytes is not None:
@@ -1261,7 +1328,7 @@ def _verify_gemini_address(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_ADDRESS_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_ADDRESS_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -1360,12 +1427,7 @@ def _verify_grok_address(
                                    has_closeup=closeup_bytes is not None)
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Satellite tile (target footprint in red, YOLO candidates numbered) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
     if context_bytes is not None:
@@ -1376,7 +1438,7 @@ def _verify_grok_address(
         content_parts.append(_to_image_url_part(closeup_bytes))
 
     messages = [
-        {"role": "system", "content": _ADDRESS_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_ADDRESS_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 

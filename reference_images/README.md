@@ -2,8 +2,7 @@
 
 These images are loaded by `vlm.py` and sent with VLM verification calls as
 few-shot examples. They teach the model what cooling towers look like from
-overhead satellite imagery. Positive examples are currently populated; negative
-lookalike examples are a known follow-up.
+overhead satellite imagery and what common rooftop false positives look like.
 
 ## Loading behavior
 
@@ -14,8 +13,9 @@ lookalike examples are a known follow-up.
 
 ## Positive examples (cooling towers)
 
-All sourced from the Roboflow training set (`mikes-workspace-ugvwl/parity-cooling-tower`).
-Yellow boxes are the original labels — they help Gemini focus on the equipment.
+All sourced from the Roboflow training set
+(`mikes-workspace-ugvwl/parity-cooling-tower`). Yellow boxes are the original
+labels; they help Gemini focus on the equipment.
 
 | File | Variety |
 |---|---|
@@ -25,11 +25,24 @@ Yellow boxes are the original labels — they help Gemini focus on the equipment
 | `04_side_by_side_different_buildings.png` | Two single cells on different adjacent buildings (footprint filter test case) |
 | `05_two_singlecells_same_building.png` | Two single cells on the same building, side-by-side |
 
-## Negative examples (lookalikes - not yet populated)
+## Negative examples (human-reviewed RTU false positives)
 
-Pull 3-5 from the `hard_negatives` folder in Roboflow. Suggested coverage:
-- Rectangular RTU / air handler (boxy, no fan)
-- Round exhaust fan or vent (smaller than a cooling tower)
-- Satellite dish (round with mounting hardware)
-- Skylight grid (crosshatch pattern)
-- Wooden water tank (cylinder, common on NYC rooftops)
+The three anonymous JPEGs in `negative/` came from production rows that a human
+reviewer explicitly marked as false positives for future reference. They are
+de-identified, equipment-only contact sheets: surrounding buildings, streets,
+and location context were removed before publication. They show RTUs, rooftop
+condensers, exhaust fans, or air handlers that YOLO proposed as cooling towers.
+
+Green boxes identify YOLO candidates that the reviewer rejected. A crop may
+retain a fragment of the red target-building outline. Those annotations are
+location aids, not equipment features.
+
+Only add a production image here after a human reviewer has explicitly
+classified it as a false positive. Keep filenames anonymous and do not include
+customer addresses or other source-sheet contents.
+
+| File | Variety |
+|---|---|
+| `01_human_reviewed_rtu_false_positive.jpg` | Three compact rooftop units and small fan grids |
+| `02_human_reviewed_rtu_false_positive.jpg` | Two RTU / condenser false positives |
+| `03_human_reviewed_rtu_false_positive.jpg` | RTU / exhaust-fan false positive |

@@ -3,6 +3,7 @@ Background worker thread that processes jobs from the queue.
 Replaces Google Cloud Tasks with in-process threading.
 """
 import os
+import re
 import time
 import logging
 import threading
@@ -21,6 +22,7 @@ from storage_helpers import (
 )
 from tasks_local import process_address_list
 from failure_diagnostics import build_failure_diagnostic
+from review_contract import entry_has_machine_attention
 
 log = logging.getLogger("worker")
 
@@ -37,6 +39,149 @@ def _advanced_row_checkpoint(data, checkpointed_count):
         "schema_version": 2,
         "row_results": row_results,
     }, len(row_results)
+
+
+def _normalize_address(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _machine_attention_message(entry):
+    error = str((entry or {}).get("error") or "").strip()
+    if error:
+        return error
+    notes = str((entry or {}).get("notes") or "").strip()
+    if notes:
+        return notes
+    verdict = str((entry or {}).get("verdict") or "").strip()
+    if verdict:
+        return f"Machine result '{verdict}' requires human confirmation"
+    return "No machine verdict was produced for this address"
+
+
+def _machine_terminal_live_update(entry):
+    needs_attention = entry_has_machine_attention(entry)
+    message = (
+        _machine_attention_message(entry)
+        if needs_attention
+        else "Machine analysis finished"
+    )
+    return {
+        "state": "attention" if needs_attention else "complete",
+        "message": message,
+        "error": str((entry or {}).get("error") or "") or (
+            message if needs_attention else ""
+        ),
+        "model_result": str((entry or {}).get("verdict") or ""),
+    }
+
+
+def _expand_workbook_chunk_entries(chunk, web_results):
+    """Attach each result to its source rows without trusting list truncation.
+
+    The normal processor returns one ordered result per unique address. If that
+    contract is ever violated, match the surviving results by address and leave
+    the absent items for the explicit missing-result placeholders created at
+    finalization. This prevents a shifted ``zip`` from writing one building's
+    analysis onto another building's source row.
+    """
+    items = list(chunk.get("items", []))
+    usable_results = [
+        entry for entry in (web_results or [])
+        if isinstance(entry, dict)
+    ]
+    positional_match = (
+        len(usable_results) == len(items)
+        and all(
+            _normalize_address(entry.get("address"))
+            == _normalize_address(item.get("address"))
+            for item, entry in zip(items, usable_results)
+        )
+    )
+    if positional_match:
+        matched = list(zip(items, usable_results))
+    else:
+        results_by_address = {}
+        for entry in usable_results:
+            key = _normalize_address(entry.get("address"))
+            if key:
+                results_by_address.setdefault(key, []).append(entry)
+        matched = []
+        for item in items:
+            candidates = results_by_address.get(
+                _normalize_address(item.get("address")), []
+            )
+            matched.append((item, candidates.pop(0) if candidates else None))
+
+    entries = []
+    missing_analysis_items = []
+    for item, web_entry in matched:
+        if web_entry is None:
+            missing_analysis_items.append(item)
+            continue
+        for target in item.get("targets", []):
+            entry = deepcopy(web_entry)
+            entry["row_id"] = target["source_key"]
+            entry["i"] = target["source_key"]
+            entry["source_key"] = target["source_key"]
+            entry["source_grid_id"] = target["grid_id"]
+            entry["source_tab"] = target["tab"]
+            entry["source_row"] = target["source_row"]
+            entry["analysis_key"] = item["analysis_key"]
+            entries.append(entry)
+    return entries, missing_analysis_items
+
+
+def _account_for_workbook_sources(run, by_source):
+    """Return exactly one review entry for every expected source key.
+
+    Missing result records are terminal attention items, not omissions. Their
+    original address, tab, grid, and row are recovered from the durable chunk
+    manifest so review/write-back routing remains collision-proof.
+    """
+    source_metadata = {}
+    for chunk in run.get("chunks", []):
+        for item in chunk.get("items", []):
+            for target in item.get("targets", []):
+                source_key = str(target.get("source_key") or "")
+                if not source_key:
+                    continue
+                source_metadata[source_key] = {
+                    "address": str(item.get("address") or ""),
+                    "analysis_key": item.get("analysis_key") or "",
+                    **target,
+                }
+
+    entries = []
+    missing_keys = []
+    for raw_source_key in run.get("target_order", []):
+        source_key = str(raw_source_key or "")
+        existing = by_source.get(source_key)
+        if existing is not None:
+            entries.append(existing)
+            continue
+
+        source = source_metadata.get(source_key, {})
+        message = (
+            "No analysis result was saved for this source row. "
+            "Retry this address; if it fails again, check the run diagnostics."
+        )
+        entries.append({
+            "row_id": source_key,
+            "i": source_key,
+            "source_key": source_key,
+            "source_grid_id": source.get("grid_id"),
+            "source_tab": source.get("tab") or "",
+            "source_row": source.get("source_row"),
+            "analysis_key": source.get("analysis_key") or "",
+            "address": source.get("address") or "",
+            "verdict": "needs_review",
+            "reasoning": "",
+            "notes": message,
+            "error": message,
+            "machine_status": "missing_result",
+        })
+        missing_keys.append(source_key)
+    return entries, missing_keys
 
 
 class BackgroundWorker:
@@ -310,13 +455,9 @@ class BackgroundWorker:
                     source_key = str(entry.get("source_key") or "")
                     if source_key not in live_rows_by_key:
                         continue
-                    error = str(entry.get("error") or "")
-                    live_rows_by_key[source_key].update({
-                        "state": "attention" if error else "complete",
-                        "message": error or "Machine analysis finished",
-                        "error": error,
-                        "model_result": str(entry.get("verdict") or ""),
-                    })
+                    live_rows_by_key[source_key].update(
+                        _machine_terminal_live_update(entry)
+                    )
 
         def _live_payload():
             return {
@@ -383,13 +524,19 @@ class BackgroundWorker:
                         web_entry = results.get(index) or {}
                         row_state = str(state.get("state") or "queued")
                         error = str(state.get("error") or web_entry.get("error") or "")
+                        message = str(state.get("message") or "")
+                        if web_entry and entry_has_machine_attention(web_entry):
+                            terminal_update = _machine_terminal_live_update(web_entry)
+                            row_state = terminal_update["state"]
+                            message = terminal_update["message"]
+                            error = error or terminal_update["error"]
                         for target in analysis_item.get("targets", []):
                             source_key = str(target.get("source_key") or "")
                             if source_key not in live_rows_by_key:
                                 continue
                             live_rows_by_key[source_key].update({
                                 "state": row_state,
-                                "message": str(state.get("message") or ""),
+                                "message": message,
                                 "error": error,
                                 "model_result": str(web_entry.get("verdict") or ""),
                             })
@@ -411,24 +558,18 @@ class BackgroundWorker:
                 raise RuntimeError(result["error"])
             result.pop("table_df", None)
             web_results = result.get("web_results") or []
-            if len(web_results) != len(chunk.get("items", [])):
-                raise RuntimeError(
-                    f"Chunk {chunk_index} returned {len(web_results)} of "
-                    f"{len(chunk.get('items', []))} analysis results"
+            entries, missing_analysis_items = _expand_workbook_chunk_entries(
+                chunk, web_results,
+            )
+            if missing_analysis_items:
+                log.error(
+                    "Workbook chunk %s returned %d of %d address results; "
+                    "%d source address(es) will be explicit attention rows",
+                    chunk_index,
+                    len(web_results),
+                    len(chunk.get("items", [])),
+                    len(missing_analysis_items),
                 )
-
-            entries = []
-            for item, web_entry in zip(chunk["items"], web_results):
-                for target in item.get("targets", []):
-                    entry = deepcopy(web_entry)
-                    entry["row_id"] = target["source_key"]
-                    entry["i"] = target["source_key"]
-                    entry["source_key"] = target["source_key"]
-                    entry["source_grid_id"] = target["grid_id"]
-                    entry["source_tab"] = target["tab"]
-                    entry["source_row"] = target["source_row"]
-                    entry["analysis_key"] = item["analysis_key"]
-                    entries.append(entry)
             write_json(chunk["result_blob"], {"schema_version": 2, "entries": entries})
             workbook_runs.mark_chunk_complete(job_id, chunk_index)
             workbook_runs.record_metric("workbook_chunks_completed")
@@ -440,15 +581,40 @@ class BackgroundWorker:
             data = read_json(chunk["result_blob"]) or {}
             for entry in data.get("entries", []):
                 by_source[str(entry.get("source_key") or "")] = entry
-        entries = [
-            by_source[source_key]
-            for source_key in run.get("target_order", [])
-            if source_key in by_source
-        ]
-        if len(entries) != int(run.get("row_count") or 0):
+        entries, missing_source_keys = _account_for_workbook_sources(
+            run, by_source,
+        )
+        declared_row_count = int(run.get("row_count") or len(entries))
+        if len(entries) != declared_row_count:
             raise RuntimeError(
-                f"Workbook produced {len(entries)} of {run.get('row_count', 0)} source rows"
+                "Workbook manifest target count mismatch: "
+                f"declared {declared_row_count}, accounted for {len(entries)}"
             )
+        if missing_source_keys:
+            log.error(
+                "Workbook %s had %d missing source result(s); explicit "
+                "attention entries were appended to review",
+                job_id,
+                len(missing_source_keys),
+            )
+            workbook_runs.record_metric(
+                "workbook_rows_missing_results",
+                len(missing_source_keys),
+            )
+            with live_state_lock:
+                for source_key in missing_source_keys:
+                    row = live_rows_by_key.get(source_key)
+                    if not row:
+                        continue
+                    row.update({
+                        "state": "attention",
+                        "message": (
+                            "Analysis result missing; retry this address"
+                        ),
+                        "error": (
+                            "No analysis result was saved for this source row"
+                        ),
+                    })
 
         from api_analyze import _finalize_batch
         _batch_id, review_url, sheet_url = _finalize_batch(
@@ -459,7 +625,10 @@ class BackgroundWorker:
             tab_inventory=run.get("tabs") or [],
             run_id=job_id,
         )
-        needs_attention = sum(1 for entry in entries if entry.get("error"))
+        needs_attention = sum(
+            1 for entry in entries
+            if entry_has_machine_attention(entry)
+        )
         workbook_runs.update_analysis_result(
             job_id,
             review_url=review_url,
