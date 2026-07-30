@@ -107,8 +107,13 @@ def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
         # data: URIs (API path) or server-hosted /files/ paths & absolute URLs
         # (browser-upload worker path) — all render in the same carousel.
         if isinstance(v, str) and v.startswith(("data:", "/files/", "http")):
-            slides += (f'<img src="{v}" data-label="{label}" alt="{label}" loading="lazy" '
-                       f'onclick="zoom(this.src)"{"" if n else " class=cur"}>')
+            safe_v = _html.escape(v, quote=True)
+            source_attr = f'src="{safe_v}"' if not n else f'data-src="{safe_v}"'
+            slides += (
+                f'<img {source_attr} data-label="{label}" alt="{label}" '
+                f'loading="lazy" decoding="async" onclick="zoom(this.src)"'
+                f'{"" if n else " class=cur"}>'
+            )
             n += 1
     if not n:
         carousel = '<div class="noimg">no imagery</div>'
@@ -203,34 +208,118 @@ def _card(e, review_schema=CURRENT_REVIEW_SCHEMA):
 def build_review_page(
     entries, job_id, webhook_url="", title="Cooling Tower Review",
     csrf_token="", review_schema=CURRENT_REVIEW_SCHEMA,
+    page=None, page_size=None, page_url="",
 ):
-    grouped = {}
+    """Render a review page, optionally limited to one server-selected page.
+
+    ``entries`` must remain the complete batch so header and tab progress stay
+    global. Passing a positive integer ``page_size`` enables pagination; callers
+    may pass ``page_url`` to preserve a stable route in Previous/Next links.
+    """
+    entries = list(entries)
+    total = len(entries)
+    pagination_enabled = (
+        isinstance(page_size, int)
+        and not isinstance(page_size, bool)
+        and page_size > 0
+    )
+    if pagination_enabled:
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        try:
+            current_page = int(page or 1)
+        except (TypeError, ValueError):
+            current_page = 1
+        current_page = min(max(current_page, 1), total_pages)
+        page_start = (current_page - 1) * page_size
+        visible_entries = entries[page_start:page_start + page_size]
+    else:
+        total_pages = 1
+        current_page = 1
+        page_start = 0
+        visible_entries = entries
+
+    all_grouped = {}
     for entry in entries:
-        grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
-    if len(grouped) == 1 and "" in grouped:
-        cards = "\n".join(_card(e, review_schema) for e in entries)
+        all_grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
+    visible_grouped = {}
+    for entry in visible_entries:
+        visible_grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
+    if len(all_grouped) == 1 and "" in all_grouped:
+        cards = "\n".join(_card(e, review_schema) for e in visible_entries)
     else:
         sections = []
-        for tab, tab_entries in grouped.items():
+        for tab, tab_entries in visible_grouped.items():
+            all_tab_entries = all_grouped[tab]
             tab_done = sum(
-                1 for entry in tab_entries
+                1 for entry in all_tab_entries
                 if entry_is_reviewed(entry, review_schema)
+            )
+            page_context = (
+                f' · {len(tab_entries)} on this page'
+                if pagination_enabled and len(tab_entries) != len(all_tab_entries)
+                else ""
             )
             sections.append(
                 f'<section class="tab-group"><div class="tab-head">'
                 f'<h2>{_html.escape(tab or "Other")}</h2>'
-                f'<span class="tab-progress">{len(tab_entries)}/{len(tab_entries)} analyzed '
-                f'· {tab_done}/{len(tab_entries)} reviewed</span></div>'
+                f'<span class="tab-progress" data-total="{len(all_tab_entries)}" '
+                f'data-reviewed="{tab_done}">{len(all_tab_entries)}/{len(all_tab_entries)} analyzed '
+                f'· {tab_done}/{len(all_tab_entries)} reviewed{page_context}</span></div>'
                 + "\n".join(_card(entry, review_schema) for entry in tab_entries)
                 + "</section>"
             )
         cards = "\n".join(sections)
-    total = len(entries)
     done0 = sum(1 for e in entries if entry_is_reviewed(e, review_schema))
     attention0 = sum(
         1 for e in entries
         if e.get("error") and not entry_is_reviewed(e, review_schema)
     )
+    if pagination_enabled:
+        base_url = str(page_url or "")
+
+        def page_href(number):
+            if not base_url:
+                return f"?page={number}"
+            parsed = urllib.parse.urlsplit(base_url)
+            query = [
+                (key, value)
+                for key, value in urllib.parse.parse_qsl(
+                    parsed.query, keep_blank_values=True
+                )
+                if key != "page"
+            ]
+            query.append(("page", str(number)))
+            return urllib.parse.urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    urllib.parse.urlencode(query),
+                    parsed.fragment,
+                )
+            )
+
+        first_visible = page_start + 1 if visible_entries else 0
+        last_visible = page_start + len(visible_entries)
+        previous = (
+            f'<a class="page-link" href="{_html.escape(page_href(current_page - 1), quote=True)}">'
+            "← Previous</a>"
+            if current_page > 1
+            else '<span class="page-link disabled">← Previous</span>'
+        )
+        following = (
+            f'<a class="page-link" href="{_html.escape(page_href(current_page + 1), quote=True)}">'
+            "Next →</a>"
+            if current_page < total_pages
+            else '<span class="page-link disabled">Next →</span>'
+        )
+        pagination = (
+            '<nav class="pagination" aria-label="Review pages">'
+            f'{previous}<span class="page-summary">Buildings {first_visible}–{last_visible} '
+            f'of {total} · page {current_page} of {total_pages}</span>{following}</nav>'
+        )
+    else:
+        pagination = ""
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
@@ -292,15 +381,21 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .bulk-submit{{background:#2f9e44;color:#fff;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;font-weight:600}}
 .bulk-submit:disabled{{background:#2a3340;color:#6b7280;cursor:not-allowed}}
 .bulk-status{{margin-left:12px;color:#9aa3ad;font-size:13px}}.bulk-status.ok{{color:#37b24d}}.bulk-status.err{{color:#ff6b6b}}
+.pagination{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 16px;
+ background:#161a20;border:1px solid #262b33;border-radius:10px;padding:10px 12px}}
+.page-link{{color:#4d9fff;text-decoration:none;white-space:nowrap}}.page-link:hover{{text-decoration:underline}}
+.page-link.disabled{{color:#59616c;cursor:default}}.page-link.disabled:hover{{text-decoration:none}}
+.page-summary{{color:#c7ccd2;text-align:center;font-size:13px}}
 #lb{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:99;padding:24px;text-align:center;cursor:zoom-out}}
 #lb img{{max-width:96%;max-height:92vh;border:2px solid #fff;border-radius:6px}}
+@media(max-width:560px){{.pagination{{gap:8px}}.page-link{{font-size:12px}}.page-summary{{font-size:11px}}}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
 <div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · {attention0} need attention · every Submit writes to the source tab</div></header>
-<div class="wrap">{cards}</div>
+<div class="wrap">{pagination}{cards}</div>
 <div class="bulk-review">
-  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
-  <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed</button>
+  <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card{' on this page' if pagination_enabled else ''} that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
+  <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed{' on this page' if pagination_enabled else ''}</button>
   <span id="bulk-status" class="bulk-status"></span>
 </div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
@@ -308,8 +403,9 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json};let done={done0};
 function zoom(s){{document.getElementById('lbi').src=s;document.getElementById('lb').style.display='block';}}
 function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
+  const current=imgs[i];if(!current.getAttribute('src')&&current.dataset.src)current.src=current.dataset.src;
   imgs.forEach((im,k)=>im.classList.toggle('cur',k==i));
-  c.querySelector('.cap').textContent=imgs[i].dataset.label+' · '+(i+1)+'/'+imgs.length+' · click image to enlarge';}}
+  c.querySelector('.cap').textContent=current.dataset.label+' · '+(i+1)+'/'+imgs.length+' · click image to enlarge';}}
 function nav(btn,d){{const c=btn.closest('.carousel');const n=+c.dataset.n;c.dataset.i=((+c.dataset.i+d)%n+n)%n;setCap(c);}}
 function toggle(chip){{
   if(!chip.classList.toggle('sel'))return;
@@ -358,9 +454,13 @@ async function submitCard(btn){{
     card.dataset.reviewed='1';card.querySelectorAll('.chip,.fitchip,.note').forEach(c=>c.disabled=true);
     if(!wasReviewed){{done++;document.getElementById('done').textContent=done;}}
     const group=card.closest('.tab-group');
-    if(group){{const totalInGroup=group.querySelectorAll('.card').length;
-      const doneInGroup=group.querySelectorAll('.card[data-reviewed="1"]').length;
-      group.querySelector('.tab-progress').textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed';}}
+    if(group&&!wasReviewed){{const progress=group.querySelector('.tab-progress');
+      const totalInGroup=+progress.dataset.total;
+      const doneInGroup=(+progress.dataset.reviewed)+1;
+      progress.dataset.reviewed=doneInGroup;
+      const onPage=group.querySelectorAll('.card').length;
+      const pageContext=onPage!==totalInGroup?' · '+onPage+' on this page':'';
+      progress.textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed'+pageContext;}}
     return 'saved';
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
 }}

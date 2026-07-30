@@ -24,6 +24,21 @@ from failure_diagnostics import build_failure_diagnostic
 
 log = logging.getLogger("worker")
 
+
+def _advanced_row_checkpoint(data, checkpointed_count):
+    """Return a compact durable checkpoint only when another row completed."""
+    row_results = [
+        item for item in data.get("row_results", [])
+        if isinstance(item, dict) and "index" in item
+    ]
+    if len(row_results) <= checkpointed_count:
+        return None, checkpointed_count
+    return {
+        "schema_version": 2,
+        "row_results": row_results,
+    }, len(row_results)
+
+
 class BackgroundWorker:
     """Background worker that processes jobs in a separate thread."""
 
@@ -330,6 +345,7 @@ class BackgroundWorker:
                 for item in partial.get("row_results", [])
                 if isinstance(item, dict) and "index" in item
             }
+            checkpointed_count = len(resume)
 
             def progress_cb(done, total, message=None):
                 update_job_status(
@@ -343,7 +359,12 @@ class BackgroundWorker:
                 )
 
             def write_workbook_partial(data):
-                write_json(chunk["partial_blob"], data)
+                nonlocal checkpointed_count
+                checkpoint, checkpointed_count = _advanced_row_checkpoint(
+                    data, checkpointed_count,
+                )
+                if checkpoint is not None:
+                    write_json(chunk["partial_blob"], checkpoint)
                 states = {
                     int(item["index"]): item
                     for item in data.get("address_states", [])
@@ -383,6 +404,8 @@ class BackgroundWorker:
                 make_signed_url=lambda dest_blob, minutes=None: make_url(dest_blob),
                 write_partial_result=write_workbook_partial,
                 resume_results=resume,
+                include_web_results_in_partials=False,
+                generate_html_report=False,
             )
             if isinstance(result, dict) and result.get("error"):
                 raise RuntimeError(result["error"])

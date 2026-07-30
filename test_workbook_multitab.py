@@ -25,6 +25,7 @@ import sheets_writer
 import storage_helpers
 import tasks_local
 import workbook_runs
+import worker
 
 
 class IsolatedState:
@@ -719,11 +720,14 @@ def test_resume_skips_checkpointed_rows(root):
                     "csv_row": {"Address": "1 Main St"},
                 }
             },
+            include_web_results_in_partials=False,
+            generate_html_report=False,
         )
         assert calls == [1]
         assert [entry["address"] for entry in result["web_results"]] == [
             "1 Main St", "2 Main St",
         ]
+        assert result["html_url"] is None
         assert any(
             next(
                 state for state in partial["address_states"]
@@ -747,12 +751,48 @@ def test_resume_skips_checkpointed_rows(root):
                 "error": "",
             },
         ]
+        assert all("web_results" not in partial for partial in partials)
     finally:
         tasks_local._process_one_address = original
         if old_key is None:
             os.environ.pop("MAPBOX_API_KEY", None)
         else:
             os.environ["MAPBOX_API_KEY"] = old_key
+
+
+def test_workbook_checkpoints_only_write_completed_rows():
+    empty, count = worker._advanced_row_checkpoint(
+        {"row_results": [], "address_states": [{"state": "analyzing"}]}, 0,
+    )
+    assert empty is None and count == 0
+
+    first_row = {
+        "index": 0,
+        "web_entry": {"address": "1 Main St", "verdict": "not_detected"},
+        "csv_row": {"Address": "1 Main St"},
+    }
+    checkpoint, count = worker._advanced_row_checkpoint(
+        {
+            "row_results": [first_row],
+            "address_states": [{"state": "complete"}],
+            "web_results": [{"duplicated": "must not persist"}],
+        },
+        count,
+    )
+    assert count == 1
+    assert checkpoint == {
+        "schema_version": 2,
+        "row_results": [first_row],
+    }
+
+    unchanged, count = worker._advanced_row_checkpoint(
+        {
+            "row_results": [first_row],
+            "address_states": [{"state": "retrying"}],
+        },
+        count,
+    )
+    assert unchanged is None and count == 1
 
 
 def test_grouped_review_and_exact_tab_writeback():
@@ -1146,6 +1186,7 @@ if __name__ == "__main__":
         test_large_workbook_approval_without_cost_rates(temp_dir)
         test_default_hundred_address_chunks(temp_dir)
         test_resume_skips_checkpointed_rows(temp_dir)
+        test_workbook_checkpoints_only_write_completed_rows()
         test_corrected_rerun_uses_exact_multitab_source(temp_dir)
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()
