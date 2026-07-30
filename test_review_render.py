@@ -109,12 +109,6 @@ def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
             "result_image_url_wide": f"https://images.example/image-{number:03d}-wide.jpg",
             "result_image_url_streetview": f"https://images.example/image-{number:03d}-street.jpg",
         }
-        if number in {1, 2, 8}:
-            entry["human"] = {
-                "hvac_systems": "Cooling Tower",
-                "optimizer_fit": "Good",
-                "periscope_fit": "Bad",
-            }
         entries.append(entry)
 
     page = build_review_page(
@@ -135,14 +129,14 @@ def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
     assert len(re.findall(r'<img src="https://images\.example/', page)) == 5
     assert len(re.findall(r'<img data-src="https://images\.example/', page)) == 10
 
-    assert '<span id="done">3</span>/15 reviewed' in page
+    assert '<span id="done">0</span>/15 reviewed' in page
     assert (
-        'data-total="7" data-reviewed="2">7/7 analyzed '
-        '· 2/7 reviewed · 2 on this page'
+        'data-total="7" data-reviewed="0">7/7 analyzed '
+        '· 0/7 reviewed · 2 on this page'
     ) in page
     assert (
-        'data-total="8" data-reviewed="1">8/8 analyzed '
-        '· 1/8 reviewed · 3 on this page'
+        'data-total="8" data-reviewed="0">8/8 analyzed '
+        '· 0/8 reviewed · 3 on this page'
     ) in page
     assert "Buildings 6–10 of 15 · page 2 of 3" in page
     assert 'href="/review/paged?mode=compact&amp;page=1"' in page
@@ -159,6 +153,126 @@ def test_pagination_is_opt_in_for_legacy_callers():
     assert 'class="pagination"' not in page
     assert "Submit all completed on this page" not in page
     assert "Submit all completed</button>" in page
+
+
+def test_unresolved_rows_are_appended_with_reasons_and_links():
+    completed = {
+        **_entry(),
+        "row_id": "g1:r2",
+        "source_tab": "DC",
+        "source_row": 2,
+        "address": "1 Completed Ave",
+        "human": {
+            "hvac_systems": "None",
+            "optimizer_fit": "Bad",
+            "periscope_fit": "Bad",
+        },
+    }
+    pending = {
+        **_entry(),
+        "row_id": "g1:r3",
+        "source_tab": "DC",
+        "source_row": 3,
+        "address": "2 Pending Ave",
+    }
+    missing = {
+        **_entry(),
+        "row_id": "g1:r4",
+        "source_tab": "DC",
+        "source_row": 4,
+        "address": "3 Missing Ave",
+        "verdict": "needs_review",
+        "error": "No analysis result was saved for this source row",
+    }
+    gated = {
+        **_entry(),
+        "row_id": "g1:r5",
+        "source_tab": "DC",
+        "source_row": 5,
+        "address": "4 Gated Ave",
+        "verdict": "likely_residential",
+        "reasoning": "",
+        "gemini_reasoning": "",
+        "notes": "Footprint size gate requires manual verification",
+    }
+    page = build_review_page(
+        [missing, pending, completed, gated],
+        job_id="unresolved-order",
+    )
+
+    assert page.index("1 Completed Ave") < page.index("2 Pending Ave")
+    assert page.index("2 Pending Ave") < page.index("3 Missing Ave")
+    assert page.index("3 Missing Ave") < page.index("4 Gated Ave")
+    assert '<section class="review-state-group pending">' in page
+    assert '<section class="review-state-group attention">' in page
+    assert "Analysis is complete, but this row has not been submitted" in page
+    assert "No analysis result was saved for this source row" in page
+    assert "Footprint size gate requires manual verification" in page
+    assert "Tab: DC · row 4" in page
+    assert page.count("google.com/maps") == 4
+    assert page.count("earth.google.com") == 4
+    assert page.count("bing.com/maps") == 4
+    assert '<span id="pending-count">1</span> still need review' in page
+    assert '<span id="attention-count">2</span> need attention' in page
+    assert "async function submitCard(btn,reloadAfterSave=true)" in page
+    assert "if(reloadAfterSave)window.location.reload();" in page
+    assert "submitCard(card.querySelector('.submit'),false)" in page
+    assert "if(saved)window.location.reload();" in page
+
+
+def test_human_disposition_resolves_machine_attention_but_not_writeback_error():
+    human = {
+        "hvac_systems": "None",
+        "optimizer_fit": "Bad",
+        "periscope_fit": "Bad",
+    }
+    dispositioned = {
+        **_entry(),
+        "row_id": "g1:r10",
+        "address": "10 Dispositioned Ave",
+        "verdict": "needs_review",
+        "error": "Visual result required human confirmation",
+        "human": human,
+        "writeback": {"status": "updated"},
+    }
+    writeback_failed = {
+        **_entry(),
+        "row_id": "g1:r11",
+        "address": "11 Writeback Failed Ave",
+        "verdict": "needs_review",
+        "error": "Visual result required human confirmation",
+        "human": human,
+        "writeback": {
+            "status": "error",
+            "error": "Source row could not be updated",
+        },
+    }
+    page = build_review_page(
+        [writeback_failed, dispositioned],
+        job_id="reviewed-attention",
+    )
+
+    dispositioned_card = re.search(
+        r'<article class="card done"[^>]*data-review-state="reviewed"'
+        r'[^>]*data-addr="10 Dispositioned Ave"',
+        page,
+    )
+    assert dispositioned_card
+    failed_card = re.search(
+        r'<article class="card done writeback-error attention"'
+        r'[^>]*data-review-state="attention"'
+        r'[^>]*data-addr="11 Writeback Failed Ave"',
+        page,
+    )
+    assert failed_card
+    assert page.index("10 Dispositioned Ave") < page.index(
+        "11 Writeback Failed Ave"
+    )
+    assert "Review saved locally, but the Sheet was not updated" in page
+    assert '<span id="attention-count">1</span> need attention' in page
+    assert "card.classList.remove('writeback-error','pending','attention')" in page
+    assert "const issue=card.querySelector('.issue');if(issue)issue.remove()" in page
+    assert "card.dataset.reviewState='reviewed'" in page
 
 
 def test_191_building_page_stays_bounded():
@@ -381,6 +495,8 @@ if __name__ == "__main__":
     test_carousel_only_sources_first_image_until_navigation()
     test_server_pagination_limits_dom_and_keeps_global_tab_progress()
     test_pagination_is_opt_in_for_legacy_callers()
+    test_unresolved_rows_are_appended_with_reasons_and_links()
+    test_human_disposition_resolves_machine_attention_but_not_writeback_error()
     test_191_building_page_stays_bounded()
     test_positive_result_defaults_cooling_tower_and_optimizer_only()
     test_possible_cooling_tower_uses_the_same_review_defaults()

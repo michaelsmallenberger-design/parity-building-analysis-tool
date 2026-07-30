@@ -795,6 +795,119 @@ def test_workbook_checkpoints_only_write_completed_rows():
     assert unchanged is None and count == 1
 
 
+def test_machine_attention_verdicts_drive_live_state_and_resolve_on_review():
+    for verdict in (
+        "likely_residential",
+        "ambiguous_footprint",
+        "needs_review",
+        "",
+    ):
+        entry = {
+            "address": "1 Attention Test Ave",
+            "verdict": verdict,
+            "error": "",
+            "notes": "Manual verification recommended",
+        }
+        assert review_contract.entry_has_machine_attention(entry)
+        live = worker._machine_terminal_live_update(entry)
+        assert live["state"] == "attention"
+        assert live["error"]
+        assert live["model_result"] == verdict
+
+        entry["human"] = {
+            "hvac_systems": "None",
+            "optimizer_fit": "Bad",
+            "periscope_fit": "Bad",
+        }
+        assert not review_contract.entry_needs_attention(
+            entry, review_contract.DUAL_FIT_SCHEMA,
+        )
+
+    failed = {
+        "address": "2 Failed Test Ave",
+        "verdict": "not_detected",
+        "error": "Image Download Failed",
+    }
+    assert worker._machine_terminal_live_update(failed)["state"] == "attention"
+
+    complete = {
+        "address": "3 Complete Test Ave",
+        "verdict": "not_detected",
+        "error": "",
+    }
+    assert not review_contract.entry_has_machine_attention(complete)
+    assert worker._machine_terminal_live_update(complete) == {
+        "state": "complete",
+        "message": "Machine analysis finished",
+        "error": "",
+        "model_result": "not_detected",
+    }
+
+
+def test_missing_workbook_results_are_explicit_attention_rows():
+    chunk = {
+        "index": 0,
+        "items": [
+            {
+                "analysis_key": "analysis-a",
+                "address": "1 Missing Result Ave",
+                "targets": [{
+                    "source_key": "ssheet:g10:r2",
+                    "grid_id": 10,
+                    "tab": "Washington",
+                    "source_row": 2,
+                }],
+            },
+            {
+                "analysis_key": "analysis-b",
+                "address": "2 Completed Result Ave",
+                "targets": [{
+                    "source_key": "ssheet:g20:r2",
+                    "grid_id": 20,
+                    "tab": "Virginia",
+                    "source_row": 2,
+                }],
+            },
+        ],
+    }
+    chunk_entries, missing_items = worker._expand_workbook_chunk_entries(
+        chunk,
+        [{
+            "address": "2 Completed Result Ave",
+            "verdict": "not_detected",
+            "error": "",
+        }],
+    )
+    assert [entry["source_key"] for entry in chunk_entries] == [
+        "ssheet:g20:r2",
+    ]
+    assert [item["address"] for item in missing_items] == [
+        "1 Missing Result Ave",
+    ]
+
+    run = {
+        "row_count": 2,
+        "target_order": ["ssheet:g10:r2", "ssheet:g20:r2"],
+        "chunks": [chunk],
+    }
+    completed, missing_keys = worker._account_for_workbook_sources(
+        run,
+        {entry["source_key"]: entry for entry in chunk_entries},
+    )
+    assert len(completed) == 2
+    assert missing_keys == ["ssheet:g10:r2"]
+    missing = completed[0]
+    assert missing["row_id"] == "ssheet:g10:r2"
+    assert missing["address"] == "1 Missing Result Ave"
+    assert missing["source_grid_id"] == 10
+    assert missing["source_tab"] == "Washington"
+    assert missing["source_row"] == 2
+    assert missing["machine_status"] == "missing_result"
+    assert missing["verdict"] == "needs_review"
+    assert "No analysis result was saved" in missing["error"]
+    assert completed[1]["address"] == "2 Completed Result Ave"
+
+
 def test_grouped_review_and_exact_tab_writeback():
     entries = [
         {"row_id": "g10:r2", "source_tab": "Washington", "source_row": 2,
@@ -1187,6 +1300,8 @@ if __name__ == "__main__":
         test_default_hundred_address_chunks(temp_dir)
         test_resume_skips_checkpointed_rows(temp_dir)
         test_workbook_checkpoints_only_write_completed_rows()
+        test_machine_attention_verdicts_drive_live_state_and_resolve_on_review()
+        test_missing_workbook_results_are_explicit_attention_rows()
         test_corrected_rerun_uses_exact_multitab_source(temp_dir)
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()

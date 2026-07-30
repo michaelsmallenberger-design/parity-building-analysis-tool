@@ -49,6 +49,7 @@ from review_contract import (
     PERI_FIT_COL,
     SINGLE_FIT_SCHEMA,
     entry_is_reviewed,
+    entry_needs_attention,
 )
 import review_store
 import sheets_writer
@@ -1209,10 +1210,7 @@ def batch_rerun(batch_id):
                 ),
                 needs_attention=sum(
                     1 for entry in entries
-                    if (
-                        _entry_is_failure(entry)
-                        and not entry_is_reviewed(entry, review_schema)
-                    )
+                    if entry_needs_attention(entry, review_schema)
                 ),
             )
         except Exception:
