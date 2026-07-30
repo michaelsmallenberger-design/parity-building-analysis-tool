@@ -4,6 +4,7 @@ Uses local storage and SQLite job queue instead of Google Cloud services.
 """
 import os
 import json
+import hashlib
 import uuid
 import logging
 import threading
@@ -13,14 +14,17 @@ import secrets
 from datetime import timedelta
 import pandas as pd
 from pathlib import Path
-from flask import Flask, request, render_template, redirect, url_for, jsonify, abort, Response, session
-from werkzeug.exceptions import RequestEntityTooLarge
+from flask import (
+    Flask, request, render_template, redirect, url_for, jsonify, abort,
+    Response, session, send_file,
+)
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 # Local modules
 from job_queue import (init_db, enqueue_job, get_job_status, cancel_job,
                        check_usage_limit, batch_size_limit)
-from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists, read_file
+from storage_helpers import init_storage, upload_file, get_file_path, read_result, file_exists
 from worker import start_worker
 from api_analyze import (api as api_blueprint, _read_csv_with_fallback,
                          _read_excel_with_worker_tab_selection, _read_excel_tabs)
@@ -771,6 +775,59 @@ def results(job_id):
     total_count = request.args.get('total', 0, type=int)
     return render_template('results.html', job_id=job_id, total_count=total_count)
 
+
+def _compact_status_rows(result):
+    """Project a persisted result down to the fields used by the progress page."""
+    rows = result.get("live_rows") or []
+    if not rows and result.get("address_states"):
+        rows = result["address_states"]
+
+    compact_rows = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        row_id = item.get("row_id")
+        if row_id is None:
+            row_id = item.get("index", "")
+        compact_rows.append({
+            "row_id": str(row_id),
+            "address": str(item.get("address") or ""),
+            "tab": str(item.get("tab") or ""),
+            "source_row": item.get("source_row"),
+            "state": str(item.get("state") or "queued"),
+            "message": str(item.get("message") or ""),
+            "error": str(item.get("error") or ""),
+        })
+    return compact_rows
+
+
+def _status_rows_version(rows):
+    """Return a stable content version so unchanged row lists need not be resent."""
+    payload = json.dumps(
+        rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _compact_status_result(result, status_name):
+    """Keep the legacy ``result`` envelope without returning analysis payloads."""
+    summary = {}
+    for key in ("review_url", "sheet_url"):
+        if result.get(key):
+            summary[key] = result[key]
+
+    diagnostic = result.get("diagnostic")
+    if status_name == "failed" and isinstance(diagnostic, dict):
+        compact_diagnostic = {
+            key: diagnostic[key]
+            for key in ("diagnostic_summary", "claude_code_context")
+            if diagnostic.get(key)
+        }
+        if compact_diagnostic:
+            summary["diagnostic"] = compact_diagnostic
+    return summary
+
+
 @app.route('/status/<job_id>')
 def job_status_route(job_id):
     """API endpoint for job status polling."""
@@ -793,29 +850,48 @@ def job_status_route(job_id):
     if status.get('message'):
         response['message'] = status['message']
 
-    # Include result data (both partial and final)
-    # This allows frontend to display results as they come in
     if status['status'] in ['processing', 'finished', 'failed']:
-        result = read_result(job_id)
+        result = read_result(job_id) or {}
         if result:
-            response['result'] = result
-            rows = result.get("live_rows") or []
-            if not rows and result.get("address_states"):
-                rows = [
-                    {
-                        "row_id": str(item.get("index", "")),
-                        "address": item.get("address") or "",
-                        "tab": "",
-                        "source_row": None,
-                        "state": item.get("state") or "queued",
-                        "message": item.get("message") or "",
-                        "error": item.get("error") or "",
-                        "model_result": "",
-                    }
-                    for item in result.get("address_states", [])
-                    if isinstance(item, dict)
-                ]
-            response["rows"] = rows
+            if request.args.get("compact") == "1":
+                # Browser polling needs row state and final links, not the full
+                # model/image payload. Compact mode is explicit so legacy API
+                # consumers retain the original response contract.
+                rows = _compact_status_rows(result)
+                rows_version = _status_rows_version(rows)
+                response["rows_version"] = rows_version
+
+                client_rows_version = request.args.get("rows_version", "")
+                rows_changed = client_rows_version != rows_version
+                response["rows_changed"] = rows_changed
+                if rows_changed:
+                    response["rows"] = rows
+
+                result_summary = _compact_status_result(
+                    result, status["status"],
+                )
+                if result_summary:
+                    response["result"] = result_summary
+            else:
+                response["result"] = result
+                rows = result.get("live_rows") or []
+                if not rows and result.get("address_states"):
+                    rows = [
+                        {
+                            "row_id": str(item.get("index", "")),
+                            "address": item.get("address") or "",
+                            "tab": "",
+                            "source_row": None,
+                            "state": item.get("state") or "queued",
+                            "message": item.get("message") or "",
+                            "error": item.get("error") or "",
+                            "model_result": "",
+                        }
+                        for item in result.get("address_states", [])
+                        if isinstance(item, dict)
+                    ]
+                response["rows"] = rows
+
             if result.get("live_rows") is not None:
                 response["total"] = len(rows)
                 response["progress"] = sum(
@@ -843,12 +919,11 @@ def cancel_job_route(job_id):
 # -----------------------------------------------------------------------------
 @app.route('/files/<path:blob_name>')
 def serve_file(blob_name):
-    """Serve files from local storage."""
+    """Stream a private artifact from local storage."""
     try:
         if not file_exists(blob_name):
             abort(404)
 
-        data = read_file(blob_name)
         lower = blob_name.lower()
 
         # Determine MIME type
@@ -865,7 +940,16 @@ def serve_file(blob_name):
         else:
             mimetype = 'application/octet-stream'
 
-        resp = Response(data, mimetype=mimetype)
+        attachment = lower.endswith(('.csv', '.zip'))
+        resp = send_file(
+            get_file_path(blob_name),
+            mimetype=mimetype,
+            as_attachment=attachment,
+            download_name=os.path.basename(blob_name) if attachment else None,
+            conditional=True,
+            etag=False,
+            max_age=0,
+        )
         # These files can contain customer addresses, roof imagery, and review
         # reports. Even though the browser password protects this route, marking
         # a response ``public`` allows shared proxies/CDNs to retain it outside
@@ -875,12 +959,9 @@ def serve_file(blob_name):
         resp.headers['Pragma'] = 'no-cache'
         resp.headers['Expires'] = '0'
 
-        # Force download for CSV and ZIP files
-        if lower.endswith('.csv') or lower.endswith('.zip'):
-            filename = os.path.basename(blob_name)
-            resp.headers['Content-Disposition'] = f"attachment; filename={filename}"
-
         return resp
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Error serving file {blob_name}: {e}")
         abort(404)
@@ -960,6 +1041,11 @@ def review_page(job_id):
     batch = review_store.load_batch(job_id)
     if not batch:
         abort(404)
+    try:
+        page_size = int(os.getenv("REVIEW_PAGE_SIZE", "10"))
+    except (TypeError, ValueError):
+        page_size = 10
+    page_size = min(max(page_size, 1), 50)
     html = build_review_page(
         batch.get("entries", []),
         job_id=job_id,
@@ -967,6 +1053,9 @@ def review_page(job_id):
         title=batch.get("title", "Cooling Tower Review"),
         csrf_token=_csrf_token(),
         review_schema=batch.get("review_schema", CURRENT_REVIEW_SCHEMA),
+        page=request.args.get("page", 1, type=int),
+        page_size=page_size,
+        page_url=request.path,
     )
     return Response(html, mimetype="text/html")
 

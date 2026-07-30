@@ -1223,6 +1223,8 @@ def process_address_list(
     write_partial_result: Callable[[Dict[str, Any]], None] = None,  # Optional callback for streaming results
     concurrency: int = None,  # addresses processed at once; None → VLM_ADDRESS_CONCURRENCY env (default 5)
     resume_results: Dict[int, Any] = None,
+    include_web_results_in_partials: bool = True,
+    generate_html_report: bool = True,
 ) -> Dict[str, Any]:
     """
     Process a CSV of addresses through the geometry + dual-VLM pipeline.
@@ -1420,11 +1422,8 @@ def process_address_list(
     done = len(results_by_index)
 
     def _partial_payload_locked():
-        return {
+        payload = {
             "schema_version": 2,
-            "web_results": [
-                results_by_index[k][0] for k in sorted(results_by_index)
-            ],
             "row_results": [
                 {
                     "index": int(k),
@@ -1437,6 +1436,11 @@ def process_address_list(
                 state_by_index[k] for k in sorted(state_by_index)
             ],
         }
+        if include_web_results_in_partials:
+            payload["web_results"] = [
+                results_by_index[k][0] for k in sorted(results_by_index)
+            ]
+        return payload
 
     def _publish_locked():
         if write_partial_result:
@@ -1586,13 +1590,17 @@ def process_address_list(
     log.info(f"  ✗ Failed: {failed}")
     log.info(f"  📡 Cooling towers detected: {detections}")
 
-    # Generate HTML report with embedded images (skip for large batches to save memory)
-    skip_html = total > 200
+    # Workbook runs use the interactive review surface and discard this legacy
+    # report. Avoid copying and base64-encoding every chunk image in that path.
+    skip_html = not generate_html_report or total > 200
     html_local = os.path.join(tempfile.gettempdir(), f"Report_{job_id}.html")
     html_url = None
 
     if skip_html:
-        log.info(f"Skipping HTML generation for large batch ({total} addresses) to conserve memory")
+        log.info(
+            "Skipping legacy HTML report generation for %d address(es)",
+            total,
+        )
     else:
         # We need a function to get local paths from blob paths for image encoding
         # This lambda will be passed to the HTML generator

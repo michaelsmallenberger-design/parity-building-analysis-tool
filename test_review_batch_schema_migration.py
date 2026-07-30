@@ -139,10 +139,10 @@ def test_dry_run_and_apply_preserve_analysis_and_rebind_dual_columns(root):
         review_schema=migrated["review_schema"],
     )
     assert 'class="chip sel" data-sys="Cooling Tower"' in page
-    assert (
-        'data-col="optimizer_fit"><button type="button" '
-        'class="fitchip sel" data-fit="Good"'
-    ) in page
+    optimizer = page.split('data-col="optimizer_fit">', 1)[1].split(
+        "</div>", 1,
+    )[0]
+    assert 'class="fitchip sel" data-fit="Good"' in optimizer
     periscope = page.split('data-col="periscope_fit">', 1)[1].split("</div>", 1)[0]
     assert 'class="fitchip sel"' not in periscope
 
