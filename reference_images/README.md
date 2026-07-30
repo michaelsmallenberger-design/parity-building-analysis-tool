@@ -10,6 +10,11 @@ overhead satellite imagery and what common rooftop false positives look like.
 - Accepted file extensions: `.jpg`, `.jpeg`, `.png`.
 - Missing folders are handled silently (no error).
 - Numeric filename prefixes (`01_`, `02_`, etc.) control load order.
+- The existing 5 positive and 3 negative assets are tightly cropped around the
+  annotated equipment while retaining enough rooftop context for comparison.
+- Gemini receives these reference-only images at medium media resolution to
+  reduce token use; live building, detail, and context imagery keeps its normal
+  resolution.
 
 ## Positive examples (cooling towers)
 
@@ -33,9 +38,12 @@ de-identified, equipment-only contact sheets: surrounding buildings, streets,
 and location context were removed before publication. They show RTUs, rooftop
 condensers, exhaust fans, or air handlers that YOLO proposed as cooling towers.
 
-Green boxes identify YOLO candidates that the reviewer rejected. A crop may
-retain a fragment of the red target-building outline. Those annotations are
-location aids, not equipment features.
+YOLO draws every candidate box green regardless of what equipment it contains.
+Green is a neutral locator, never evidence that a unit is an RTU, a cooling
+tower, positive, or negative. These examples are negative because a human
+reviewer rejected the equipment inside the boxes. A crop may retain a fragment
+of the red target-building outline; neither annotation color is an equipment
+feature.
 
 Only add a production image here after a human reviewer has explicitly
 classified it as a false positive. Keep filenames anonymous and do not include
