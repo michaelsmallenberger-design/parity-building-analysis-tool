@@ -39,6 +39,7 @@ geometry (1).py
 
 # Sensitive / local-only files (do not publish on public fork)
 Existing_Market_TAM.xlsx
+addresses.csv
 training/addresses.csv
 jobs.db
 jobs.db-*
