@@ -17,7 +17,8 @@ from shapely.ops import transform
 
 from utils import (
     geocode_address_mapbox, geocode_with_confidence,
-    get_satellite_image, get_streetview_image_google, validate_address_google,
+    get_satellite_image, get_streetview_image_google,
+    get_streetview_metadata_google, validate_address_google,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
@@ -70,6 +71,20 @@ CLOSEUP_ZOOM = int(os.getenv("CLOSEUP_ZOOM", "20"))
 # ambiguous (non-containing) one, retry with the Mapbox geocode of the same address and
 # adopt it if it lands inside a building.
 GEOCODER_FALLBACK_ENABLED = os.environ.get("GEOCODER_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Reviewer-only exterior context. This never affects the machine verdict.
+# The hard bound is two Street View images per eligible address: one selected
+# using the full source address and one alternate/context angle.
+STREETVIEW_SECONDARY_ENABLED = os.environ.get(
+    "STREETVIEW_SECONDARY_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+STREETVIEW_PRIMARY_FOV = int(os.getenv("STREETVIEW_PRIMARY_FOV", "90"))
+STREETVIEW_PRIMARY_PITCH = int(os.getenv("STREETVIEW_PRIMARY_PITCH", "5"))
+STREETVIEW_CONTEXT_FOV = int(os.getenv("STREETVIEW_CONTEXT_FOV", "105"))
+STREETVIEW_CONTEXT_PITCH = int(os.getenv("STREETVIEW_CONTEXT_PITCH", "5"))
+STREETVIEW_ALTERNATE_HEADING_OFFSET = float(
+    os.getenv("STREETVIEW_ALTERNATE_HEADING_OFFSET", "55")
+)
 
 # YOLO ensemble models are @lru_cache-shared singletons; ultralytics .predict()
 # is not thread-safe. Serialize inference so concurrent addresses can't corrupt
@@ -320,6 +335,121 @@ def _footprint_area_m2(footprint: Dict[str, Any]) -> float:
     return projected.area
 
 
+def _bearing_degrees(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial compass bearing from one WGS84 point to another."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_lon = math.radians(lon2 - lon1)
+    y = math.sin(delta_lon) * math.cos(phi2)
+    x = (
+        math.cos(phi1) * math.sin(phi2)
+        - math.sin(phi1) * math.cos(phi2) * math.cos(delta_lon)
+    )
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _panorama_heading(
+    metadata: Optional[Dict[str, Any]],
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+) -> Optional[float]:
+    """Aim a selected panorama at the target building when coordinates exist."""
+    location = (metadata or {}).get("location") or {}
+    if target_lat is None or target_lon is None:
+        return None
+    try:
+        return _bearing_degrees(
+            float(location["lat"]),
+            float(location["lng"]),
+            float(target_lat),
+            float(target_lon),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _capture_review_streetviews(
+    full_address: str,
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+    job_id: str,
+    row_index: int,
+    clean_addr: str,
+    upload_file: Callable[[str, str], None],
+    make_signed_url: Callable[[str], str],
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Capture at most two reviewer-only exterior images.
+
+    The first panorama search uses the full source address, which lets Google
+    prefer a camera that displays the address. The second search uses the
+    selected building point. When both searches choose the same panorama, the
+    second image rotates by a bounded offset instead of duplicating the first.
+    """
+    primary_path = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{row_index}_{clean_addr}_streetview_address.jpg",
+    )
+    paths = [primary_path]
+    primary_url = None
+    context_url = None
+    primary_meta = get_streetview_metadata_google(full_address)
+    primary_heading = _panorama_heading(
+        primary_meta, target_lat, target_lon
+    )
+    if primary_meta and get_streetview_image_google(
+        target_lat or 0.0,
+        target_lon or 0.0,
+        primary_path,
+        location=full_address,
+        fov=STREETVIEW_PRIMARY_FOV,
+        pitch=STREETVIEW_PRIMARY_PITCH,
+        heading=primary_heading,
+        metadata=primary_meta,
+    ):
+        primary_blob = f"results/{job_id}/{os.path.basename(primary_path)}"
+        upload_file(primary_path, primary_blob)
+        primary_url = make_signed_url(primary_blob)
+
+    if (
+        not STREETVIEW_SECONDARY_ENABLED
+        or target_lat is None
+        or target_lon is None
+    ):
+        return primary_url, context_url, paths
+
+    context_path = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{row_index}_{clean_addr}_streetview_context.jpg",
+    )
+    paths.append(context_path)
+    coordinate_query = f"{float(target_lat):.7f},{float(target_lon):.7f}"
+    context_meta = get_streetview_metadata_google(coordinate_query)
+    heading = _panorama_heading(context_meta, target_lat, target_lon)
+    if (
+        primary_meta
+        and context_meta
+        and primary_meta.get("pano_id")
+        and primary_meta.get("pano_id") == context_meta.get("pano_id")
+    ):
+        if heading is not None:
+            heading = (
+                heading + STREETVIEW_ALTERNATE_HEADING_OFFSET
+            ) % 360.0
+    if context_meta and get_streetview_image_google(
+        target_lat,
+        target_lon,
+        context_path,
+        location=coordinate_query,
+        fov=STREETVIEW_CONTEXT_FOV,
+        pitch=STREETVIEW_CONTEXT_PITCH,
+        heading=heading,
+        metadata=context_meta,
+    ):
+        context_blob = f"results/{job_id}/{os.path.basename(context_path)}"
+        upload_file(context_path, context_blob)
+        context_url = make_signed_url(context_blob)
+    return primary_url, context_url, paths
+
+
 def _build_web_entry(
     full_address: str,
     verdict: str,
@@ -332,6 +462,7 @@ def _build_web_entry(
     error: Optional[str] = None,
     result_url_wide: Optional[str] = None,
     result_url_streetview: Optional[str] = None,
+    result_url_streetview_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a web_results entry. Keeps the shared keys the report/CSV renderers expect
     (address, confidence_score, result_image_url, original_image_url, error) plus
@@ -378,6 +509,7 @@ def _build_web_entry(
         "result_image_url": result_url,
         "result_image_url_wide": result_url_wide,
         "result_image_url_streetview": result_url_streetview,
+        "result_image_url_streetview_context": result_url_streetview_context,
         "original_image_url": original_url,
         "verdict": verdict,
         "detection_count": detection_count,
@@ -678,6 +810,21 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            geo_lat,
+            geo_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
+        )
+
         notes = _build_notes({'verdict': 'footprint_missing', 'geocoder_retried': geocoder_retried})
         if addr_val_note:
             notes = f"{addr_val_note} {notes}".strip()
@@ -690,6 +837,8 @@ def _process_one_address_core(
             notes=notes,
             original_url=original_url,
             result_url=result_url,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
         )
         csv_row = _build_csv_row(
             full_address=full_address,
@@ -702,7 +851,7 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local):
+        for p in (original_local, annotated_local, *streetview_paths):
             try:
                 if os.path.exists(p):
                     os.remove(p)
@@ -731,18 +880,39 @@ def _process_one_address_core(
         })
         if addr_val_note:
             notes = f"{addr_val_note} {notes}".strip()
-        return (
-            _build_web_entry(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
-            _build_csv_row(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            geo_lat,
+            geo_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
         )
+        web_entry = _build_web_entry(
+            full_address=full_address, verdict='ambiguous_footprint',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=None, result_url=None,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address, verdict='ambiguous_footprint',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=None, result_url=None,
+        )
+        for path in streetview_paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {path}: {e}")
+        return web_entry, csv_row
 
     footprint_area = _footprint_area_m2(footprint) if AREA_GATE_ENABLED else 0.0
     if AREA_GATE_ENABLED and footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
@@ -776,19 +946,46 @@ def _process_one_address_core(
             wide_blob = f"results/{job_id}/{os.path.basename(annotated_wide_local)}"
             upload_file(annotated_wide_local, wide_blob)
             result_url_wide = make_signed_url(wide_blob)
-        return (
-            _build_web_entry(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=original_url, result_url=result_url,
-                result_url_wide=result_url_wide,
-            ),
-            _build_csv_row(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=original_url, result_url=result_url,
-            ),
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            centroid_lat,
+            centroid_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
         )
+        web_entry = _build_web_entry(
+            full_address=full_address, verdict='likely_residential',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=original_url, result_url=result_url,
+            result_url_wide=result_url_wide,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address, verdict='likely_residential',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=original_url, result_url=result_url,
+        )
+        for path in (
+            original_local,
+            annotated_local,
+            gate_wide,
+            annotated_wide_local,
+            *streetview_paths,
+        ):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {path}: {e}")
+        return web_entry, csv_row
 
     # Per-address routing off the dense-urban gate (NYC cores + curated downtowns):
     #  - imagery: dense → Mapbox (true nadir; Google's 3D photogrammetry distorts dense
@@ -855,12 +1052,20 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
-        result_url_streetview = None
-        streetview_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_streetview.jpg")
-        if get_streetview_image_google(centroid_lat, centroid_lon, streetview_local):
-            sv_blob = f"results/{job_id}/{os.path.basename(streetview_local)}"
-            upload_file(streetview_local, sv_blob)
-            result_url_streetview = make_signed_url(sv_blob)
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            centroid_lat,
+            centroid_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
+        )
 
         # Wide/aerial context tile so registry-confirmed rows also carry the wide view
         # for human review (requirement: every report has one, no matter the path).
@@ -896,6 +1101,7 @@ def _process_one_address_core(
             original_url=original_url,
             result_url=result_url,
             result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
             result_url_wide=result_url_wide,
         )
         csv_row = _build_csv_row(
@@ -909,7 +1115,13 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local, streetview_local, wide_local, annotated_wide_local):
+        for p in (
+            original_local,
+            annotated_local,
+            wide_local,
+            annotated_wide_local,
+            *streetview_paths,
+        ):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
@@ -1096,16 +1308,22 @@ def _process_one_address_core(
     result_url = _render_tile(render_src, MAPBOX_ZOOM, annotated_local)
     result_url_wide = _render_tile(render_wide, MAPBOX_ZOOM_WIDE, annotated_wide_local)
 
-    # Ground-level Street View photo for faster human review (separate from the
-    # detect/verify pipeline above -- failure here never affects the verdict).
-    # Heading is auto-aimed by Google from the centroid we already computed for
-    # the satellite tiles, so this costs one extra (cheap, free-if-no-coverage) call.
-    result_url_streetview = None
-    streetview_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_streetview.jpg")
-    if get_streetview_image_google(centroid_lat, centroid_lon, streetview_local):
-        sv_blob = f"results/{job_id}/{os.path.basename(streetview_local)}"
-        upload_file(streetview_local, sv_blob)
-        result_url_streetview = make_signed_url(sv_blob)
+    # Reviewer-only exterior context is separate from detection/verification;
+    # absence or failure never changes the machine verdict.
+    (
+        result_url_streetview,
+        result_url_streetview_context,
+        streetview_paths,
+    ) = _capture_review_streetviews(
+        full_address,
+        centroid_lat,
+        centroid_lon,
+        job_id,
+        i,
+        clean_addr,
+        upload_file,
+        make_signed_url,
+    )
 
     # Construction → needs_review: active construction means the Mapbox tile may
     # predate the current building state, so the cooling-tower call isn't reliable.
@@ -1157,6 +1375,7 @@ def _process_one_address_core(
         result_url=result_url,
         result_url_wide=result_url_wide,
         result_url_streetview=result_url_streetview,
+        result_url_streetview_context=result_url_streetview_context,
     )
     csv_row = _build_csv_row(
         full_address=full_address,
@@ -1171,7 +1390,8 @@ def _process_one_address_core(
 
     for p in (original_local, wide_local, annotated_local, annotated_wide_local,
               marked_detail, marked_wide, retry_detail, retry_marked,
-              closeup_local, retry_closeup, wide_retry, wr_marked, streetview_local):
+              closeup_local, retry_closeup, wide_retry, wr_marked,
+              *streetview_paths):
         try:
             if p and os.path.exists(p):
                 os.remove(p)

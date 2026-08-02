@@ -43,13 +43,54 @@ _AI_POSITIVE = {
 _IMG_SLOTS = [
     ("result_image_url", "Aerial (detections)"),
     ("result_image_url_wide", "Wide / context"),
-    ("result_image_url_streetview", "Street View"),
+    ("result_image_url_streetview", "Exterior / address"),
+    ("result_image_url_streetview_context", "Exterior / alternate angle"),
 ]
+_EXTERIOR_IMAGE_KEYS = {
+    "result_image_url_streetview",
+    "result_image_url_streetview_context",
+}
+_SHEET_BUILDING_INFO_FIELDS = (
+    ("property_name", "Property name"),
+    ("property_type", "Property type"),
+    ("secondary_type", "Secondary type"),
+    ("building_class", "Building class"),
+    ("construction_type", "Construction type"),
+    ("units", "Units"),
+    ("total_buildings", "Total buildings"),
+    ("square_feet", "Square feet"),
+    ("year_built", "Year built"),
+    ("year_renovated", "Year renovated"),
+    ("affordable_type", "Affordable type"),
+    ("city", "City"),
+    ("market_name", "Market"),
+)
 VERDICT_COLOR = {
     "confirmed": "#37b24d", "registry_confirmed": "#37b24d", "likely": "#94d82d",
     "neighbor_only": "#f59f00", "needs_review": "#f59f00",
     "likely_residential": "#868e96", "not_detected": "#e8590c", "": "#868e96",
 }
+
+# Keep the established Sheet/API value ``Okay`` for backward compatibility,
+# while giving reviewers the clearer product-language label requested in the
+# review UI. ``Not Sure`` remains reserved for inadequate imagery/location
+# evidence; ``Maybe`` means the visible evidence suggests a possible fit.
+_DUAL_FIT_DISPLAY_LABELS = {"Okay": "Maybe"}
+
+
+def _fit_display_label(value, review_schema):
+    value = str(value or "")
+    if review_schema == DUAL_FIT_SCHEMA:
+        return _DUAL_FIT_DISPLAY_LABELS.get(value, value)
+    return value
+
+
+def _valid_image_source(value):
+    return isinstance(value, str) and value.startswith(
+        ("data:", "/files/", "http")
+    )
+
+
 _REVIEW_STATE_ORDER = ("reviewed", "pending", "attention")
 _REVIEW_STATE_LABELS = {
     "reviewed": "Completed reviews",
@@ -170,11 +211,12 @@ def _card(
 
     slides = ""
     n = 0
+    has_exterior = False
     for key, label in _IMG_SLOTS:
         v = e.get(key)
         # data: URIs (API path) or server-hosted /files/ paths & absolute URLs
         # (browser-upload worker path) — all render in the same carousel.
-        if isinstance(v, str) and v.startswith(("data:", "/files/", "http")):
+        if _valid_image_source(v):
             safe_v = _html.escape(v, quote=True)
             source_attr = f'src="{safe_v}"' if not n else f'data-src="{safe_v}"'
             slides += (
@@ -183,6 +225,8 @@ def _card(
                 f'{"" if n else " class=cur"}>'
             )
             n += 1
+            if key in _EXTERIOR_IMAGE_KEYS:
+                has_exterior = True
     if not n:
         carousel = '<div class="noimg">no imagery</div>'
     else:
@@ -191,6 +235,13 @@ def _card(
         carousel = (f'<div class="carousel" data-n="{n}" data-i="0">{arrows}'
                     f'<div class="frame">{slides}</div>'
                     f'<div class="cap"></div></div>')
+    exterior_status = ""
+    if not has_exterior:
+        exterior_status = (
+            '<div class="exterior-status missing"><strong>No exterior view '
+            'available.</strong> Use the map links below to verify the building.'
+            '</div>'
+        )
 
     controls_dis = " disabled" if reviewed else ""
     submit_dis = " disabled" if reviewed and not writeback_error else ""
@@ -220,7 +271,8 @@ def _card(
         for fo in fit_options:
             pre = " sel" if fo == picked_fit else ""
             chips_f += (f'<button type="button" class="fitchip{pre}"{controls_dis} '
-                        f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">{_html.escape(fo)}</button>')
+                        f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">'
+                        f'{_html.escape(_fit_display_label(fo, review_schema))}</button>')
         fitrows += (f'<div class="label">{_html.escape(col)}:</div>'
                     f'<div class="fitchips" data-col="{fit_key}">{chips_f}</div>')
 
@@ -234,7 +286,7 @@ def _card(
         for col, fit_key, _fit_options in fit_specs:
             v = human.get(fit_key)
             if v:
-                saved += f" · {col}: {v}"
+                saved += f" · {col}: {_fit_display_label(v, review_schema)}"
         status = f'<span class="status ok">{_html.escape(saved)}</span>'
     elif human and review_schema == SINGLE_FIT_SCHEMA:
         status = '<span class="status err">HVAC saved; choose Fit to complete</span>'
@@ -247,6 +299,34 @@ def _card(
             f'<div class="source">Tab: {_html.escape(str(e["source_tab"]))} '
             f'· row {_html.escape(str(e.get("source_row") or ""))}</div>'
         )
+    source_context = e.get("source_context") or {}
+    stories = str(source_context.get("stories") or "").strip()
+    context = ""
+    if stories:
+        context = (
+            '<div class="source-context">'
+            f'<span class="context-item">Sheet Stories/Floors: <strong>'
+            f'{_html.escape(stories)}</strong></span></div>'
+        )
+    sheet_details = ""
+    building_info = source_context.get("building_info") or {}
+    if isinstance(building_info, dict):
+        info_rows = []
+        for key, label in _SHEET_BUILDING_INFO_FIELDS:
+            value = str(building_info.get(key) or "").strip()
+            if not value:
+                continue
+            info_rows.append(
+                '<div class="sheet-info-row">'
+                f'<dt>{_html.escape(label)}</dt>'
+                f'<dd>{_html.escape(value[:160])}</dd></div>'
+            )
+        if info_rows:
+            sheet_details = (
+                '<details class="sheet-details"><summary>'
+                'Other building information from Sheet</summary>'
+                f'<dl>{"".join(info_rows)}</dl></details>'
+            )
     button_text = "Retry Sheet write-back" if writeback_error else "Submit"
     review_state = review_state or _review_state(e, review_schema)[0]
     state_class = (
@@ -269,17 +349,19 @@ def _card(
     return f'''
 <article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_error else ''}{state_class}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-review-state="{review_state}" data-addr="{addr_attr}" data-ai="{_html.escape(ai)}">
   <div class="head">
-    <div><div class="addr">{addr_e}</div>{source}</div>
+    <div><div class="addr">{addr_e}</div>{source}{context}</div>
     <div class="ai">model: <span class="badge" style="background:{ai_color}">{_html.escape(ai) or '—'}</span></div>
   </div>
   {issue}
   {carousel}
+  {exterior_status}
   <div class="links">
     <a href="{gmaps}" target="_blank" rel="noopener">\U0001f4cd Google Maps</a>
     <a href="{gearth}" target="_blank" rel="noopener">\U0001f30d Google Earth</a>
     <a href="{bing}" target="_blank" rel="noopener">\U0001f5fa️ Bing Maps</a>
   </div>
   <details class="why"><summary>What the models said</summary>{_model_boxes(e, reasoning)}</details>
+  {sheet_details}
   <div class="review">
     <div class="label">HVAC systems you see (check all):</div>
     <div class="chips">{chips}</div>
@@ -294,7 +376,7 @@ def _card(
 def build_review_page(
     entries, job_id, webhook_url="", title="Cooling Tower Review",
     csrf_token="", review_schema=CURRENT_REVIEW_SCHEMA,
-    page=None, page_size=None, page_url="",
+    page=None, page_size=None, page_url="", source_context_refresh_url="",
 ):
     """Render a review page, optionally limited to one server-selected page.
 
@@ -444,7 +526,16 @@ def build_review_page(
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
+    context_refresh = json.dumps(str(source_context_refresh_url or ""))
     schema_json = json.dumps(str(review_schema))
+    source_context_toolbar = ""
+    if source_context_refresh_url:
+        source_context_toolbar = '''
+<div class="context-refresh">
+  <div><strong>Stories missing?</strong><span> Load only the Stories/Floors column from the source Sheet. Analysis and review decisions are unchanged.</span></div>
+  <button type="button" id="refresh-source-context" onclick="refreshSourceContext()">Load stories from Sheet</button>
+  <span id="context-refresh-status" class="context-refresh-status"></span>
+</div>'''
     fit_help = (
         "both Optimizer Fit and Periscope Fit choices"
         if review_schema == DUAL_FIT_SCHEMA
@@ -468,6 +559,8 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .tab-group{{margin:0 0 28px}}.tab-head{{display:flex;justify-content:space-between;align-items:center;
  gap:12px;margin:6px 2px 12px;padding-bottom:8px;border-bottom:1px solid #333b45}}
 .tab-head h2{{margin:0;font-size:18px}}.tab-head span,.source{{color:#9aa3ad;font-size:12px}}
+.source-context{{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}}
+.context-item{{color:#d8dde4;font-size:13px}}.context-item strong{{color:#fff}}
 .card{{background:#161a20;border:1px solid #262b33;border-radius:12px;padding:16px;margin:0 0 16px}}
 .card.done{{border-color:#2f9e44;opacity:.85}}
 .card.writeback-error{{border-color:#f59f00;opacity:1}}
@@ -487,8 +580,16 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .nav:hover{{background:rgba(40,48,60,.95)}}.prev{{left:8px}}.next{{right:8px}}
 .cap{{text-align:center;color:#9aa3ad;font-size:12px;padding:6px}}
 .noimg{{color:#6b7280;font-style:italic;padding:28px;text-align:center}}
+.exterior-status{{margin:-2px 0 10px;padding:8px 10px;border-radius:8px;font-size:13px}}
+.exterior-status.missing{{background:#2b2415;border:1px solid #8a6d2f;color:#f5deb3}}
 .links{{display:flex;gap:14px;font-size:13px;margin:2px 0 10px}}.links a{{color:#4d9fff;text-decoration:none}}.links a:hover{{text-decoration:underline}}
 .why{{margin:4px 0 12px}}.why summary{{cursor:pointer;color:#9aa3ad;font-size:13px}}.why p.combined{{margin:8px 0 0;font-size:13px;color:#aeb6bf}}
+.sheet-details{{margin:4px 0 12px;border:1px solid #333b45;border-radius:8px;padding:8px 10px}}
+.sheet-details summary{{cursor:pointer;color:#c7ccd2;font-size:13px;font-weight:600}}
+.sheet-details dl{{margin:10px 0 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px}}
+.sheet-info-row{{background:#101318;border-radius:6px;padding:7px 9px}}
+.sheet-info-row dt{{color:#8f98a3;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}
+.sheet-info-row dd{{margin:2px 0 0;color:#eef1f4;font-size:13px;overflow-wrap:anywhere}}
 .mbox{{margin:8px 0 0;border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.45}}
 .mbox .mh{{font-weight:700;font-size:12px;margin-bottom:5px;letter-spacing:.02em}}
 .mbox.gemini{{background:#0f2a1a;border:1px solid #2f9e44;color:#d3f0dd}}.mbox.gemini .mh{{color:#69db7c}}
@@ -518,13 +619,19 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .page-link{{color:#4d9fff;text-decoration:none;white-space:nowrap}}.page-link:hover{{text-decoration:underline}}
 .page-link.disabled{{color:#59616c;cursor:default}}.page-link.disabled:hover{{text-decoration:none}}
 .page-summary{{color:#c7ccd2;text-align:center;font-size:13px}}
+.context-refresh{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 16px;
+ background:#161a20;border:1px solid #375a7f;border-radius:10px;padding:10px 12px}}
+.context-refresh div{{flex:1;min-width:240px}}.context-refresh div span{{color:#9aa3ad;font-size:13px}}
+.context-refresh button{{background:#173a66;color:#fff;border:1px solid #4d9fff;border-radius:8px;padding:8px 12px;cursor:pointer}}
+.context-refresh button:disabled{{background:#2a3340;color:#6b7280;border-color:#333b45;cursor:not-allowed}}
+.context-refresh-status{{color:#9aa3ad;font-size:13px}}.context-refresh-status.err{{color:#ff6b6b}}
 #lb{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:99;padding:24px;text-align:center;cursor:zoom-out}}
 #lb img{{max-width:96%;max-height:92vh;border:2px solid #fff;border-radius:6px}}
 @media(max-width:560px){{.pagination{{gap:8px}}.page-link{{font-size:12px}}.page-summary{{font-size:11px}}}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
 <div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · <span id="pending-count">{pending0}</span> still need review · <span id="attention-count">{attention0}</span> need attention · every Submit writes to the source tab</div></header>
-<div class="wrap">{pagination}{cards}</div>
+<div class="wrap">{source_context_toolbar}{pagination}{cards}{pagination}</div>
 <div class="bulk-review">
   <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card{' on this page' if pagination_enabled else ''} that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
   <button type="button" id="submit-all" class="bulk-submit" onclick="submitAll()">Submit all completed{' on this page' if pagination_enabled else ''}</button>
@@ -532,7 +639,21 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 </div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
 <script>
-const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json};let done={done0};
+const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json}, SOURCE_CONTEXT_REFRESH={context_refresh};let done={done0};
+async function refreshSourceContext(){{
+  if(!SOURCE_CONTEXT_REFRESH)return;
+  const button=document.getElementById('refresh-source-context');
+  const status=document.getElementById('context-refresh-status');
+  button.disabled=true;status.textContent='Loading stories...';status.className='context-refresh-status';
+  try{{
+    const headers={{}};if(CSRF_TOKEN)headers['X-CSRF-Token']=CSRF_TOKEN;
+    const response=await fetch(SOURCE_CONTEXT_REFRESH,{{method:'POST',headers}});
+    let reply={{}};try{{reply=await response.json();}}catch(e){{reply={{}};}}
+    if(!response.ok)throw new Error(reply.error||('HTTP '+response.status));
+    status.textContent=(reply.updated||0)+' card'+((reply.updated||0)===1?'':'s')+' updated';
+    window.location.reload();
+  }}catch(e){{status.textContent=e.message+' (retry)';status.className='context-refresh-status err';button.disabled=false;}}
+}}
 function zoom(s){{document.getElementById('lbi').src=s;document.getElementById('lb').style.display='block';}}
 function setCap(c){{const i=+c.dataset.i,imgs=c.querySelectorAll('.frame img');
   const current=imgs[i];if(!current.getAttribute('src')&&current.dataset.src)current.src=current.dataset.src;

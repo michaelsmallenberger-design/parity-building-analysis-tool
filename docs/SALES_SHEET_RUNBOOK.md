@@ -64,7 +64,8 @@ changed, the converted copy is trashed and the run stops before analysis.
 ### 4. Let Parity Analyze the Buildings
 
 Parity processes each address in the background. It uses maps, building outlines,
-and rooftop imagery to prepare a review card for each building.
+rooftop imagery, and available ground-level exterior imagery to prepare a review
+card for each building.
 
 The progress screen gives a link to the dark **Review Page**. You can keep that
 link and return later through the Reviews page; progress is saved.
@@ -77,13 +78,29 @@ batch is running. Every result is tied to its original tab and physical row.
 On the dark Review Page, each card shows the address, rooftop imagery, useful map
 links, and the model's guidance. A person—not the model—makes the final choice.
 
+Cards show **Sheet Stories/Floors** only when the source Sheet contains a
+recognized Stories or Floors column. Parity displays that source value; it does
+not calculate or independently verify the number.
+
+When the Sheet contains other approved building facts, the collapsed **Other
+building information from Sheet** section can show property name/type, units,
+building count, square footage, year built/renovated, building class,
+construction type, city, and market. Owner/manager names, contacts, notes,
+comments, and unrecognized columns are never copied into the review card.
+
+The carousel labels the address-targeted ground view **Exterior / address** and,
+when coverage exists, a second front/side context view **Exterior / alternate
+angle**. If neither exterior image is available, the card says so and directs
+the reviewer to the existing map links.
+
 For each building:
 
 1. Look at the imagery and map links.
 2. Select every HVAC system you can actually see, or select **None**.
-3. Choose one **Fit**: **Optimizer**, **Periscope**, **Unclear**, or **Bad**.
-4. Add a note only when it would help the next person.
-5. Click **Submit**.
+3. Choose **Optimizer Fit**.
+4. Independently choose **Periscope Fit**.
+5. Add a note only when it would help the next person.
+6. Click **Submit**.
 
 Each Submit immediately saves the reviewer choice and writes it back into the
 same row in Sales's Google Sheet. The model guidance itself is not added as a
@@ -93,11 +110,17 @@ customer-facing Sheet column.
 
 Each building requires two independent product decisions:
 
-- **Optimizer Fit:** `Customer`, `Good`, `Okay`, `Bad`, or `Not Sure`
-- **Periscope Fit:** `Customer`, `Good`, `Okay`, `Bad`, or `Not Sure`
+- **Optimizer Fit:** `Customer`, `Good`, `Maybe`, `Bad`, or `Not Sure`
+- **Periscope Fit:** `Customer`, `Good`, `Maybe`, `Bad`, or `Not Sure`
 
 A building can be a good fit for both products, one product, or neither. The
 reviewer therefore never combines these decisions into one field.
+
+Use **Maybe** when the visible evidence suggests a possible fit but is not
+strong enough for **Good**. Use **Not Sure** only when the imagery or building
+location is not clear enough to make the fit judgment. For compatibility with
+existing Sheet dropdowns and saved reviews, the review page writes the
+established canonical value `Okay` when a reviewer selects **Maybe**.
 
 ## What Changes in the Sales Sheet
 
@@ -130,7 +153,9 @@ canonical output.
 | --- | --- |
 | The wrong address column or Sheet tab is suggested | Do not confirm it. Go back and contact the Parity operator. |
 | A Sheet says it needs setup | Check the address header and make sure the service account has Editor access. |
-| A building has poor/no imagery | Mark the best human decision and add a short note; do not invent a result. |
+| A building has poor/no imagery | Use **Not Sure** when the location or building is not clear enough to judge; add a short note and do not invent a result. |
+| Stories/Floors is blank | Confirm that the source Sheet contains a recognized `Stories` or `Floors` column. Parity does not estimate the value from imagery. |
+| The card says no exterior view is available | Use the Google Maps, Google Earth, or Bing links directly below the imagery. |
 | A Sheet value is marked invalid | Stop and tell the Parity operator; do not force a value outside the team dropdown. |
 | A row was changed while a run was in progress | Stop the batch and have the Parity operator verify the row mapping before review continues. |
 

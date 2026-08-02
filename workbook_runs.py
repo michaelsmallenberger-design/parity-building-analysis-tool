@@ -789,6 +789,7 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
                 "grid_id": target["grid_id"],
                 "tab": target["tab"],
                 "source_row": target["source_row"],
+                "source_context": deepcopy(target.get("source_context") or {}),
             })
         slim_bindings.append({
             key: deepcopy(value)

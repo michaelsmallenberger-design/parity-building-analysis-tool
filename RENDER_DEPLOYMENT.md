@@ -50,6 +50,19 @@ Optional (enables the live review-to-sheet loop):
 Without these, the app runs exactly as before: `sheet_url` stays empty and the
 operator/skill flow builds the sheet from `GET /api/batch`.
 
+Optional Street View review controls (defaults are suitable for production):
+
+- `STREETVIEW_SECONDARY_ENABLED=true`
+- `STREETVIEW_PRIMARY_FOV=90`, `STREETVIEW_PRIMARY_PITCH=5`
+- `STREETVIEW_CONTEXT_FOV=105`, `STREETVIEW_CONTEXT_PITCH=5`
+- `STREETVIEW_ALTERNATE_HEADING_OFFSET=55`
+
+Each eligible address performs metadata checks before downloading at most two
+outdoor Street View images. These requests use the existing Google Maps key and
+can affect provider usage; missing coverage is skipped and never changes the
+analysis verdict. Disable `STREETVIEW_SECONDARY_ENABLED` to cap new runs at one
+ground-level review image per address.
+
 ## Google Sheets service account (one-time, ~15 min)
 
 This lets the server create the output Google Sheet at run time and write each
