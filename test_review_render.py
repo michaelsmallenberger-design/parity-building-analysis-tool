@@ -66,6 +66,10 @@ def test_review_contract():
     assert 'data-col="periscope_fit"' in html
     for fit in DUAL_FIT_OPTIONS:
         assert html.count(f'data-fit="{fit}"') == 2
+    assert html.count(
+        'data-fit="Okay" onclick="pickFit(this)">Maybe</button>'
+    ) == 2
+    assert 'data-fit="Okay" onclick="pickFit(this)">Okay</button>' not in html
     for host in MAP_HOSTS:
         assert host in html
 
@@ -93,6 +97,50 @@ def test_carousel_only_sources_first_image_until_navigation():
         "if(!current.getAttribute('src')&&current.dataset.src)"
         "current.src=current.dataset.src"
     ) in page
+
+
+def test_review_card_shows_stories_and_alternate_exterior_view():
+    entry = {
+        **_entry(),
+        "source_context": {
+            "stories": "14",
+            "building_info": {
+                "property_name": "Synthetic Tower",
+                "units": "250",
+                "year_built": "1988",
+                "private_notes": "must never render",
+            },
+        },
+        "result_image_url_streetview_context": (
+            "https://images.example/alternate-exterior.jpg"
+        ),
+    }
+    page = build_review_page([entry], job_id="source-context")
+
+    assert (
+        '<span class="context-item">Sheet Stories/Floors: '
+        '<strong>14</strong></span>'
+    ) in page
+    assert "Other building information from Sheet" in page
+    assert "Property name" in page and "Synthetic Tower" in page
+    assert "Units" in page and "250" in page
+    assert "Year built" in page and "1988" in page
+    assert "private_notes" not in page and "must never render" not in page
+    assert 'data-label="Exterior / address"' in page
+    assert 'data-label="Exterior / alternate angle"' in page
+    assert "alternate-exterior.jpg" in page
+
+
+def test_review_card_explains_when_no_exterior_view_is_available():
+    entry = _entry()
+    entry.pop("result_image_url_streetview")
+    page = build_review_page([entry], job_id="no-exterior")
+
+    assert "No exterior view available" in page
+    assert "Use the map links below" in page
+
+    with_exterior = build_review_page([_entry()], job_id="has-exterior")
+    assert "No exterior view available" not in with_exterior
 
 
 def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
@@ -141,6 +189,7 @@ def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
     assert "Buildings 6–10 of 15 · page 2 of 3" in page
     assert 'href="/review/paged?mode=compact&amp;page=1"' in page
     assert 'href="/review/paged?mode=compact&amp;page=3"' in page
+    assert page.count('class="pagination"') == 2
     assert "Submit all completed on this page" in page
     assert "const totalInGroup=+progress.dataset.total" in page
 
@@ -347,6 +396,25 @@ def test_saved_human_choices_override_positive_defaults():
     )
 
 
+def test_saved_okay_choice_is_presented_as_maybe_without_changing_canonical_value():
+    saved = {
+        **_entry(),
+        "human": {
+            "hvac_systems": "RTU",
+            "optimizer_fit": "Okay",
+            "periscope_fit": "Bad",
+        },
+    }
+    page = build_review_page([saved], job_id="saved-maybe")
+
+    assert (
+        'class="fitchip sel" disabled data-fit="Okay" '
+        'onclick="pickFit(this)">Maybe</button>'
+        in _fit_group(page, "optimizer_fit")
+    )
+    assert "Optimizer Fit: Maybe" in page
+
+
 def test_partial_human_choices_are_never_filled_by_ai_defaults():
     partial = {
         **_entry(),
@@ -493,6 +561,8 @@ def test_legacy_single_batch_stays_compatible():
 if __name__ == "__main__":
     test_review_contract()
     test_carousel_only_sources_first_image_until_navigation()
+    test_review_card_shows_stories_and_alternate_exterior_view()
+    test_review_card_explains_when_no_exterior_view_is_available()
     test_server_pagination_limits_dom_and_keeps_global_tab_progress()
     test_pagination_is_opt_in_for_legacy_callers()
     test_unresolved_rows_are_appended_with_reasons_and_links()
@@ -501,6 +571,7 @@ if __name__ == "__main__":
     test_positive_result_defaults_cooling_tower_and_optimizer_only()
     test_possible_cooling_tower_uses_the_same_review_defaults()
     test_saved_human_choices_override_positive_defaults()
+    test_saved_okay_choice_is_presented_as_maybe_without_changing_canonical_value()
     test_partial_human_choices_are_never_filled_by_ai_defaults()
     test_negative_result_does_not_default_review_choices()
     test_positive_legacy_result_defaults_to_optimizer()

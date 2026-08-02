@@ -126,6 +126,9 @@ def _expand_workbook_chunk_entries(chunk, web_results):
             entry["source_grid_id"] = target["grid_id"]
             entry["source_tab"] = target["tab"]
             entry["source_row"] = target["source_row"]
+            entry["source_context"] = deepcopy(
+                target.get("source_context") or {}
+            )
             entry["analysis_key"] = item["analysis_key"]
             entries.append(entry)
     return entries, missing_analysis_items
@@ -172,6 +175,7 @@ def _account_for_workbook_sources(run, by_source):
             "source_grid_id": source.get("grid_id"),
             "source_tab": source.get("tab") or "",
             "source_row": source.get("source_row"),
+            "source_context": deepcopy(source.get("source_context") or {}),
             "analysis_key": source.get("analysis_key") or "",
             "address": source.get("address") or "",
             "verdict": "needs_review",

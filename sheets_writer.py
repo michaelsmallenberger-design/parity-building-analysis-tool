@@ -109,6 +109,153 @@ def _norm(h) -> str:
     return re.sub(r"\s+", " ", str(h)).strip().lower()
 
 
+_STORIES_HEADER_ALIASES = frozenset({
+    "stories",
+    "story count",
+    "number of stories",
+    "# of stories",
+    "floors",
+    "floor count",
+    "number of floors",
+    "# of floors",
+})
+
+# Reviewer context is deliberately narrower than the source workbook. These
+# structural/property facts help a reviewer judge building fit, while contacts,
+# owners, managers, notes, comments, and other arbitrary columns never enter the
+# persisted review batch or browser page.
+_REVIEW_BUILDING_INFO_ALIASES = (
+    ("property_name", frozenset({
+        "property name", "building name", "property",
+    })),
+    ("city", frozenset({"city"})),
+    ("market_name", frozenset({
+        "market name", "market", "submarket", "submarket name",
+    })),
+    ("units", frozenset({
+        "units", "# of units", "unit count", "number of units",
+    })),
+    ("total_buildings", frozenset({
+        "total buildings", "buildings", "# of buildings",
+        "number of buildings",
+    })),
+    ("year_built", frozenset({
+        "year built", "built", "construction year",
+    })),
+    ("year_renovated", frozenset({
+        "year renovated", "renovated", "year renov",
+    })),
+    ("property_type", frozenset({
+        "property type", "primary property type", "building type",
+        "asset type",
+    })),
+    ("secondary_type", frozenset({
+        "secondary type", "secondary property type",
+    })),
+    ("affordable_type", frozenset({"affordable type"})),
+    ("square_feet", frozenset({
+        "square feet", "square footage", "sq ft", "sqft",
+        "building area", "gross building area", "gross square feet", "gsf",
+    })),
+    ("building_class", frozenset({"building class", "class"})),
+    ("construction_type", frozenset({"construction type"})),
+)
+
+
+def _review_context_value(cells, index) -> str:
+    raw = cells[index] if index < len(cells or []) else ""
+    return re.sub(r"\s+", " ", str(raw)).strip()[:160]
+
+
+def review_context_for_row(headers, cells) -> dict:
+    """Return the small, allowlisted source context safe for a review card.
+
+    Never persist an arbitrary source row in the workbook manifest. Stable
+    source identity remains tab + physical row; this helper copies only fields
+    deliberately approved for the review UI.
+    """
+    normalized_headers = [_norm(header) for header in (headers or [])]
+    context = {}
+    for index, header in enumerate(normalized_headers):
+        if header not in _STORIES_HEADER_ALIASES:
+            continue
+        value = _review_context_value(cells, index)
+        if value:
+            context["stories"] = value[:80]
+            break
+
+    building_info = {}
+    for key, aliases in _REVIEW_BUILDING_INFO_ALIASES:
+        for index, header in enumerate(normalized_headers):
+            if header not in aliases:
+                continue
+            value = _review_context_value(cells, index)
+            if value:
+                building_info[key] = value
+                break
+    if building_info:
+        context["building_info"] = building_info
+    return context
+
+
+def _stories_column_index(headers) -> int | None:
+    return next(
+        (
+            index
+            for index, header in enumerate(headers or [])
+            if _norm(header) in _STORIES_HEADER_ALIASES
+        ),
+        None,
+    )
+
+
+def binding_has_review_context(binding) -> bool:
+    return _stories_column_index((binding or {}).get("headers", [])) is not None
+
+
+def read_review_contexts_for_bindings(bindings) -> dict:
+    """Read only the allowlisted Stories/Floors column for exact bound rows.
+
+    This supports old persisted batches without replaying geocoding, imagery,
+    detection, or model work. Returned keys are stable grid/tab/physical-row
+    identities rather than list positions.
+    """
+    sheets, _ = _get_services()
+    contexts = {}
+    for binding in bindings or []:
+        headers = list(binding.get("headers") or [])
+        column_index = _stories_column_index(headers)
+        row_numbers = sorted({
+            int(row)
+            for row in binding.get("row_numbers", [])
+            if str(row).strip().isdigit() and int(row) >= 2
+        })
+        if column_index is None or not row_numbers:
+            continue
+        first_row, last_row = row_numbers[0], row_numbers[-1]
+        column = _col_letter(column_index)
+        values = sheets.spreadsheets().values().get(
+            spreadsheetId=binding["spreadsheet_id"],
+            range=_tab_range(
+                binding["tab"], f"{column}{first_row}:{column}{last_row}"
+            ),
+        ).execute().get("values", [])
+        for source_row in row_numbers:
+            offset = source_row - first_row
+            row = values[offset] if offset < len(values) else []
+            context = review_context_for_row(
+                [headers[column_index]],
+                [row[0] if row else ""],
+            )
+            if context:
+                contexts[(
+                    str(binding.get("grid_id")),
+                    str(binding.get("tab") or ""),
+                    source_row,
+                )] = context
+    return contexts
+
+
 def _tab_range(tab: str, a1: str = "") -> str:
     quoted = "'" + str(tab).replace("'", "''") + "'"
     return f"{quoted}!{a1}" if a1 else quoted
@@ -269,6 +416,7 @@ def read_bound_sheet_mappings(sheet_url, mappings, expected_fingerprint=None):
                 "tab": selected["tab"],
                 "source_row": row_number,
                 "address": address,
+                "source_context": review_context_for_row(headers, cells),
             })
         bindings.append({
             "spreadsheet_id": inspected["spreadsheet_id"],

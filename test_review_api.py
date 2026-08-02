@@ -265,6 +265,61 @@ def test_upload_mapping_preserves_dual_fields_and_does_not_guess_from_single_fit
     assert rows[0][headers.index("Periscope Fit")] == "Bad"
 
 
+def test_existing_batch_can_load_stories_without_reanalysis(root):
+    with IsolatedReviews(root):
+        review_store.save_batch(
+            "stories-refresh",
+            "Synthetic review",
+            [{
+                "row_id": "sabc:g10:r2",
+                "source_grid_id": 10,
+                "source_tab": "Washington",
+                "source_row": 2,
+                "address": "1 Example Ave",
+                "human": {
+                    "hvac_systems": "RTU",
+                    "optimizer_fit": "Good",
+                    "periscope_fit": "Okay",
+                    "note": "keep this decision",
+                },
+            }],
+            sheet_bindings=[{
+                "spreadsheet_id": "sheet",
+                "grid_id": 10,
+                "tab": "Washington",
+                "headers": ["Address", "Stories"],
+                "row_numbers": [2],
+            }],
+        )
+        original_enabled = sheets_writer.enabled
+        original_read = sheets_writer.read_review_contexts_for_bindings
+        try:
+            sheets_writer.enabled = lambda: True
+            sheets_writer.read_review_contexts_for_bindings = lambda _bindings: {
+                ("10", "Washington", 2): {"stories": "14"},
+            }
+            client = app_railway.app.test_client()
+            page = client.get("/review/stories-refresh")
+            assert page.status_code == 200
+            assert "Load stories from Sheet" in page.get_data(as_text=True)
+            response = client.post(
+                "/review/stories-refresh/source-context/refresh"
+            )
+            assert response.status_code == 200
+            assert response.json["matched"] == 1
+            assert response.json["updated"] == 1
+            batch = review_store.load_batch("stories-refresh")
+            assert batch["entries"][0]["source_context"] == {
+                "stories": "14",
+            }
+            assert batch["entries"][0]["human"]["note"] == (
+                "keep this decision"
+            )
+        finally:
+            sheets_writer.enabled = original_enabled
+            sheets_writer.read_review_contexts_for_bindings = original_read
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp_dir:
         test_single_fit_submission_returns_200_and_updates_exact_source(temp_dir)
@@ -276,5 +331,7 @@ if __name__ == "__main__":
         test_unreviewed_misstamped_run_upgrades_from_source_tab_inventory(temp_dir)
     with tempfile.TemporaryDirectory() as temp_dir:
         test_reviewed_single_fit_run_is_never_auto_migrated(temp_dir)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_existing_batch_can_load_stories_without_reanalysis(temp_dir)
     test_upload_mapping_preserves_dual_fields_and_does_not_guess_from_single_fit()
     print("OK: review API dual-product mapping and single-Fit compatibility hold.")

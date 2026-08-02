@@ -1047,6 +1047,19 @@ def review_page(job_id):
     except (TypeError, ValueError):
         page_size = 10
     page_size = min(max(page_size, 1), 50)
+    bindings = batch.get("sheet_bindings") or []
+    needs_source_context = any(
+        not str((entry.get("source_context") or {}).get("stories") or "").strip()
+        for entry in batch.get("entries", [])
+    )
+    source_context_refresh_url = ""
+    if (
+        needs_source_context
+        and any(sheets_writer.binding_has_review_context(item) for item in bindings)
+    ):
+        source_context_refresh_url = url_for(
+            "refresh_review_source_context", job_id=job_id
+        )
     html = build_review_page(
         batch.get("entries", []),
         job_id=job_id,
@@ -1057,8 +1070,37 @@ def review_page(job_id):
         page=request.args.get("page", 1, type=int),
         page_size=page_size,
         page_url=request.path,
+        source_context_refresh_url=source_context_refresh_url,
     )
     return Response(html, mimetype="text/html")
+
+
+@app.route('/review/<job_id>/source-context/refresh', methods=['POST'])
+def refresh_review_source_context(job_id):
+    """Refresh allowlisted Sheet context without rerunning paid analysis."""
+    batch = review_store.load_batch(job_id)
+    if not batch:
+        return jsonify({"error": "unknown batch"}), 404
+    bindings = batch.get("sheet_bindings") or []
+    eligible = [
+        binding for binding in bindings
+        if sheets_writer.binding_has_review_context(binding)
+    ]
+    if not eligible:
+        return jsonify({"error": "no Stories/Floors source column is bound"}), 409
+    if not sheets_writer.enabled():
+        return jsonify({"error": "Google Sheets access is not configured"}), 503
+    try:
+        contexts = sheets_writer.read_review_contexts_for_bindings(eligible)
+        receipt = review_store.merge_source_contexts(job_id, contexts)
+    except Exception:
+        log.exception("Could not refresh review source context for %s", job_id)
+        return jsonify({"error": "could not read Stories/Floors from the source Sheet"}), 502
+    return jsonify({
+        "ok": True,
+        "matched": receipt["matched"],
+        "updated": receipt["updated"],
+    })
 
 
 @app.route('/api/review', methods=['POST'])

@@ -856,6 +856,7 @@ def test_missing_workbook_results_are_explicit_attention_rows():
                     "grid_id": 10,
                     "tab": "Washington",
                     "source_row": 2,
+                    "source_context": {"stories": "4"},
                 }],
             },
             {
@@ -866,6 +867,7 @@ def test_missing_workbook_results_are_explicit_attention_rows():
                     "grid_id": 20,
                     "tab": "Virginia",
                     "source_row": 2,
+                    "source_context": {"stories": "12"},
                 }],
             },
         ],
@@ -881,6 +883,7 @@ def test_missing_workbook_results_are_explicit_attention_rows():
     assert [entry["source_key"] for entry in chunk_entries] == [
         "ssheet:g20:r2",
     ]
+    assert chunk_entries[0]["source_context"] == {"stories": "12"}
     assert [item["address"] for item in missing_items] == [
         "1 Missing Result Ave",
     ]
@@ -902,10 +905,96 @@ def test_missing_workbook_results_are_explicit_attention_rows():
     assert missing["source_grid_id"] == 10
     assert missing["source_tab"] == "Washington"
     assert missing["source_row"] == 2
+    assert missing["source_context"] == {"stories": "4"}
     assert missing["machine_status"] == "missing_result"
     assert missing["verdict"] == "needs_review"
     assert "No analysis result was saved" in missing["error"]
     assert completed[1]["address"] == "2 Completed Result Ave"
+
+
+def test_review_context_extracts_only_allowlisted_building_fields():
+    headers = [
+        "Property Name", "Floors", "Units", "Year Built",
+        "Square Footage", "Private Notes", "True Owner Name", "Name",
+    ]
+    cells = [
+        "Synthetic Tower", "17", "250", "1988", "120,000",
+        "do not copy", "private owner", "private person",
+    ]
+
+    assert sheets_writer.review_context_for_row(headers, cells) == {
+        "stories": "17",
+        "building_info": {
+            "property_name": "Synthetic Tower",
+            "units": "250",
+            "year_built": "1988",
+            "square_feet": "120,000",
+        },
+    }
+    assert sheets_writer.review_context_for_row(
+        ["Address", "# of stories"], ["1 Example Ave", "9"]
+    ) == {"stories": "9"}
+    assert sheets_writer.review_context_for_row(
+        ["Address", "Private Notes", "Owner Name"],
+        ["1 Example Ave", "do not copy", "private owner"],
+    ) == {}
+
+
+def test_existing_batch_stories_refresh_uses_exact_source_identity(root):
+    class FakeSheets:
+        def __init__(self):
+            self.ranges = []
+
+        def spreadsheets(self):
+            return self
+
+        def values(self):
+            return self
+
+        def get(self, **kwargs):
+            self.ranges.append(kwargs["range"])
+            return FakeRequest({"values": [["4"], ["12"]]})
+
+    fake = FakeSheets()
+    original_services = sheets_writer._get_services
+    try:
+        sheets_writer._get_services = lambda: (fake, None)
+        bindings = [{
+            "spreadsheet_id": "sheet",
+            "grid_id": 10,
+            "tab": "Washington",
+            "headers": ["Address", "Stories"],
+            "row_numbers": [2, 3],
+        }]
+        contexts = sheets_writer.read_review_contexts_for_bindings(bindings)
+        assert fake.ranges == ["'Washington'!B2:B3"]
+        assert contexts == {
+            ("10", "Washington", 2): {"stories": "4"},
+            ("10", "Washington", 3): {"stories": "12"},
+        }
+    finally:
+        sheets_writer._get_services = original_services
+
+    with IsolatedState(root):
+        review_store.save_batch(
+            "stories-refresh",
+            "Synthetic review",
+            [
+                {"row_id": "a", "source_grid_id": 10,
+                 "source_tab": "Washington", "source_row": 2},
+                {"row_id": "b", "source_grid_id": 10,
+                 "source_tab": "Washington", "source_row": 3},
+            ],
+            sheet_bindings=bindings,
+        )
+        receipt = review_store.merge_source_contexts(
+            "stories-refresh", contexts
+        )
+        assert receipt["matched"] == 2
+        assert receipt["updated"] == 2
+        batch = review_store.load_batch("stories-refresh")
+        assert batch["entries"][0]["source_context"] == {"stories": "4"}
+        assert batch["entries"][1]["source_context"] == {"stories": "12"}
 
 
 def test_grouped_review_and_exact_tab_writeback():
@@ -1302,6 +1391,8 @@ if __name__ == "__main__":
         test_workbook_checkpoints_only_write_completed_rows()
         test_machine_attention_verdicts_drive_live_state_and_resolve_on_review()
         test_missing_workbook_results_are_explicit_attention_rows()
+        test_review_context_extracts_only_allowlisted_building_fields()
+        test_existing_batch_stories_refresh_uses_exact_source_identity(temp_dir)
         test_corrected_rerun_uses_exact_multitab_source(temp_dir)
         test_legacy_run_file_fails_closed_on_multiple_tabs(temp_dir)
     test_dropdown_conversion_fails_closed()

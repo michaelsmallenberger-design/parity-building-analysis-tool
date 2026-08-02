@@ -43,7 +43,8 @@ versioned workbook engine.
 - `POST /api/v2/workbook-runs/<run_id>/retry`: resume a failed/cancelled analysis from durable row checkpoints without a second reservation
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
-- `GET /review/<batch_id>`: interactive dark review page for the team (imagery carousel + AI guidance, HVAC multi-select + Fit single-select, Submit per building; each Submit is recorded server-side AND written live into the batch's Google Sheet row when one exists)
+- `GET /review/<batch_id>`: interactive dark review page for the team (Sheet-provided Stories/Floors, a collapsed allowlisted building-facts panel, explicit missing-exterior status, address-targeted and alternate-angle exterior views when available, roof imagery + AI guidance, HVAC multi-select + Fit choices, and exact-row Sheet write-back)
+- `POST /review/<batch_id>/source-context/refresh`: refresh only allowlisted Stories/Floors values for an existing bound-Sheet batch; this does not replay analysis or change human decisions
 - `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — the fallback for building the final Google Sheet by hand
 - `GET /api/batch/<batch_id>/failures`: the rows that failed analysis (imagery/geocode/analyzer errors) for the cleanup skill
 - `POST /api/batch/<batch_id>/rerun`: re-run failed rows in place (optionally with corrected addresses) and merge fresh results into the same review page/sheet
@@ -106,8 +107,11 @@ For each address:
 6. Run YOLO detections. `MODEL_PATHS` can enable an ensemble; if unset, only `MODEL_PATH` is used.
 7. Convert detections into geo-space and filter them against the footprint.
 8. Render marked detail/wide imagery and a close-up.
-9. Call `vlm.verify_address()` once for the address. Gemini is the normal reviewer; Grok is allowed one emergency request only after a technical Gemini failure.
-10. Emit CSV-compatible data plus audit-card web entries.
+9. Resolve an outdoor Street View panorama from the full source address, then
+   add at most one alternate front/side-context view. Missing coverage never
+   changes the machine verdict.
+10. Call `vlm.verify_address()` once for the address. Gemini is the normal reviewer; Grok is allowed one emergency request only after a technical Gemini failure.
+11. Emit CSV-compatible data plus audit-card web entries.
 
 The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functions still exist in `vlm.py` for compatibility/testing, but the active per-address pipeline uses `verify_address()`.
 
@@ -133,6 +137,10 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `MAPBOX_ZOOM`: detail tile zoom, default `19`
 - `MAPBOX_ZOOM_WIDE`: wide/context tile zoom, default `18`
 - `MAPBOX_SIZE`: default `768x768`
+- `STREETVIEW_SECONDARY_ENABLED`: default `true`; bounds review imagery to one address-targeted exterior plus at most one alternate view
+- `STREETVIEW_PRIMARY_FOV` / `STREETVIEW_PRIMARY_PITCH`: defaults `90` / `5`
+- `STREETVIEW_CONTEXT_FOV` / `STREETVIEW_CONTEXT_PITCH`: defaults `105` / `5`
+- `STREETVIEW_ALTERNATE_HEADING_OFFSET`: default `55` degrees when both requests resolve to the same panorama
 - `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
 - `MULTI_TAB_WORKBOOK_ENABLED`: master workbook-engine feature flag
 - `MULTI_TAB_BROWSER_ENABLED`, `MULTI_TAB_DRIVE_ENABLED`, `MULTI_TAB_API_ENABLED`: staged surface flags

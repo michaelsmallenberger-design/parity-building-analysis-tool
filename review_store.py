@@ -141,6 +141,40 @@ def save_raw(job_id: str, batch: dict) -> None:
         write_json(_path(job_id), batch)
 
 
+def merge_source_contexts(job_id: str, contexts: dict) -> dict:
+    """Merge allowlisted source context by exact grid/tab/physical-row key."""
+    with _lock_for(job_id):
+        batch = load_batch(job_id)
+        if not batch:
+            return {"matched": 0, "updated": 0, "batch": None}
+        matched = 0
+        updated = 0
+        for entry in batch.get("entries", []):
+            try:
+                source_row = int(entry.get("source_row"))
+            except (TypeError, ValueError):
+                continue
+            key = (
+                str(entry.get("source_grid_id")),
+                str(entry.get("source_tab") or ""),
+                source_row,
+            )
+            incoming = contexts.get(key) or {}
+            stories = str(incoming.get("stories") or "").strip()[:80]
+            if not stories:
+                continue
+            matched += 1
+            existing = dict(entry.get("source_context") or {})
+            if existing.get("stories") == stories:
+                continue
+            existing["stories"] = stories
+            entry["source_context"] = existing
+            updated += 1
+        if updated:
+            write_json(_path(job_id), batch)
+        return {"matched": matched, "updated": updated, "batch": batch}
+
+
 def _rid(entry) -> str:
     return str(
         entry.get("row_id")
