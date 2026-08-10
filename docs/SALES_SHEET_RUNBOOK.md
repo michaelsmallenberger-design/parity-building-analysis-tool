@@ -106,6 +106,32 @@ Each Submit immediately saves the reviewer choice and writes it back into the
 same row in Sales's Google Sheet. The model guidance itself is not added as a
 customer-facing Sheet column.
 
+## Alex Review After Primary Completion
+
+When the Alex review feature is enabled, it waits until every building has a
+complete human HVAC plus both product-fit decisions and no Sheet write-back is
+failed. It then places any building with **Maybe** or **Not Sure** in either
+product at the top under **Needs Alex Review**. These cards remain counted as
+reviewed; the separate Alex count is a follow-up queue, not incomplete primary
+work. Parity changes only the review-page display order and never sorts the
+Google Sheet.
+
+For each Alex card:
+
+1. Click **Review qualification**. HVAC remains locked.
+2. Either adjust Optimizer Fit, Periscope Fit, and/or Notes and click **Save Alex
+   review**, or click **Confirm current qualification** when the uncertainty is
+   still correct.
+3. Click **Cancel** to discard on-screen edits without saving anything.
+
+A successful save or confirmation removes the card from the queue and returns
+to the first review page. If another browser tab saved the card first, the stale
+tab receives a conflict warning and writes nothing. If the local revision saves
+but the Sheet update fails, the card moves to **Needs attention**; use **Retry
+Sheet write-back**. The retry sends the same revision and does not create a
+second history entry. A confirmation makes no Sheet call because no values
+changed.
+
 ## Product-Fit Standard
 
 Each building requires two independent product decisions:
@@ -158,6 +184,8 @@ canonical output.
 | The card says no exterior view is available | Use the Google Maps, Google Earth, or Bing links directly below the imagery. |
 | A Sheet value is marked invalid | Stop and tell the Parity operator; do not force a value outside the team dropdown. |
 | A row was changed while a run was in progress | Stop the batch and have the Parity operator verify the row mapping before review continues. |
+| An Alex review says the row changed in another tab | Reload the page and review the current saved values; the stale submission was not written. |
+| An Alex revision appears under Needs attention | Use Retry Sheet write-back. The local revision is preserved and HVAC remains unchanged. |
 
 ## Quick Checklist
 
@@ -167,4 +195,5 @@ canonical output.
 - [ ] The operator entered the team password and pasted the link.
 - [ ] Any unusual address mapping was checked before confirming.
 - [ ] Every review card was submitted by a person.
+- [ ] When enabled, the Needs Alex Review count reached zero or each remaining uncertainty was intentionally confirmed.
 - [ ] The original Sheet was spot-checked after review.

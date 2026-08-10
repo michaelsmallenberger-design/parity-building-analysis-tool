@@ -23,6 +23,7 @@ PERI_FIT_COL = "Periscope Fit"
 DUAL_FIT_COLUMNS = [OPT_FIT_COL, PERI_FIT_COL]
 DUAL_FIT_OPTIONS = ["Customer", "Good", "Okay", "Bad", "Not Sure"]
 CURRENT_REVIEW_SCHEMA = DUAL_FIT_SCHEMA
+ALEX_REVIEW_FIT_VALUES = frozenset({"Okay", "Not Sure"})
 MACHINE_ATTENTION_VERDICTS = frozenset({
     "ambiguous_footprint",
     "likely_residential",
@@ -138,4 +139,88 @@ def entry_needs_attention(
     return (
         entry_has_machine_attention(entry)
         and not entry_is_reviewed(entry, review_schema)
+    )
+
+
+def human_review_version(entry: dict[str, Any] | None) -> int:
+    """Return the optimistic-lock version for one persisted human decision.
+
+    Completed decisions created before version metadata existed are revision 1
+    in memory. They are not rewritten until a reviewer performs a new action.
+    """
+    human = (entry or {}).get("human") or {}
+    if not human:
+        return 0
+    try:
+        version = int(human.get("review_version"))
+    except (TypeError, ValueError):
+        version = 0
+    return version if version > 0 else 1
+
+
+def batch_primary_review_complete(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    review_schema: str,
+) -> bool:
+    """Whether a dual-fit batch is safe to expose for secondary review."""
+    entries = list(entries or [])
+    if review_schema != DUAL_FIT_SCHEMA or not entries:
+        return False
+    if not all(entry_is_reviewed(entry, review_schema) for entry in entries):
+        return False
+    return not any(
+        str((entry.get("writeback") or {}).get("status") or "").casefold()
+        == "error"
+        for entry in entries
+    )
+
+
+def _secondary_review_matches_current(entry: dict[str, Any]) -> bool:
+    secondary = entry.get("secondary_review") or {}
+    action = str(secondary.get("action") or "")
+    if action not in {"revise", "confirm_uncertain"}:
+        return False
+    try:
+        source_version = int(secondary.get("source_review_version"))
+    except (TypeError, ValueError):
+        return False
+    current_version = human_review_version(entry)
+    if action == "confirm_uncertain":
+        return source_version == current_version
+    human = entry.get("human") or {}
+    return (
+        str(human.get("review_stage") or "") == "secondary"
+        and current_version == source_version + 1
+    )
+
+
+def entry_needs_alex_review(
+    entry: dict[str, Any] | None,
+    review_schema: str,
+) -> bool:
+    """Return the derived secondary-review eligibility for one row."""
+    entry = entry or {}
+    if review_schema != DUAL_FIT_SCHEMA or not entry_is_reviewed(
+        entry, review_schema
+    ):
+        return False
+    human = entry.get("human") or {}
+    uncertain = any(
+        str(human.get(key) or "").strip() in ALEX_REVIEW_FIT_VALUES
+        for key in ("optimizer_fit", "periscope_fit")
+    )
+    return uncertain and not _secondary_review_matches_current(entry)
+
+
+def alex_review_remaining(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    review_schema: str,
+) -> int:
+    """Count candidates only after the clean primary-completion gate opens."""
+    entries = list(entries or [])
+    if not batch_primary_review_complete(entries, review_schema):
+        return 0
+    return sum(
+        1 for entry in entries
+        if entry_needs_alex_review(entry, review_schema)
     )

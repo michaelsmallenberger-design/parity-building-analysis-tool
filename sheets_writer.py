@@ -693,6 +693,72 @@ def write_decision_source(binding, source_row, hvac, optimizer_fit="",
     return True
 
 
+def write_secondary_decision_source(
+    binding,
+    source_row,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write only Alex-editable values to one exact physical source row.
+
+    All three columns must already be bound so the operation cannot silently
+    become a partial revision. Notes are written even when empty, allowing an
+    authorized secondary review to clear the prior note. HVAC is never present
+    in this request.
+    """
+    try:
+        row = int(source_row)
+    except (TypeError, ValueError):
+        return False
+    if row < 2:
+        return False
+    colmap = binding.get("colmap") or {}
+    cells = {
+        OPT_FIT_COL: optimizer_fit,
+        PERI_FIT_COL: periscope_fit,
+        NOTES_COL: note,
+    }
+    if any(column not in colmap for column in cells):
+        return False
+    data = [
+        {
+            "range": _tab_range(
+                binding["tab"], f"{_col_letter(colmap[column])}{row}"
+            ),
+            "values": [[value]],
+        }
+        for column, value in cells.items()
+    ]
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute()
+    return True
+
+
+def write_secondary_decision_bound(
+    binding,
+    row_id,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write Alex-editable values using a bound data-row identifier."""
+    try:
+        source_row = binding["row_numbers"][int(row_id) - 1]
+    except (IndexError, ValueError, TypeError):
+        return False
+    return write_secondary_decision_source(
+        binding,
+        source_row,
+        optimizer_fit=optimizer_fit,
+        periscope_fit=periscope_fit,
+        note=note,
+    )
+
+
 def write_source_values(binding, source_row, mapping) -> bool:
     """Write explicit existing source columns on one exact workbook tab/row."""
     try:
@@ -862,3 +928,29 @@ def write_decision(sheet_url, headers, rows, row_id, hvac,
     if note:
         mapping[NOTES_COL] = note
     return write_row_values(sheet_url, headers, rows, row_id, mapping)
+
+
+def write_secondary_decision(
+    sheet_url,
+    headers,
+    rows,
+    row_id,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write only Alex-editable values in a generated legacy batch Sheet."""
+    required = {OPT_FIT_COL, PERI_FIT_COL, NOTES_COL}
+    if not required.issubset(set(headers or [])):
+        return False
+    return write_row_values(
+        sheet_url,
+        headers,
+        rows,
+        row_id,
+        {
+            OPT_FIT_COL: optimizer_fit,
+            PERI_FIT_COL: periscope_fit,
+            NOTES_COL: note,
+        },
+    )

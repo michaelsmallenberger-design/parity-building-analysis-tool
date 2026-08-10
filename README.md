@@ -44,6 +44,7 @@ versioned workbook engine.
 - `POST /api/analyze`: one address -> one self-contained result entry
 - `POST /api/report`: result entries -> audit HTML
 - `GET /review/<batch_id>`: interactive dark review page for the team (Sheet-provided Stories/Floors, a collapsed allowlisted building-facts panel, explicit missing-exterior status, address-targeted and alternate-angle exterior views when available, roof imagery + AI guidance, HVAC multi-select + Fit choices, and exact-row Sheet write-back)
+- `POST /api/review`: same-origin, CSRF-protected review relay. Primary submissions retain the existing HVAC + fit behavior. When `ALEX_REVIEW_QUEUE_ENABLED=true`, secondary submissions use `review_stage: "secondary"`, `secondary_action: "revise" | "confirm_uncertain"`, and `expected_review_version`; stale or ineligible requests return `409` without local or Sheet mutation. Responses add `primary_review_complete` and `alex_review_remaining`.
 - `POST /review/<batch_id>/source-context/refresh`: refresh only allowlisted Stories/Floors values for an existing bound-Sheet batch; this does not replay analysis or change human decisions
 - `GET /api/batch/<batch_id>`: the original uploaded table plus the human review decisions recorded so far (no AI columns) — the fallback for building the final Google Sheet by hand
 - `GET /api/batch/<batch_id>/failures`: the rows that failed analysis (imagery/geocode/analyzer errors) for the cleanup skill
@@ -79,12 +80,27 @@ on the server — see `RENDER_DEPLOYMENT.md` for the one-time setup):
    Submit is recorded server-side by `review_store.py` AND written live into that row of the
    Google Sheet — when review is done, the sheet is already done. **Human picks only, no AI
    verdict/confidence columns.**
-3. Failed buildings (no imagery, geocode misses) are fixed with the `parity-cleanup-failed`
+3. With the Alex queue flag enabled, a clean, fully human-reviewed dual-fit batch derives a
+   **Needs Alex Review** group from `Maybe` (`Okay` in stored/Sheet data) and `Not Sure` in
+   either product. This global ordering happens before review-page pagination and never
+   changes entry order or Sheet row order. Alex can revise only Optimizer Fit, Periscope Fit,
+   and Notes, or confirm the current uncertainty; HVAC remains locked in both the browser and
+   server request contract.
+4. Failed buildings (no imagery, geocode misses) are fixed with the `parity-cleanup-failed`
    skill, which diagnoses and re-runs them in place via `/api/batch/<id>/failures` + `/rerun`.
 
 Fallback (credential not configured): `sheet_url` comes back empty, picks are only recorded
 server-side, and the `parity-cooling-tower` skill builds the sheet from `GET /api/batch`
 after review — the pre-existing operator flow.
+
+Secondary-review state is additive and backward-compatible. Existing completed dual-fit
+decisions are treated as primary review version 1 in memory, with no migration. A revision
+stores the prior human decision in `human_revisions` (original plus the 19 most recent
+snapshots), advances `human.review_version`, and records only the secondary stage/action and
+timestamps—not a claimed reviewer identity, because browser access uses a shared password.
+The local mutation is compare-and-set under the batch lock before any Sheet call. A stale
+revision therefore cannot touch local JSON or Sheets; a Sheet failure retains the local
+revision and enters the existing attention/retry flow without duplicating history.
 
 Primary files:
 
@@ -141,6 +157,7 @@ The older per-box `verify_detection()` and whole-roof `verify_rooftop()` functio
 - `STREETVIEW_PRIMARY_FOV` / `STREETVIEW_PRIMARY_PITCH`: defaults `90` / `5`
 - `STREETVIEW_CONTEXT_FOV` / `STREETVIEW_CONTEXT_PITCH`: defaults `105` / `5`
 - `STREETVIEW_ALTERNATE_HEADING_OFFSET`: default `55` degrees when both requests resolve to the same panorama
+- `ALEX_REVIEW_QUEUE_ENABLED`: default `false`; enables the post-primary Alex queue and version-checked secondary review controls. Disable it for immediate rollback; additive review metadata remains readable and is ignored by the old interface.
 - `VLM_ADDRESS_CONCURRENCY`: address-level concurrency, default `5`
 - `MULTI_TAB_WORKBOOK_ENABLED`: master workbook-engine feature flag
 - `MULTI_TAB_BROWSER_ENABLED`, `MULTI_TAB_DRIVE_ENABLED`, `MULTI_TAB_API_ENABLED`: staged surface flags

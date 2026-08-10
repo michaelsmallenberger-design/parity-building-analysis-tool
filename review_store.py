@@ -13,14 +13,27 @@ import threading
 from storage_helpers import write_json, read_json, get_file_path
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
+    DUAL_FIT_SCHEMA,
     SINGLE_FIT_SCHEMA,
+    batch_primary_review_complete,
+    entry_needs_alex_review,
     entry_is_reviewed,
+    human_review_version,
     infer_review_schema,
 )
 
 
 _locks_guard = threading.Lock()
 _batch_locks = {}
+_MAX_HUMAN_REVISIONS = 20
+
+
+class ReviewConflict(Exception):
+    """A persisted review changed or no longer satisfies the requested stage."""
+
+    def __init__(self, message: str, current_review_version: int | None = None):
+        super().__init__(message)
+        self.current_review_version = current_review_version
 
 
 def _lock_for(job_id: str) -> threading.RLock:
@@ -183,7 +196,51 @@ def _rid(entry) -> str:
     )
 
 
-def record_decision(job_id: str, row_id, decision: dict):
+def _decision_matches(human: dict, decision: dict, review_schema: str) -> bool:
+    keys = ["hvac_systems", "note"]
+    if review_schema == DUAL_FIT_SCHEMA:
+        keys.extend(["optimizer_fit", "periscope_fit"])
+    else:
+        keys.append("fit")
+    return all(
+        str(human.get(key) or "") == str(decision.get(key) or "")
+        for key in keys
+    )
+
+
+def _strict_review_version(human: dict) -> int:
+    if "review_version" not in human:
+        return 1
+    value = human.get("review_version")
+    if isinstance(value, int) and not isinstance(value, bool):
+        version = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        version = int(value.strip())
+    else:
+        raise ReviewConflict("invalid persisted review version")
+    if version < 1:
+        raise ReviewConflict("invalid persisted review version")
+    return version
+
+
+def _bounded_revisions(existing, snapshot: dict) -> list[dict]:
+    revisions = [
+        dict(item) for item in (existing or []) if isinstance(item, dict)
+    ]
+    revisions.append(dict(snapshot))
+    if len(revisions) <= _MAX_HUMAN_REVISIONS:
+        return revisions
+    return [revisions[0], *revisions[-(_MAX_HUMAN_REVISIONS - 1):]]
+
+
+def record_decision(
+    job_id: str,
+    row_id,
+    decision: dict,
+    *,
+    versioned: bool = False,
+    protect_completed: bool = False,
+):
     """Stamp a reviewer's decision onto the matching entry so a page reload shows
     it as already reviewed. Returns the updated batch dict (so the caller can
     reach sheet_url/table without re-reading the JSON), or None if the batch/row
@@ -192,15 +249,209 @@ def record_decision(job_id: str, row_id, decision: dict):
         batch = load_batch(job_id)
         if not batch:
             return None
-        hit = False
-        for e in batch.get("entries", []):
-            if _rid(e) == str(row_id):
-                e["human"] = {**decision, "reviewed_at": datetime.utcnow().isoformat()}
-                hit = True
-        if not hit:
+        matches = [
+            entry for entry in batch.get("entries", [])
+            if _rid(entry) == str(row_id)
+        ]
+        if not matches:
             return None
+        if versioned and len(matches) != 1:
+            raise ReviewConflict("review row identity is not unique")
+        review_schema = infer_review_schema(batch)
+        if not versioned:
+            for entry in matches:
+                entry["human"] = {
+                    **decision,
+                    "reviewed_at": datetime.utcnow().isoformat(),
+                }
+            write_json(_path(job_id), batch)
+            return batch
+
+        entry = matches[0]
+        existing = entry.get("human") or {}
+        complete = entry_is_reviewed(entry, review_schema)
+        identical = bool(existing) and _decision_matches(
+            existing, decision, review_schema
+        )
+        if (
+            complete
+            and protect_completed
+            and str(existing.get("review_stage") or "primary") == "secondary"
+        ):
+            raise ReviewConflict(
+                "secondary reviews cannot be submitted through the primary endpoint",
+                human_review_version(entry),
+            )
+        if complete and protect_completed and not identical:
+            raise ReviewConflict(
+                "completed reviews require the secondary review controls",
+                human_review_version(entry),
+            )
+        if (
+            complete
+            and protect_completed
+            and identical
+            and str((entry.get("writeback") or {}).get("status") or "")
+            not in {"error", "pending"}
+        ):
+            raise ReviewConflict(
+                "completed review has no failed Sheet write-back to retry",
+                human_review_version(entry),
+            )
+        if identical:
+            return batch
+        version = (
+            _strict_review_version(existing) + 1
+            if existing and (complete or "review_version" in existing)
+            else 1
+        )
+        entry["human"] = {
+            **decision,
+            "reviewed_at": datetime.utcnow().isoformat(),
+            "review_version": version,
+            "review_stage": "primary",
+        }
+        entry.pop("secondary_review", None)
         write_json(_path(job_id), batch)
         return batch
+
+
+def record_secondary_review(
+    job_id: str,
+    row_id,
+    *,
+    action: str,
+    expected_review_version: int,
+    decision: dict | None = None,
+    sheet_write_required: bool = False,
+):
+    """CAS-protected secondary action with bounded, original-first history.
+
+    The exact eligibility and version checks occur under the same batch lock as
+    the mutation. An identical failed Sheet retry is the only allowed exception
+    to the clean-completion gate, and it never adds another history snapshot.
+    """
+    with _lock_for(job_id):
+        batch = load_batch(job_id)
+        if not batch:
+            return None
+        matches = [
+            entry for entry in batch.get("entries", [])
+            if _rid(entry) == str(row_id)
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ReviewConflict("review row identity is not unique")
+        entry = matches[0]
+        review_schema = infer_review_schema(batch)
+        if review_schema != DUAL_FIT_SCHEMA or not entry_is_reviewed(
+            entry, review_schema
+        ):
+            raise ReviewConflict("row is not eligible for secondary review")
+        human = entry.get("human") or {}
+        current_version = _strict_review_version(human)
+        if expected_review_version != current_version:
+            raise ReviewConflict("review changed in another tab", current_version)
+
+        secondary = entry.get("secondary_review") or {}
+        writeback_status = str(
+            (entry.get("writeback") or {}).get("status") or ""
+        ).casefold()
+        retry_decision = decision or {}
+        try:
+            retry_source_version = int(secondary.get("source_review_version"))
+        except (TypeError, ValueError):
+            retry_source_version = -1
+        is_retry = (
+            action == "revise"
+            and writeback_status in {"error", "pending"}
+            and str(human.get("review_stage") or "") == "secondary"
+            and str(secondary.get("action") or "") == "revise"
+            and retry_source_version + 1 == current_version
+            and _decision_matches(
+                human,
+                {
+                    "hvac_systems": human.get("hvac_systems", ""),
+                    "optimizer_fit": retry_decision.get("optimizer_fit", ""),
+                    "periscope_fit": retry_decision.get("periscope_fit", ""),
+                    "note": retry_decision.get("note", ""),
+                },
+                review_schema,
+            )
+        )
+        if is_retry:
+            if sheet_write_required:
+                entry["writeback"] = {
+                    "status": "pending",
+                    "error": "",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                write_json(_path(job_id), batch)
+            return {
+                "batch": batch,
+                "entry": entry,
+                "is_retry": True,
+                "review_version": current_version,
+            }
+
+        if not batch_primary_review_complete(
+            batch.get("entries", []), review_schema
+        ):
+            raise ReviewConflict(
+                "secondary review opens only after clean primary completion",
+                current_version,
+            )
+        if not entry_needs_alex_review(entry, review_schema):
+            raise ReviewConflict(
+                "row is no longer in Needs Alex Review",
+                current_version,
+            )
+
+        now = datetime.utcnow().isoformat()
+        if action == "confirm_uncertain":
+            entry["secondary_review"] = {
+                "action": action,
+                "completed_at": now,
+                "source_review_version": current_version,
+            }
+        elif action == "revise":
+            snapshot = dict(human)
+            snapshot.setdefault("review_version", current_version)
+            snapshot.setdefault("review_stage", "primary")
+            entry["human_revisions"] = _bounded_revisions(
+                entry.get("human_revisions"), snapshot
+            )
+            entry["human"] = {
+                **human,
+                "optimizer_fit": retry_decision.get("optimizer_fit", ""),
+                "periscope_fit": retry_decision.get("periscope_fit", ""),
+                "note": retry_decision.get("note", ""),
+                "reviewed_at": now,
+                "review_version": current_version + 1,
+                "review_stage": "secondary",
+            }
+            entry["secondary_review"] = {
+                "action": action,
+                "completed_at": now,
+                "source_review_version": current_version,
+            }
+            if sheet_write_required:
+                entry["writeback"] = {
+                    "status": "pending",
+                    "error": "",
+                    "updated_at": now,
+                }
+        else:
+            raise ReviewConflict("invalid secondary review action", current_version)
+
+        write_json(_path(job_id), batch)
+        return {
+            "batch": batch,
+            "entry": entry,
+            "is_retry": False,
+            "review_version": human_review_version(entry),
+        }
 
 
 def record_writeback(job_id: str, row_id, status: str, error: str = ""):

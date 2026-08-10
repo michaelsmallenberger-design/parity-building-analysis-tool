@@ -5,6 +5,9 @@ from review_contract import (
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
     SINGLE_FIT_SCHEMA,
+    alex_review_remaining,
+    batch_primary_review_complete,
+    human_review_version,
 )
 from review_render import build_review_page, HVAC_SYSTEMS, FIT_OPTIONS, FIT_COLUMNS
 
@@ -558,6 +561,163 @@ def test_legacy_single_batch_stays_compatible():
     assert '<span id="done">1</span>/1 reviewed' in html
 
 
+def _reviewed_entry(index, optimizer="Good", periscope="Bad"):
+    entry = {
+        **_entry(),
+        "i": index,
+        "address": f"{index} Test St",
+        "source_tab": "Maryland",
+        "source_row": index + 1,
+        "human": {
+            "hvac_systems": "Cooling Tower",
+            "optimizer_fit": optimizer,
+            "periscope_fit": periscope,
+            "note": f"primary {index}",
+        },
+    }
+    return entry
+
+
+def test_alex_queue_orders_globally_before_pagination_and_preserves_counts():
+    entries = [_reviewed_entry(index) for index in range(1, 13)]
+    entries[10]["human"]["optimizer_fit"] = "Okay"
+    entries[11]["human"]["periscope_fit"] = "Not Sure"
+
+    html = build_review_page(
+        entries,
+        job_id="alex-order",
+        review_schema=DUAL_FIT_SCHEMA,
+        page=1,
+        page_size=5,
+        page_url="/review/alex-order",
+        alex_review_enabled=True,
+    )
+
+    assert batch_primary_review_complete(entries, DUAL_FIT_SCHEMA)
+    assert alex_review_remaining(entries, DUAL_FIT_SCHEMA) == 2
+    assert "Needs Alex Review" in html
+    assert '<span id="alex-count">2</span>' in html
+    assert '<span id="done">12</span>/12 reviewed' in html
+    assert (
+        html.index('data-rid="11"')
+        < html.index('data-rid="12"')
+        < html.index('data-rid="1"')
+    )
+    assert "6 Test St" not in html
+    assert html.count('<article class="card') == 5
+    assert 'data-review-state="alex_review"' in html
+    assert 'data-review-version="1"' in html
+    assert "Review qualification" in html
+    assert "Save Alex review" in html
+    assert "Confirm current qualification" in html
+    assert "Cancel" in html
+    assert 'data-fit="Okay" onclick="pickFit(this)">Maybe</button>' in html
+
+
+def test_alex_queue_waits_for_clean_primary_completion():
+    complete = _reviewed_entry(1, optimizer="Okay")
+    incomplete = {**_entry(), "i": 2, "address": "2 Test St"}
+    partial_html = build_review_page(
+        [complete, incomplete],
+        job_id="alex-partial",
+        review_schema=DUAL_FIT_SCHEMA,
+        alex_review_enabled=True,
+    )
+    assert not batch_primary_review_complete(
+        [complete, incomplete], DUAL_FIT_SCHEMA
+    )
+    assert '<section class="review-state-group alex_review">' not in partial_html
+    assert partial_html.index("1 Test St") < partial_html.index("2 Test St")
+
+    failed = _reviewed_entry(2)
+    failed["writeback"] = {"status": "error", "error": "temporary"}
+    failed_html = build_review_page(
+        [complete, failed],
+        job_id="alex-writeback",
+        review_schema=DUAL_FIT_SCHEMA,
+        alex_review_enabled=True,
+    )
+    assert not batch_primary_review_complete([complete, failed], DUAL_FIT_SCHEMA)
+    assert '<section class="review-state-group alex_review">' not in failed_html
+    assert "Needs attention" in failed_html
+
+
+def test_secondary_confirmation_clears_queue_without_migration():
+    confirmed = _reviewed_entry(1, optimizer="Okay")
+    confirmed["secondary_review"] = {
+        "action": "confirm_uncertain",
+        "completed_at": "2026-08-10T12:00:00",
+        "source_review_version": 1,
+    }
+    assert human_review_version(confirmed) == 1
+    assert alex_review_remaining([confirmed], DUAL_FIT_SCHEMA) == 0
+    html = build_review_page(
+        [confirmed],
+        job_id="alex-confirmed",
+        review_schema=DUAL_FIT_SCHEMA,
+        alex_review_enabled=True,
+    )
+    assert '<section class="review-state-group alex_review">' not in html
+    assert "Other completed reviews" in html
+
+    legacy = {
+        **_entry(),
+        "human": {"hvac_systems": "AHU", "fit": "Unclear"},
+    }
+    legacy_html = build_review_page(
+        [legacy],
+        job_id="legacy",
+        review_schema=SINGLE_FIT_SCHEMA,
+        alex_review_enabled=True,
+    )
+    assert "Needs Alex Review" not in legacy_html
+
+
+def test_alex_queue_qualifies_each_row_once_and_keeps_revised_uncertain_clear():
+    entries = [
+        _reviewed_entry(1, optimizer="Okay", periscope="Not Sure"),
+        _reviewed_entry(2, optimizer="Not Sure", periscope="Good"),
+        _reviewed_entry(3, optimizer="Customer", periscope="Bad"),
+    ]
+    assert alex_review_remaining(entries, DUAL_FIT_SCHEMA) == 2
+
+    entries[0]["human"].update({
+        "review_version": 2,
+        "review_stage": "secondary",
+    })
+    entries[0]["secondary_review"] = {
+        "action": "revise",
+        "completed_at": "2026-08-10T12:00:00",
+        "source_review_version": 1,
+    }
+    assert alex_review_remaining(entries, DUAL_FIT_SCHEMA) == 1
+
+
+def test_flag_off_never_routes_secondary_failure_through_primary_submit():
+    entry = _reviewed_entry(1, optimizer="Good", periscope="Not Sure")
+    entry["human"].update({
+        "review_version": 2,
+        "review_stage": "secondary",
+    })
+    entry["secondary_review"] = {
+        "action": "revise",
+        "completed_at": "2026-08-10T12:00:00",
+        "source_review_version": 1,
+    }
+    entry["writeback"] = {"status": "error", "error": "temporary"}
+    html = build_review_page(
+        [entry],
+        job_id="alex-rollback",
+        review_schema=DUAL_FIT_SCHEMA,
+        alex_review_enabled=False,
+    )
+    card = re.search(r"<article class=\"card.*?</article>", html, re.DOTALL)
+    assert card
+    assert "Enable Alex review to retry Sheet write-back" in card.group(0)
+    assert 'onclick="submitCard(this)"' not in card.group(0)
+    assert 'class="submit" disabled' in card.group(0)
+
+
 if __name__ == "__main__":
     test_review_contract()
     test_carousel_only_sources_first_image_until_navigation()
@@ -579,4 +739,9 @@ if __name__ == "__main__":
     test_legacy_single_contract_does_not_accept_dual_decision()
     test_current_dual_batch_is_complete_only_with_both_products()
     test_legacy_single_batch_stays_compatible()
+    test_alex_queue_orders_globally_before_pagination_and_preserves_counts()
+    test_alex_queue_waits_for_clean_primary_completion()
+    test_secondary_confirmation_clears_queue_without_migration()
+    test_alex_queue_qualifies_each_row_once_and_keeps_revised_uncertain_clear()
+    test_flag_off_never_routes_secondary_failure_through_primary_submit()
     print("OK: dual-product review contract and single-Fit compatibility hold.")

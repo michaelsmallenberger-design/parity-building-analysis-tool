@@ -49,6 +49,8 @@ services:
         generateValue: true
       - key: SITE_COOKIE_SECURE
         value: "true"
+      - key: ALEX_REVIEW_QUEUE_ENABLED
+        value: "false"
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: SHEET_PARENT_FOLDER_ID
