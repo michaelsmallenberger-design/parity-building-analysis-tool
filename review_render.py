@@ -11,8 +11,6 @@ from failure_diagnostics import sanitize_failure_text
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_COLUMNS,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_OPTIONS,
     MACHINE_ATTENTION_VERDICTS,
     SINGLE_FIT_SCHEMA,
@@ -21,6 +19,8 @@ from review_contract import (
     entry_needs_alex_review,
     entry_is_reviewed,
     human_review_version,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 
 # Exact HVAC Systems data-validation dropdown from the Washington Gas sheet
@@ -74,16 +74,14 @@ VERDICT_COLOR = {
     "likely_residential": "#868e96", "not_detected": "#e8590c", "": "#868e96",
 }
 
-# Keep the established Sheet/API value ``Okay`` for backward compatibility,
-# while giving reviewers the clearer product-language label requested in the
-# review UI. ``Not Sure`` remains reserved for inadequate imagery/location
-# evidence; ``Maybe`` means the visible evidence suggests a possible fit.
+# Keep the legacy Sheet/API value ``Okay`` for old batches while giving
+# reviewers the requested ``Maybe`` label. New batches store ``Maybe`` itself.
 _DUAL_FIT_DISPLAY_LABELS = {"Okay": "Maybe"}
 
 
 def _fit_display_label(value, review_schema):
     value = str(value or "")
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         return _DUAL_FIT_DISPLAY_LABELS.get(value, value)
     return value
 
@@ -286,17 +284,18 @@ def _card(
             pre = " sel" if (s == "Cooling Tower" and ai_positive) else ""
         chips += f'<button type="button" class="chip{pre}"{hvac_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
     fitrows = ""
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
+        dual_options = fit_options_for_schema(review_schema)
         fit_specs = [
-            ("Optimizer Fit", "optimizer_fit", DUAL_FIT_OPTIONS),
-            ("Periscope Fit", "periscope_fit", DUAL_FIT_OPTIONS),
+            ("Optimizer Fit", "optimizer_fit", dual_options),
+            ("Periscope Fit", "periscope_fit", dual_options),
         ]
     else:
         fit_specs = [("Fit", "fit", FIT_OPTIONS)]
     for col, fit_key, fit_options in fit_specs:
         picked_fit = str(human.get(fit_key) or "")
         if not human and ai_positive:
-            if review_schema == DUAL_FIT_SCHEMA and fit_key == "optimizer_fit":
+            if is_dual_fit_schema(review_schema) and fit_key == "optimizer_fit":
                 picked_fit = "Good"
             elif review_schema == SINGLE_FIT_SCHEMA and fit_key == "fit":
                 picked_fit = "Optimizer"
@@ -619,7 +618,7 @@ def build_review_page(
     first_page_json = json.dumps(first_page_url)
     alex_header = (
         f' · Needs Alex Review: <span id="alex-count">{alex0}</span>'
-        if alex_review_enabled and review_schema == DUAL_FIT_SCHEMA
+        if alex_review_enabled and is_dual_fit_schema(review_schema)
         else ""
     )
     source_context_toolbar = ""
@@ -632,7 +631,7 @@ def build_review_page(
 </div>'''
     fit_help = (
         "both Optimizer Fit and Periscope Fit choices"
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else "a Fit choice"
     )
     return f'''<!doctype html><html><head><meta charset="utf-8">
@@ -668,8 +667,8 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .issue.pending{{background:#10243a;border:1px solid #375a7f;color:#d7e9fb}}
 .issue.attention{{background:#321719;border:1px solid #e03131;color:#ffd8d8}}
 .carousel{{position:relative;margin:12px 0;background:#0b0d10;border:1px solid #222833;border-radius:10px}}
-.frame{{text-align:center;min-height:320px;display:flex;align-items:center;justify-content:center}}
-.frame img{{display:none;max-width:100%;max-height:60vh;border-radius:8px;cursor:zoom-in}}
+.frame{{text-align:center;min-height:440px;display:flex;align-items:center;justify-content:center}}
+.frame img{{display:none;width:100%;max-width:100%;max-height:72vh;object-fit:contain;border-radius:8px;cursor:zoom-in}}
 .frame img.cur{{display:block}}
 .nav{{position:absolute;top:50%;transform:translateY(-50%);background:rgba(20,24,30,.8);color:#fff;border:1px solid #333b45;
  width:40px;height:52px;border-radius:8px;font-size:26px;cursor:pointer;z-index:2}}
@@ -824,7 +823,7 @@ async function submitCard(btn,reloadAfterSave=true){{
     status.textContent='choose one Fit: Optimizer, Periscope, Unclear, or Bad';
     status.className='status err';return 'incomplete';
   }}
-  if(REVIEW_SCHEMA==='dual_product_fit_v1' && (!fits.optimizer_fit || !fits.periscope_fit)){{
+  if(REVIEW_SCHEMA.startsWith('dual_product_fit_') && (!fits.optimizer_fit || !fits.periscope_fit)){{
     status.textContent='choose both Optimizer Fit and Periscope Fit';
     status.className='status err';return 'incomplete';
   }}

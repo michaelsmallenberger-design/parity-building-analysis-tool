@@ -628,6 +628,7 @@ class BackgroundWorker:
             sheet_bindings=run.get("sheet_bindings") or [],
             tab_inventory=run.get("tabs") or [],
             run_id=job_id,
+            review_schema=run.get("review_schema"),
         )
         needs_attention = sum(
             1 for entry in entries

@@ -81,8 +81,8 @@ on the server — see `RENDER_DEPLOYMENT.md` for the one-time setup):
    Google Sheet — when review is done, the sheet is already done. **Human picks only, no AI
    verdict/confidence columns.**
 3. With the Alex queue flag enabled, a clean, fully human-reviewed dual-fit batch derives a
-   **Needs Alex Review** group from `Maybe` (`Okay` in stored/Sheet data) and `Not Sure` in
-   either product. This global ordering happens before review-page pagination and never
+   **Needs Alex Review** group from `Maybe` in either product. Legacy v1 runs also derive the
+   queue from their already-saved `Okay` and `Not Sure` values. This global ordering happens before review-page pagination and never
    changes entry order or Sheet row order. Alex can revise only Optimizer Fit, Periscope Fit,
    and Notes, or confirm the current uncertainty; HVAC remains locked in both the browser and
    server request contract.
@@ -101,6 +101,12 @@ timestamps—not a claimed reviewer identity, because browser access uses a shar
 The local mutation is compare-and-set under the batch lock before any Sheet call. A stale
 revision therefore cannot touch local JSON or Sheets; a Sheet failure retains the local
 revision and enters the existing attention/retry flow without duplicating history.
+
+New review batches use `dual_product_fit_v2` and the exact four-value contract
+`Customer`, `Good`, `Maybe`, `Bad` in both the review page and new Sheet dropdowns.
+Existing `dual_product_fit_v1` batches keep their stored/Sheet-compatible `Okay` value
+(displayed as **Maybe**) and retain already-saved `Not Sure` decisions only as legacy
+Alex-queue candidates. The refreshed v1 page does not offer `Not Sure` as a new choice.
 
 Primary files:
 

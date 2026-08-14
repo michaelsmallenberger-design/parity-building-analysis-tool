@@ -1148,7 +1148,7 @@ def test_dual_fit_columns_are_reused_or_appended_once():
                 item["userEnteredValue"]
                 for item in validation["rule"]["condition"]["values"]
             ]
-            assert options == ["Customer", "Good", "Okay", "Bad", "Not Sure"]
+            assert options == ["Customer", "Good", "Maybe", "Bad"]
             assert validation["rule"]["strict"] is True
     finally:
         sheets_writer._get_services = original

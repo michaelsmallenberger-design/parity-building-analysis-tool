@@ -35,8 +35,6 @@ from review_render import (
 )
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_COL,
     SINGLE_FIT_SCHEMA,
     alex_review_remaining,
@@ -44,6 +42,9 @@ from review_contract import (
     entry_is_reviewed,
     entry_needs_attention,
     human_review_version,
+    accepted_fit_values_for_schema,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 import review_store
 import sheets_writer
@@ -1265,7 +1266,7 @@ def _api_secondary_review(payload, existing_batch, review_schema, job_id, row_id
         return jsonify({"error": "secondary review is not enabled"}), 409
     if not _csrf_is_valid():
         return jsonify({"error": "review session needs to be refreshed"}), 403
-    if review_schema != DUAL_FIT_SCHEMA:
+    if not is_dual_fit_schema(review_schema):
         return jsonify({"error": "secondary review requires a dual-fit batch"}), 409
     if "hvac_systems" in payload or "fit" in payload:
         return jsonify({"error": "HVAC and legacy Fit are locked in secondary review"}), 400
@@ -1288,9 +1289,10 @@ def _api_secondary_review(payload, existing_batch, review_schema, job_id, row_id
             return jsonify({"error": "confirmation cannot include changed values"}), 400
         decision = None
     else:
-        if payload.get("optimizer_fit") not in DUAL_FIT_OPTIONS:
+        allowed_fit_values = accepted_fit_values_for_schema(review_schema)
+        if payload.get("optimizer_fit") not in allowed_fit_values:
             return jsonify({"error": "Optimizer Fit is required"}), 400
-        if payload.get("periscope_fit") not in DUAL_FIT_OPTIONS:
+        if payload.get("periscope_fit") not in allowed_fit_values:
             return jsonify({"error": "Periscope Fit is required"}), 400
         note_value = str(payload.get("note") or "")
         if len(note_value) > 2000:
@@ -1398,10 +1400,11 @@ def api_review():
         or (NONE_OPTION in systems and len(systems) > 1)
     ):
         return jsonify({"error": "invalid HVAC selection"}), 400
-    if review_schema == DUAL_FIT_SCHEMA:
-        if payload.get("optimizer_fit") not in DUAL_FIT_OPTIONS:
+    if is_dual_fit_schema(review_schema):
+        allowed_fit_values = accepted_fit_values_for_schema(review_schema)
+        if payload.get("optimizer_fit") not in allowed_fit_values:
             return jsonify({"error": "Optimizer Fit is required"}), 400
-        if payload.get("periscope_fit") not in DUAL_FIT_OPTIONS:
+        if payload.get("periscope_fit") not in allowed_fit_values:
             return jsonify({"error": "Periscope Fit is required"}), 400
     elif payload.get("fit") not in FIT_OPTIONS:
         return jsonify({"error": "Fit is required"}), 400
@@ -1412,7 +1415,7 @@ def api_review():
         "hvac_systems": payload.get("hvac_systems", ""),
         "note": payload.get("note", ""),
     }
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         decision.update({
             "optimizer_fit": payload.get("optimizer_fit", ""),
             "periscope_fit": payload.get("periscope_fit", ""),
@@ -1421,7 +1424,7 @@ def api_review():
         decision["fit"] = payload.get("fit", "")
     versioned = bool(
         app.config.get("ALEX_REVIEW_QUEUE_ENABLED")
-        and review_schema == DUAL_FIT_SCHEMA
+        and is_dual_fit_schema(review_schema)
     )
     try:
         batch = review_store.record_decision(
@@ -1488,7 +1491,7 @@ def api_review():
                     sheets_writer.ensure_review_columns(
                         binding, binding.get("headers", []),
                         HVAC_SYSTEMS + [NONE_OPTION],
-                        FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                        fit_options_for_schema(review_schema),
                         review_schema=review_schema,
                     )
                 ok = sheets_writer.write_decision_source(
@@ -1520,7 +1523,7 @@ def api_review():
                     and FIT_COL not in binding.get("colmap", {})
                 )
                 or (
-                    review_schema == DUAL_FIT_SCHEMA
+                    is_dual_fit_schema(review_schema)
                     and any(
                         column not in binding.get("colmap", {})
                         for column in (
@@ -1534,7 +1537,7 @@ def api_review():
                     binding,
                     binding.get("headers", []),
                     HVAC_SYSTEMS + [NONE_OPTION],
-                    FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                    fit_options_for_schema(review_schema),
                     review_schema=review_schema,
                 )
             ok = sheets_writer.write_decision_bound(

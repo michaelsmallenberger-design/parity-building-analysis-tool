@@ -13,13 +13,13 @@ import threading
 from storage_helpers import write_json, read_json, get_file_path
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
-    DUAL_FIT_SCHEMA,
     SINGLE_FIT_SCHEMA,
     batch_primary_review_complete,
     entry_needs_alex_review,
     entry_is_reviewed,
     human_review_version,
     infer_review_schema,
+    is_dual_fit_schema,
 )
 
 
@@ -198,7 +198,7 @@ def _rid(entry) -> str:
 
 def _decision_matches(human: dict, decision: dict, review_schema: str) -> bool:
     keys = ["hvac_systems", "note"]
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         keys.extend(["optimizer_fit", "periscope_fit"])
     else:
         keys.append("fit")
@@ -345,7 +345,7 @@ def record_secondary_review(
             raise ReviewConflict("review row identity is not unique")
         entry = matches[0]
         review_schema = infer_review_schema(batch)
-        if review_schema != DUAL_FIT_SCHEMA or not entry_is_reviewed(
+        if not is_dual_fit_schema(review_schema) or not entry_is_reviewed(
             entry, review_schema
         ):
             raise ReviewConflict("row is not eligible for secondary review")

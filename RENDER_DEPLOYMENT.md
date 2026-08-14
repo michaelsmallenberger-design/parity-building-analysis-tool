@@ -72,9 +72,12 @@ After local tests pass and Render is running the expected commit, enable it to
 derive **Needs Alex Review** for clean, fully human-reviewed dual-fit batches.
 The queue does not rerun maps/models and does not reorder Sheets. A live
 secondary-write smoke test must use an explicitly approved disposable Sheet:
-verify one `Maybe`, one `Not Sure`, one final row, one confirmation, one
-revision, the exact three revised cells, unchanged HVAC, and the remaining
-queue count. Roll back immediately by setting the flag to `false`; no metadata
+verify one new-v2 `Maybe`, one final row, one confirmation, one revision, the
+exact three revised cells, unchanged HVAC, and the remaining queue count. Also
+verify read-only rendering of a legacy-v1 `Okay`/`Not Sure` row when a current
+run exists. New v2 runs use `Customer`, `Good`, `Maybe`, `Bad`; refreshed v1
+pages hide `Not Sure` and display the Sheet-compatible `Okay` value as
+`Maybe`. Roll back immediately by setting the flag to `false`; no metadata
 migration or customer-row restoration is needed.
 
 ## Google Sheets service account (one-time, ~15 min)

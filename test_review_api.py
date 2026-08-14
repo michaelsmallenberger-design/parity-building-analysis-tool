@@ -11,7 +11,7 @@ import review_store
 import sheets_writer
 import storage_helpers
 import workbook_runs
-from review_contract import DUAL_FIT_SCHEMA, SINGLE_FIT_SCHEMA
+from review_contract import DUAL_FIT_SCHEMA, DUAL_FIT_SCHEMA_V1, SINGLE_FIT_SCHEMA
 
 
 class IsolatedReviews:
@@ -150,7 +150,7 @@ def test_true_historical_dual_submission_remains_valid(root):
                 "HVAC Systems", "Optimizer Fit", "Periscope Fit", "Row_ID",
             ],
             table_rows=[["", "", "", "1"]],
-            review_schema=DUAL_FIT_SCHEMA,
+            review_schema=DUAL_FIT_SCHEMA_V1,
         )
         client = app_railway.app.test_client()
         assert client.get("/review/legacy").status_code == 200
@@ -166,6 +166,96 @@ def test_true_historical_dual_submission_remains_valid(root):
             headers={"X-CSRF-Token": _csrf(client)},
         )
         assert response.status_code == 200
+
+
+def test_current_legacy_dual_run_can_be_requalified_without_sheet_rewrite(root):
+    with IsolatedReviews(root):
+        review_store.save_batch(
+            "legacy-alex",
+            "Legacy Alex review",
+            [{
+                "i": 1,
+                "address": "1 Main St",
+                "human": {
+                    "hvac_systems": "RTU",
+                    "optimizer_fit": "Not Sure",
+                    "periscope_fit": "Okay",
+                },
+            }],
+            review_schema=DUAL_FIT_SCHEMA_V1,
+        )
+        old_flag = app_railway.app.config.get("ALEX_REVIEW_QUEUE_ENABLED")
+        try:
+            app_railway.app.config["ALEX_REVIEW_QUEUE_ENABLED"] = True
+            client = app_railway.app.test_client()
+            page = client.get("/review/legacy-alex")
+            assert page.status_code == 200
+            assert "Needs Alex Review" in page.get_data(as_text=True)
+            rejected_not_sure = client.post(
+                "/api/review",
+                json={
+                    "job_id": "legacy-alex",
+                    "row_id": 1,
+                    "review_stage": "secondary",
+                    "secondary_action": "revise",
+                    "expected_review_version": 1,
+                    "optimizer_fit": "Not Sure",
+                    "periscope_fit": "Bad",
+                },
+                headers={"X-CSRF-Token": _csrf(client)},
+            )
+            assert rejected_not_sure.status_code == 400
+            response = client.post(
+                "/api/review",
+                json={
+                    "job_id": "legacy-alex",
+                    "row_id": 1,
+                    "review_stage": "secondary",
+                    "secondary_action": "revise",
+                    "expected_review_version": 1,
+                    "optimizer_fit": "Customer",
+                    "periscope_fit": "Bad",
+                    "note": "Alex resolved legacy uncertainty",
+                },
+                headers={"X-CSRF-Token": _csrf(client)},
+            )
+            assert response.status_code == 200
+            entry = review_store.load_batch("legacy-alex")["entries"][0]
+            assert entry["human"]["optimizer_fit"] == "Customer"
+            assert entry["human_revisions"][0]["optimizer_fit"] == "Not Sure"
+        finally:
+            app_railway.app.config["ALEX_REVIEW_QUEUE_ENABLED"] = old_flag
+
+
+def test_finalize_versions_existing_dual_columns_as_v1_and_new_runs_as_v2(root):
+    with IsolatedReviews(root):
+        old_enabled = sheets_writer.enabled
+        try:
+            sheets_writer.enabled = lambda: False
+            api_analyze._finalize_batch(
+                [{"i": 1, "address": "1 Main St", "verdict": "confirmed"}],
+                "Existing dual columns",
+                batch_id="existing-dual",
+                binding={
+                    "headers": [
+                        "Address", "Optimizer Fit", "Periscope Fit", "Notes",
+                    ],
+                },
+            )
+            assert review_store.load_batch("existing-dual")["review_schema"] == (
+                DUAL_FIT_SCHEMA_V1
+            )
+
+            api_analyze._finalize_batch(
+                [{"i": 1, "address": "2 Main St", "verdict": "confirmed"}],
+                "New four-value run",
+                batch_id="new-dual",
+            )
+            assert review_store.load_batch("new-dual")["review_schema"] == (
+                DUAL_FIT_SCHEMA
+            )
+        finally:
+            sheets_writer.enabled = old_enabled
 
 
 def test_pre_fix_multitab_batch_infers_single_fit_without_guessing(root):
@@ -222,7 +312,7 @@ def test_unreviewed_misstamped_run_upgrades_from_source_tab_inventory(root):
             "entries": [{"row_id": "g10:r2", "verdict": "confirmed"}],
         })
         batch = review_store.load_batch("misstamped")
-        assert batch["review_schema"] == DUAL_FIT_SCHEMA
+        assert batch["review_schema"] == DUAL_FIT_SCHEMA_V1
 
 
 def test_reviewed_single_fit_run_is_never_auto_migrated(root):
@@ -281,7 +371,7 @@ def test_existing_batch_can_load_stories_without_reanalysis(root):
                 "human": {
                     "hvac_systems": "RTU",
                     "optimizer_fit": "Good",
-                    "periscope_fit": "Okay",
+                    "periscope_fit": "Maybe",
                     "note": "keep this decision",
                 },
             }],
@@ -335,7 +425,7 @@ def _save_clean_alex_batch(job_id):
                 "address": "1 Main St",
                 "human": {
                     "hvac_systems": "Cooling Tower, AHU",
-                    "optimizer_fit": "Okay",
+                    "optimizer_fit": "Maybe",
                     "periscope_fit": "Good",
                     "note": "primary note",
                     "reviewed_at": "2026-08-10T10:00:00",
@@ -426,7 +516,7 @@ def test_alex_revision_is_versioned_and_writes_only_allowed_cells(root):
             assert entry["human"]["review_version"] == 2
             assert entry["human"]["review_stage"] == "secondary"
             assert len(entry["human_revisions"]) == 1
-            assert entry["human_revisions"][0]["optimizer_fit"] == "Okay"
+            assert entry["human_revisions"][0]["optimizer_fit"] == "Maybe"
             assert entry["human_revisions"][0]["hvac_systems"] == "Cooling Tower, AHU"
             assert entry["secondary_review"]["action"] == "revise"
             assert entry["secondary_review"]["source_review_version"] == 1
@@ -502,7 +592,7 @@ def test_alex_confirmation_is_local_only_and_hvac_is_rejected(root):
             assert response.json["sheet"] == "none"
             assert response.json["alex_review_remaining"] == 0
             entry = review_store.load_batch("alex-confirm")["entries"][0]
-            assert entry["human"]["optimizer_fit"] == "Okay"
+            assert entry["human"]["optimizer_fit"] == "Maybe"
             assert "human_revisions" not in entry
             assert entry["secondary_review"]["action"] == "confirm_uncertain"
 
@@ -557,7 +647,7 @@ def test_alex_sheet_failure_retry_does_not_duplicate_history(root):
                 "secondary_action": "revise",
                 "expected_review_version": 1,
                 "optimizer_fit": "Good",
-                "periscope_fit": "Not Sure",
+                "periscope_fit": "Maybe",
                 "note": "retain uncertainty",
             }
             failed = client.post(
@@ -703,7 +793,7 @@ def test_last_primary_response_exposes_alex_queue(root):
                     "address": "1 Main St",
                     "human": {
                         "hvac_systems": "AHU",
-                        "optimizer_fit": "Okay",
+                        "optimizer_fit": "Maybe",
                         "periscope_fit": "Good",
                     },
                 },
@@ -771,7 +861,7 @@ def test_secondary_writer_targets_only_fit_and_notes_cells():
             },
             7,
             optimizer_fit="Good",
-            periscope_fit="Not Sure",
+            periscope_fit="Maybe",
             note="",
         )
         assert ok is True
@@ -783,7 +873,7 @@ def test_secondary_writer_targets_only_fit_and_notes_cells():
             "'Maryland Review'!F7",
         ]
         assert [item["values"] for item in data] == [
-            [["Good"]], [["Not Sure"]], [[""]],
+            [["Good"]], [["Maybe"]], [[""]],
         ]
         assert all("A7" not in item["range"] for item in data)
     finally:
@@ -925,6 +1015,10 @@ if __name__ == "__main__":
         test_single_fit_submission_returns_200_and_updates_exact_source(temp_dir)
     with tempfile.TemporaryDirectory() as temp_dir:
         test_true_historical_dual_submission_remains_valid(temp_dir)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_current_legacy_dual_run_can_be_requalified_without_sheet_rewrite(temp_dir)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_finalize_versions_existing_dual_columns_as_v1_and_new_runs_as_v2(temp_dir)
     with tempfile.TemporaryDirectory() as temp_dir:
         test_pre_fix_multitab_batch_infers_single_fit_without_guessing(temp_dir)
     with tempfile.TemporaryDirectory() as temp_dir:

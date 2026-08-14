@@ -26,13 +26,13 @@ import threading
 
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_COL,
     FIT_OPTIONS,
     OPT_FIT_COL,
     PERI_FIT_COL,
     SINGLE_FIT_SCHEMA,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 
 log = logging.getLogger("sheets")
@@ -513,7 +513,7 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
         norm_to_idx.setdefault(_norm(h), i)
     fill_synonyms = (
         _DUAL_FILL_SYNONYMS
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else _SINGLE_FILL_SYNONYMS
     )
     colmap, missing = {}, []
@@ -570,8 +570,11 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     # as invalid in the Sheet. Existing customer HVAC dropdowns remain intact.
     reqs = []
     rules = (
-        [(OPT_FIT_COL, DUAL_FIT_OPTIONS), (PERI_FIT_COL, DUAL_FIT_OPTIONS)]
-        if review_schema == DUAL_FIT_SCHEMA
+        [
+            (OPT_FIT_COL, fit_options_for_schema(review_schema)),
+            (PERI_FIT_COL, fit_options_for_schema(review_schema)),
+        ]
+        if is_dual_fit_schema(review_schema)
         else [(FIT_COL, fit_options or FIT_OPTIONS)]
     )
     for canon, options in rules:
@@ -607,7 +610,7 @@ def clear_review_answers(binding, review_schema=CURRENT_REVIEW_SCHEMA) -> bool:
     colmap = binding.get("colmap") or {}
     review_columns = (
         [HVAC_COL, OPT_FIT_COL, PERI_FIT_COL]
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else [HVAC_COL, FIT_COL]
     )
     first_row, last_row = min(rows), max(rows)
@@ -856,8 +859,8 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
         [(FIT_COL, fit_options or FIT_OPTIONS)]
         if FIT_COL in headers
         else [
-            (OPT_FIT_COL, DUAL_FIT_OPTIONS),
-            (PERI_FIT_COL, DUAL_FIT_OPTIONS),
+            (OPT_FIT_COL, fit_options or fit_options_for_schema(CURRENT_REVIEW_SCHEMA)),
+            (PERI_FIT_COL, fit_options or fit_options_for_schema(CURRENT_REVIEW_SCHEMA)),
         ]
     )
     for col_name, options in [(HVAC_COL, hvac_options)] + fit_rules:

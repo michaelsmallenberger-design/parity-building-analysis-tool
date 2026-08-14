@@ -44,12 +44,15 @@ from review_contract import (
     CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
+    DUAL_FIT_SCHEMA_V1,
+    LEGACY_DUAL_FIT_OPTIONS,
     FIT_COL,
     OPT_FIT_COL,
     PERI_FIT_COL,
     SINGLE_FIT_SCHEMA,
     entry_is_reviewed,
     entry_needs_attention,
+    fit_options_for_schema,
 )
 import review_store
 import sheets_writer
@@ -533,7 +536,10 @@ def _detect_hvac_fit_columns(df):
     hvac_vocab = {s.lower() for s in HVAC_SYSTEMS}
     # Recognize both current single-Fit and historical dual-product values so a
     # filled classification column is never mistaken for HVAC.
-    fit_vocab = {s.lower() for s in FIT_OPTIONS + DUAL_FIT_OPTIONS}
+    fit_vocab = {
+        s.lower()
+        for s in FIT_OPTIONS + DUAL_FIT_OPTIONS + LEGACY_DUAL_FIT_OPTIONS
+    }
 
     def content_score(col, vocab):
         vals = [str(v) for v in df[col].dropna().tolist() if str(v).strip()]
@@ -635,6 +641,7 @@ def _table_from_df(df):
 def _finalize_batch(
     results, title, headers=None, rows=None, binding=None, *,
     batch_id=None, sheet_bindings=None, tab_inventory=None, run_id=None,
+    review_schema=None,
 ):
     """Stamp row ids and persist the batch for /review, storing the ORIGINAL uploaded
     table (all the user's columns). When a Sheets service-account credential is
@@ -653,6 +660,22 @@ def _finalize_batch(
         if e.get("i") is None:
             e["i"] = e["row_id"]
     batch_id = batch_id or f"b-{uuid.uuid4().hex[:10]}"
+    if not review_schema:
+        candidate_bindings = list(sheet_bindings or [])
+        if binding:
+            candidate_bindings.append(binding)
+        dual_names = {OPT_FIT_COL.casefold(), PERI_FIT_COL.casefold()}
+        existing_dual_columns = any(
+            {
+                re.sub(r"\s+", " ", str(header or "")).strip().casefold()
+                for header in item.get("headers", [])
+            }.issuperset(dual_names)
+            for item in candidate_bindings
+        )
+        review_schema = (
+            DUAL_FIT_SCHEMA_V1 if existing_dual_columns else CURRENT_REVIEW_SCHEMA
+        )
+    fit_options = fit_options_for_schema(review_schema)
     if headers is None:
         headers, rows = _lean_table(results)
     base = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
@@ -673,8 +696,8 @@ def _finalize_batch(
                 ):
                     sheets_writer.ensure_review_columns(
                         multi_binding, multi_binding.get("headers", []),
-                        HVAC_SYSTEMS + [NONE_OPTION], DUAL_FIT_OPTIONS,
-                        review_schema=DUAL_FIT_SCHEMA,
+                        HVAC_SYSTEMS + [NONE_OPTION], fit_options,
+                        review_schema=review_schema,
                     )
                 multi_binding.pop("writeback_error", None)
             except Exception as e:
@@ -694,8 +717,8 @@ def _finalize_batch(
         try:
             sheets_writer.ensure_review_columns(
                 binding, binding.get("headers", []), HVAC_SYSTEMS + [NONE_OPTION],
-                DUAL_FIT_OPTIONS, review_url=review_url if base else "",
-                review_schema=DUAL_FIT_SCHEMA)
+                fit_options, review_url=review_url if base else "",
+                review_schema=review_schema)
             sheet_url = binding["sheet_url"]
         except Exception as e:
             log.error("Bound-sheet setup failed for %s: %s", batch_id, e, exc_info=True)
@@ -703,7 +726,7 @@ def _finalize_batch(
     elif sheets_writer.enabled():
         try:
             sheet_url = sheets_writer.create_batch_sheet(
-                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], DUAL_FIT_OPTIONS,
+                title, headers, rows, HVAC_SYSTEMS + [NONE_OPTION], fit_options,
                 review_url=review_url if base else "")
         except Exception as e:
             log.error("Sheet creation failed for %s: %s", batch_id, e, exc_info=True)
@@ -714,7 +737,7 @@ def _finalize_batch(
                             tab_inventory=tab_inventory,
                             schema_version=2 if sheet_bindings else 1,
                             run_id=run_id,
-                            review_schema=DUAL_FIT_SCHEMA)
+                            review_schema=review_schema)
     log.info("Batch %s finalized: %d rows, review %s, sheet %s",
              batch_id, len(results), review_url, sheet_url or "(none)")
     return batch_id, review_url, sheet_url

@@ -4,6 +4,7 @@ import re
 from review_contract import (
     DUAL_FIT_OPTIONS,
     DUAL_FIT_SCHEMA,
+    DUAL_FIT_SCHEMA_V1,
     SINGLE_FIT_SCHEMA,
     alex_review_remaining,
     batch_primary_review_complete,
@@ -53,9 +54,7 @@ def test_review_contract():
     assert HVAC_SYSTEMS == EXPECTED_HVAC
     assert FIT_OPTIONS == EXPECTED_LEGACY_FIT
     assert FIT_COLUMNS == ["Optimizer Fit", "Periscope Fit"]
-    assert DUAL_FIT_OPTIONS == [
-        "Customer", "Good", "Okay", "Bad", "Not Sure",
-    ]
+    assert DUAL_FIT_OPTIONS == ["Customer", "Good", "Maybe", "Bad"]
 
     html = build_review_page([_entry()], job_id="t", title="Test")
 
@@ -69,10 +68,10 @@ def test_review_contract():
     assert 'data-col="periscope_fit"' in html
     for fit in DUAL_FIT_OPTIONS:
         assert html.count(f'data-fit="{fit}"') == 2
-    assert html.count(
-        'data-fit="Okay" onclick="pickFit(this)">Maybe</button>'
-    ) == 2
-    assert 'data-fit="Okay" onclick="pickFit(this)">Okay</button>' not in html
+    assert html.count('data-fit="Maybe"') == 2
+    assert 'data-fit="Okay"' not in html
+    assert 'data-fit="Not Sure"' not in html
+    assert "min-height:440px" in html and "max-height:72vh" in html
     for host in MAP_HOSTS:
         assert host in html
 
@@ -408,7 +407,9 @@ def test_saved_okay_choice_is_presented_as_maybe_without_changing_canonical_valu
             "periscope_fit": "Bad",
         },
     }
-    page = build_review_page([saved], job_id="saved-maybe")
+    page = build_review_page(
+        [saved], job_id="saved-maybe", review_schema=DUAL_FIT_SCHEMA_V1
+    )
 
     assert (
         'class="fitchip sel" disabled data-fit="Okay" '
@@ -416,6 +417,28 @@ def test_saved_okay_choice_is_presented_as_maybe_without_changing_canonical_valu
         in _fit_group(page, "optimizer_fit")
     )
     assert "Optimizer Fit: Maybe" in page
+
+
+def test_legacy_dual_run_hides_not_sure_and_queues_existing_uncertainty():
+    legacy = {
+        **_entry(),
+        "human": {
+            "hvac_systems": "RTU",
+            "optimizer_fit": "Not Sure",
+            "periscope_fit": "Okay",
+        },
+    }
+    page = build_review_page(
+        [legacy],
+        job_id="legacy-dual-current-run",
+        review_schema=DUAL_FIT_SCHEMA_V1,
+        alex_review_enabled=True,
+    )
+
+    assert alex_review_remaining([legacy], DUAL_FIT_SCHEMA_V1) == 1
+    assert 'data-review-state="alex_review"' in page
+    assert 'data-fit="Okay" onclick="pickFit(this)">Maybe</button>' in page
+    assert 'data-fit="Not Sure"' not in page
 
 
 def test_partial_human_choices_are_never_filled_by_ai_defaults():
@@ -580,8 +603,8 @@ def _reviewed_entry(index, optimizer="Good", periscope="Bad"):
 
 def test_alex_queue_orders_globally_before_pagination_and_preserves_counts():
     entries = [_reviewed_entry(index) for index in range(1, 13)]
-    entries[10]["human"]["optimizer_fit"] = "Okay"
-    entries[11]["human"]["periscope_fit"] = "Not Sure"
+    entries[10]["human"]["optimizer_fit"] = "Maybe"
+    entries[11]["human"]["periscope_fit"] = "Maybe"
 
     html = build_review_page(
         entries,
@@ -611,11 +634,11 @@ def test_alex_queue_orders_globally_before_pagination_and_preserves_counts():
     assert "Save Alex review" in html
     assert "Confirm current qualification" in html
     assert "Cancel" in html
-    assert 'data-fit="Okay" onclick="pickFit(this)">Maybe</button>' in html
+    assert 'data-fit="Maybe" onclick="pickFit(this)">Maybe</button>' in html
 
 
 def test_alex_queue_waits_for_clean_primary_completion():
-    complete = _reviewed_entry(1, optimizer="Okay")
+    complete = _reviewed_entry(1, optimizer="Maybe")
     incomplete = {**_entry(), "i": 2, "address": "2 Test St"}
     partial_html = build_review_page(
         [complete, incomplete],
@@ -643,7 +666,7 @@ def test_alex_queue_waits_for_clean_primary_completion():
 
 
 def test_secondary_confirmation_clears_queue_without_migration():
-    confirmed = _reviewed_entry(1, optimizer="Okay")
+    confirmed = _reviewed_entry(1, optimizer="Maybe")
     confirmed["secondary_review"] = {
         "action": "confirm_uncertain",
         "completed_at": "2026-08-10T12:00:00",
@@ -675,8 +698,8 @@ def test_secondary_confirmation_clears_queue_without_migration():
 
 def test_alex_queue_qualifies_each_row_once_and_keeps_revised_uncertain_clear():
     entries = [
-        _reviewed_entry(1, optimizer="Okay", periscope="Not Sure"),
-        _reviewed_entry(2, optimizer="Not Sure", periscope="Good"),
+        _reviewed_entry(1, optimizer="Maybe", periscope="Maybe"),
+        _reviewed_entry(2, optimizer="Maybe", periscope="Good"),
         _reviewed_entry(3, optimizer="Customer", periscope="Bad"),
     ]
     assert alex_review_remaining(entries, DUAL_FIT_SCHEMA) == 2
@@ -694,7 +717,7 @@ def test_alex_queue_qualifies_each_row_once_and_keeps_revised_uncertain_clear():
 
 
 def test_flag_off_never_routes_secondary_failure_through_primary_submit():
-    entry = _reviewed_entry(1, optimizer="Good", periscope="Not Sure")
+    entry = _reviewed_entry(1, optimizer="Good", periscope="Maybe")
     entry["human"].update({
         "review_version": 2,
         "review_stage": "secondary",
@@ -732,6 +755,7 @@ if __name__ == "__main__":
     test_possible_cooling_tower_uses_the_same_review_defaults()
     test_saved_human_choices_override_positive_defaults()
     test_saved_okay_choice_is_presented_as_maybe_without_changing_canonical_value()
+    test_legacy_dual_run_hides_not_sure_and_queues_existing_uncertainty()
     test_partial_human_choices_are_never_filled_by_ai_defaults()
     test_negative_result_does_not_default_review_choices()
     test_positive_legacy_result_defaults_to_optimizer()

@@ -88,7 +88,7 @@ building count, square footage, year built/renovated, building class,
 construction type, city, and market. Owner/manager names, contacts, notes,
 comments, and unrecognized columns are never copied into the review card.
 
-The carousel labels the address-targeted ground view **Exterior / address** and,
+The enlarged carousel labels the address-targeted ground view **Exterior / address** and,
 when coverage exists, a second front/side context view **Exterior / alternate
 angle**. If neither exterior image is available, the card says so and directs
 the reviewer to the existing map links.
@@ -110,8 +110,9 @@ customer-facing Sheet column.
 
 When the Alex review feature is enabled, it waits until every building has a
 complete human HVAC plus both product-fit decisions and no Sheet write-back is
-failed. It then places any building with **Maybe** or **Not Sure** in either
-product at the top under **Needs Alex Review**. These cards remain counted as
+failed. It then places any building with **Maybe** in either product at the top
+under **Needs Alex Review**. Current legacy runs also surface already-saved
+**Okay** or **Not Sure** decisions in this queue. These cards remain counted as
 reviewed; the separate Alex count is a follow-up queue, not incomplete primary
 work. Parity changes only the review-page display order and never sorts the
 Google Sheet.
@@ -136,17 +137,18 @@ changed.
 
 Each building requires two independent product decisions:
 
-- **Optimizer Fit:** `Customer`, `Good`, `Maybe`, `Bad`, or `Not Sure`
-- **Periscope Fit:** `Customer`, `Good`, `Maybe`, `Bad`, or `Not Sure`
+- **Optimizer Fit:** `Customer`, `Good`, `Maybe`, or `Bad`
+- **Periscope Fit:** `Customer`, `Good`, `Maybe`, or `Bad`
 
 A building can be a good fit for both products, one product, or neither. The
 reviewer therefore never combines these decisions into one field.
 
-Use **Maybe** when the visible evidence suggests a possible fit but is not
-strong enough for **Good**. Use **Not Sure** only when the imagery or building
-location is not clear enough to make the fit judgment. For compatibility with
-existing Sheet dropdowns and saved reviews, the review page writes the
-established canonical value `Okay` when a reviewer selects **Maybe**.
+Use **Maybe** when the evidence is inconclusive or suggests a possible fit but
+is not strong enough for **Good**; add a short note when imagery or location is
+the reason. New runs store `Maybe` directly. For compatibility with current
+legacy runs and their existing Sheet dropdowns, those pages still write the
+established canonical value `Okay` while displaying it as **Maybe**. They do
+not offer **Not Sure** as a new choice.
 
 ## What Changes in the Sales Sheet
 
@@ -179,7 +181,7 @@ canonical output.
 | --- | --- |
 | The wrong address column or Sheet tab is suggested | Do not confirm it. Go back and contact the Parity operator. |
 | A Sheet says it needs setup | Check the address header and make sure the service account has Editor access. |
-| A building has poor/no imagery | Use **Not Sure** when the location or building is not clear enough to judge; add a short note and do not invent a result. |
+| A building has poor/no imagery | Use **Maybe**, add a short note that imagery/location is insufficient, and do not invent a result. |
 | Stories/Floors is blank | Confirm that the source Sheet contains a recognized `Stories` or `Floors` column. Parity does not estimate the value from imagery. |
 | The card says no exterior view is available | Use the Google Maps, Google Earth, or Bing links directly below the imagery. |
 | A Sheet value is marked invalid | Stop and tell the Parity operator; do not force a value outside the team dropdown. |
