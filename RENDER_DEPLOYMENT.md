@@ -63,6 +63,23 @@ can affect provider usage; missing coverage is skipped and never changes the
 analysis verdict. Disable `STREETVIEW_SECONDARY_ENABLED` to cap new runs at one
 ground-level review image per address.
 
+Optional Alex secondary-review queue:
+
+- `ALEX_REVIEW_QUEUE_ENABLED=false` (safe default in `render.yaml`)
+
+Leave this false through deployment and signed-out password-gate verification.
+After local tests pass and Render is running the expected commit, enable it to
+derive **Needs Alex Review** for clean, fully human-reviewed dual-fit batches.
+The queue does not rerun maps/models and does not reorder Sheets. A live
+secondary-write smoke test must use an explicitly approved disposable Sheet:
+verify one new-v2 `Maybe`, one final row, one confirmation, one revision, the
+exact three revised cells, unchanged HVAC, and the remaining queue count. Also
+verify read-only rendering of a legacy-v1 `Okay`/`Not Sure` row when a current
+run exists. New v2 runs use `Customer`, `Good`, `Maybe`, `Bad`; refreshed v1
+pages hide `Not Sure` and display the Sheet-compatible `Okay` value as
+`Maybe`. Roll back immediately by setting the flag to `false`; no metadata
+migration or customer-row restoration is needed.
+
 ## Google Sheets service account (one-time, ~15 min)
 
 This lets the server create the output Google Sheet at run time and write each

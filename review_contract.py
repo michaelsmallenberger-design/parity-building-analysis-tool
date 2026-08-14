@@ -1,9 +1,9 @@
 """Versioned human-review contracts shared by rendering, storage, and Sheets.
 
 New Parity workbooks use separate ``Optimizer Fit`` and ``Periscope Fit``
-columns. Each product is reviewed independently using the source Sheet's five
-allowed values. Previously persisted single-``Fit`` batches remain readable
-and submittable.
+columns. Each product is reviewed independently using four allowed values.
+Previously persisted dual-fit and single-``Fit`` batches remain readable and
+submittable without rewriting their stored decisions.
 """
 from __future__ import annotations
 
@@ -12,8 +12,12 @@ from typing import Any
 
 
 SINGLE_FIT_SCHEMA = "single_fit_v1"
-DUAL_FIT_SCHEMA = "dual_product_fit_v1"
-VALID_REVIEW_SCHEMAS = {SINGLE_FIT_SCHEMA, DUAL_FIT_SCHEMA}
+DUAL_FIT_SCHEMA_V1 = "dual_product_fit_v1"
+DUAL_FIT_SCHEMA_V2 = "dual_product_fit_v2"
+# Compatibility name used by callers that mean "the current dual-fit schema".
+DUAL_FIT_SCHEMA = DUAL_FIT_SCHEMA_V2
+DUAL_FIT_SCHEMAS = frozenset({DUAL_FIT_SCHEMA_V1, DUAL_FIT_SCHEMA_V2})
+VALID_REVIEW_SCHEMAS = {SINGLE_FIT_SCHEMA, *DUAL_FIT_SCHEMAS}
 
 FIT_COL = "Fit"
 FIT_OPTIONS = ["Optimizer", "Periscope", "Unclear", "Bad"]
@@ -21,8 +25,11 @@ FIT_OPTIONS = ["Optimizer", "Periscope", "Unclear", "Bad"]
 OPT_FIT_COL = "Optimizer Fit"
 PERI_FIT_COL = "Periscope Fit"
 DUAL_FIT_COLUMNS = [OPT_FIT_COL, PERI_FIT_COL]
-DUAL_FIT_OPTIONS = ["Customer", "Good", "Okay", "Bad", "Not Sure"]
+DUAL_FIT_OPTIONS = ["Customer", "Good", "Maybe", "Bad"]
+LEGACY_DUAL_FIT_OPTIONS = ["Customer", "Good", "Okay", "Bad", "Not Sure"]
 CURRENT_REVIEW_SCHEMA = DUAL_FIT_SCHEMA
+ALEX_REVIEW_FIT_VALUES = frozenset({"Maybe"})
+LEGACY_ALEX_REVIEW_FIT_VALUES = frozenset({"Okay", "Not Sure"})
 MACHINE_ATTENTION_VERDICTS = frozenset({
     "ambiguous_footprint",
     "likely_residential",
@@ -32,6 +39,29 @@ MACHINE_ATTENTION_VERDICTS = frozenset({
 
 def _norm(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def is_dual_fit_schema(review_schema: str) -> bool:
+    return str(review_schema or "") in DUAL_FIT_SCHEMAS
+
+
+def fit_options_for_schema(review_schema: str) -> list[str]:
+    """Return submit choices compatible with one batch's Sheet contract.
+
+    Legacy dual-fit batches continue to write ``Okay`` because their existing
+    Sheet validation may reject ``Maybe``. The UI labels that value ``Maybe``
+    and no longer offers ``Not Sure``. New v2 batches store ``Maybe`` directly.
+    """
+    if review_schema == DUAL_FIT_SCHEMA_V1:
+        return ["Customer", "Good", "Okay", "Bad"]
+    if review_schema == DUAL_FIT_SCHEMA_V2:
+        return list(DUAL_FIT_OPTIONS)
+    return list(FIT_OPTIONS)
+
+
+def accepted_fit_values_for_schema(review_schema: str) -> frozenset[str]:
+    """API acceptance set for new primary and secondary submissions."""
+    return frozenset(fit_options_for_schema(review_schema))
 
 
 def infer_review_schema(batch: dict[str, Any] | None) -> str:
@@ -46,7 +76,7 @@ def infer_review_schema(batch: dict[str, Any] | None) -> str:
     """
     batch = batch or {}
     explicit = str(batch.get("review_schema") or "")
-    if explicit == DUAL_FIT_SCHEMA:
+    if explicit in DUAL_FIT_SCHEMAS:
         return explicit
 
     selected_inventory_headers = []
@@ -75,7 +105,7 @@ def infer_review_schema(batch: dict[str, Any] | None) -> str:
         and inventory_proves_dual
         and not has_human_decisions
     ):
-        return DUAL_FIT_SCHEMA
+        return DUAL_FIT_SCHEMA_V1
     if explicit == SINGLE_FIT_SCHEMA:
         return explicit
 
@@ -94,7 +124,9 @@ def infer_review_schema(batch: dict[str, Any] | None) -> str:
     if _norm(FIT_COL) in normalized:
         return SINGLE_FIT_SCHEMA
     if all(_norm(column) in normalized for column in DUAL_FIT_COLUMNS):
-        return DUAL_FIT_SCHEMA
+        # An unstamped dual-fit batch predates v2. Preserve its existing Sheet
+        # value contract instead of assuming the new four-value validation.
+        return DUAL_FIT_SCHEMA_V1
     return CURRENT_REVIEW_SCHEMA
 
 
@@ -102,7 +134,7 @@ def human_is_complete(human: dict[str, Any] | None, review_schema: str) -> bool:
     human = human or {}
     if not str(human.get("hvac_systems") or "").strip():
         return False
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         return all(
             str(human.get(key) or "").strip()
             for key in ("optimizer_fit", "periscope_fit")
@@ -138,4 +170,93 @@ def entry_needs_attention(
     return (
         entry_has_machine_attention(entry)
         and not entry_is_reviewed(entry, review_schema)
+    )
+
+
+def human_review_version(entry: dict[str, Any] | None) -> int:
+    """Return the optimistic-lock version for one persisted human decision.
+
+    Completed decisions created before version metadata existed are revision 1
+    in memory. They are not rewritten until a reviewer performs a new action.
+    """
+    human = (entry or {}).get("human") or {}
+    if not human:
+        return 0
+    try:
+        version = int(human.get("review_version"))
+    except (TypeError, ValueError):
+        version = 0
+    return version if version > 0 else 1
+
+
+def batch_primary_review_complete(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    review_schema: str,
+) -> bool:
+    """Whether a dual-fit batch is safe to expose for secondary review."""
+    entries = list(entries or [])
+    if not is_dual_fit_schema(review_schema) or not entries:
+        return False
+    if not all(entry_is_reviewed(entry, review_schema) for entry in entries):
+        return False
+    return not any(
+        str((entry.get("writeback") or {}).get("status") or "").casefold()
+        == "error"
+        for entry in entries
+    )
+
+
+def _secondary_review_matches_current(entry: dict[str, Any]) -> bool:
+    secondary = entry.get("secondary_review") or {}
+    action = str(secondary.get("action") or "")
+    if action not in {"revise", "confirm_uncertain"}:
+        return False
+    try:
+        source_version = int(secondary.get("source_review_version"))
+    except (TypeError, ValueError):
+        return False
+    current_version = human_review_version(entry)
+    if action == "confirm_uncertain":
+        return source_version == current_version
+    human = entry.get("human") or {}
+    return (
+        str(human.get("review_stage") or "") == "secondary"
+        and current_version == source_version + 1
+    )
+
+
+def entry_needs_alex_review(
+    entry: dict[str, Any] | None,
+    review_schema: str,
+) -> bool:
+    """Return the derived secondary-review eligibility for one row."""
+    entry = entry or {}
+    if not is_dual_fit_schema(review_schema) or not entry_is_reviewed(
+        entry, review_schema
+    ):
+        return False
+    human = entry.get("human") or {}
+    uncertain_values = (
+        LEGACY_ALEX_REVIEW_FIT_VALUES
+        if review_schema == DUAL_FIT_SCHEMA_V1
+        else ALEX_REVIEW_FIT_VALUES
+    )
+    uncertain = any(
+        str(human.get(key) or "").strip() in uncertain_values
+        for key in ("optimizer_fit", "periscope_fit")
+    )
+    return uncertain and not _secondary_review_matches_current(entry)
+
+
+def alex_review_remaining(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    review_schema: str,
+) -> int:
+    """Count candidates only after the clean primary-completion gate opens."""
+    entries = list(entries or [])
+    if not batch_primary_review_complete(entries, review_schema):
+        return 0
+    return sum(
+        1 for entry in entries
+        if entry_needs_alex_review(entry, review_schema)
     )

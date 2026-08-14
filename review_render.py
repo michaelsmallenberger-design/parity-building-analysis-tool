@@ -11,13 +11,16 @@ from failure_diagnostics import sanitize_failure_text
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
     DUAL_FIT_COLUMNS,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_OPTIONS,
     MACHINE_ATTENTION_VERDICTS,
     SINGLE_FIT_SCHEMA,
+    batch_primary_review_complete,
     entry_has_machine_attention,
+    entry_needs_alex_review,
     entry_is_reviewed,
+    human_review_version,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 
 # Exact HVAC Systems data-validation dropdown from the Washington Gas sheet
@@ -71,16 +74,14 @@ VERDICT_COLOR = {
     "likely_residential": "#868e96", "not_detected": "#e8590c", "": "#868e96",
 }
 
-# Keep the established Sheet/API value ``Okay`` for backward compatibility,
-# while giving reviewers the clearer product-language label requested in the
-# review UI. ``Not Sure`` remains reserved for inadequate imagery/location
-# evidence; ``Maybe`` means the visible evidence suggests a possible fit.
+# Keep the legacy Sheet/API value ``Okay`` for old batches while giving
+# reviewers the requested ``Maybe`` label. New batches store ``Maybe`` itself.
 _DUAL_FIT_DISPLAY_LABELS = {"Okay": "Maybe"}
 
 
 def _fit_display_label(value, review_schema):
     value = str(value or "")
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         return _DUAL_FIT_DISPLAY_LABELS.get(value, value)
     return value
 
@@ -93,6 +94,7 @@ def _valid_image_source(value):
 
 _REVIEW_STATE_ORDER = ("reviewed", "pending", "attention")
 _REVIEW_STATE_LABELS = {
+    "alex_review": "Needs Alex Review",
     "reviewed": "Completed reviews",
     "pending": "Still needs review",
     "attention": "Needs attention",
@@ -136,6 +138,11 @@ def _machine_attention_reason(e):
             limit=240,
         )
         return f"Review saved locally, but the Sheet was not updated: {detail}"
+    if writeback.get("status") == "pending":
+        return (
+            "Review is saved locally, but its Sheet update is still pending. "
+            "Retry the write-back before continuing."
+        )
 
     error = str(e.get("error") or "").strip()
     if error:
@@ -165,9 +172,14 @@ def _machine_attention_reason(e):
     return ""
 
 
-def _review_state(e, review_schema):
+def _review_state(e, review_schema, alex_review_enabled=False):
     """Classify without mutating persisted entry order or human decisions."""
-    if (e.get("writeback") or {}).get("status") == "error":
+    writeback_status = (e.get("writeback") or {}).get("status")
+    if writeback_status == "error" or (
+        alex_review_enabled
+        and writeback_status == "pending"
+        and str((e.get("human") or {}).get("review_stage") or "") == "secondary"
+    ):
         return "attention", _machine_attention_reason(e)
     if entry_is_reviewed(e, review_schema):
         return "reviewed", ""
@@ -184,6 +196,7 @@ def _card(
     review_schema=CURRENT_REVIEW_SCHEMA,
     review_state=None,
     issue_reason="",
+    alex_review_enabled=False,
 ):
     # A batch entry carries a "human" decision once reviewed (review_store); render
     # such cards in the exact state a live Submit leaves them in, so reopening the
@@ -192,6 +205,22 @@ def _card(
     reviewed = entry_is_reviewed(e, review_schema)
     writeback = e.get("writeback") or {}
     writeback_error = writeback.get("status") == "error"
+    writeback_pending = writeback.get("status") == "pending"
+    writeback_problem = writeback_error or writeback_pending
+    review_state = review_state or _review_state(
+        e, review_schema, alex_review_enabled
+    )[0]
+    review_stage = str(human.get("review_stage") or ("primary" if human else ""))
+    review_version = human_review_version(e)
+    secondary_writeback = bool(
+        reviewed and writeback_problem and review_stage == "secondary"
+    )
+    secondary_retry = bool(
+        alex_review_enabled
+        and secondary_writeback
+        and str((e.get("secondary_review") or {}).get("action") or "") == "revise"
+    )
+    alex_review = review_state == "alex_review"
     picked = {s.strip() for s in str(human.get("hvac_systems", "")).split(",") if s.strip()}
     rid = _html.escape(str(
         e.get("row_id") if e.get("row_id") is not None else e.get("i", "")
@@ -243,42 +272,47 @@ def _card(
             '</div>'
         )
 
-    controls_dis = " disabled" if reviewed else ""
-    submit_dis = " disabled" if reviewed and not writeback_error else ""
+    hvac_dis = " disabled" if reviewed else ""
+    fit_dis = " disabled" if reviewed else ""
+    note_dis = " disabled" if reviewed else ""
+    submit_dis = " disabled" if reviewed and not writeback_problem else ""
     chips = ""
     for s in HVAC_SYSTEMS + [NONE_OPTION]:
         if human:
             pre = " sel" if s in picked else ""
         else:
             pre = " sel" if (s == "Cooling Tower" and ai_positive) else ""
-        chips += f'<button type="button" class="chip{pre}"{controls_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
+        chips += f'<button type="button" class="chip{pre}"{hvac_dis} data-sys="{_html.escape(s)}" onclick="toggle(this)">{_html.escape(s)}</button>'
     fitrows = ""
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
+        dual_options = fit_options_for_schema(review_schema)
         fit_specs = [
-            ("Optimizer Fit", "optimizer_fit", DUAL_FIT_OPTIONS),
-            ("Periscope Fit", "periscope_fit", DUAL_FIT_OPTIONS),
+            ("Optimizer Fit", "optimizer_fit", dual_options),
+            ("Periscope Fit", "periscope_fit", dual_options),
         ]
     else:
         fit_specs = [("Fit", "fit", FIT_OPTIONS)]
     for col, fit_key, fit_options in fit_specs:
         picked_fit = str(human.get(fit_key) or "")
         if not human and ai_positive:
-            if review_schema == DUAL_FIT_SCHEMA and fit_key == "optimizer_fit":
+            if is_dual_fit_schema(review_schema) and fit_key == "optimizer_fit":
                 picked_fit = "Good"
             elif review_schema == SINGLE_FIT_SCHEMA and fit_key == "fit":
                 picked_fit = "Optimizer"
         chips_f = ""
         for fo in fit_options:
             pre = " sel" if fo == picked_fit else ""
-            chips_f += (f'<button type="button" class="fitchip{pre}"{controls_dis} '
+            chips_f += (f'<button type="button" class="fitchip{pre}"{fit_dis} '
                         f'data-fit="{_html.escape(fo)}" onclick="pickFit(this)">'
                         f'{_html.escape(_fit_display_label(fo, review_schema))}</button>')
         fitrows += (f'<div class="label">{_html.escape(col)}:</div>'
                     f'<div class="fitchips" data-col="{fit_key}">{chips_f}</div>')
 
-    if writeback_error:
+    if writeback_problem:
         status = (
-            '<span class="status err">saved locally; Sheet write-back failed '
+            '<span class="status err">saved locally; Sheet write-back '
+            + ("pending" if writeback_pending else "failed")
+            + ' '
             '— retry</span>'
         )
     elif reviewed:
@@ -327,11 +361,10 @@ def _card(
                 'Other building information from Sheet</summary>'
                 f'<dl>{"".join(info_rows)}</dl></details>'
             )
-    button_text = "Retry Sheet write-back" if writeback_error else "Submit"
-    review_state = review_state or _review_state(e, review_schema)[0]
+    button_text = "Retry Sheet write-back" if writeback_problem else "Submit"
     state_class = (
         f" {review_state}"
-        if review_state in {"pending", "attention"}
+        if review_state in {"alex_review", "pending", "attention"}
         else ""
     )
     issue = ""
@@ -345,9 +378,33 @@ def _card(
             f'<div class="issue {review_state}"><strong>{issue_label}:</strong> '
             f'{_html.escape(issue_reason)}</div>'
         )
+    if alex_review:
+        actions = '''
+    <button type="button" class="alex-unlock" onclick="beginAlexReview(this)">Review qualification</button>
+    <div class="alex-actions" hidden>
+      <button type="button" class="submit alex-save" onclick="submitSecondary(this,'revise')">Save Alex review</button>
+      <button type="button" class="alex-confirm" onclick="submitSecondary(this,'confirm_uncertain')">Confirm current qualification</button>
+      <button type="button" class="alex-cancel" onclick="cancelAlexReview(this)">Cancel</button>
+    </div>'''
+    elif secondary_retry:
+        actions = (
+            '<button type="button" class="submit secondary-retry" '
+            'onclick="submitSecondary(this,\'revise\')">'
+            f'{button_text}</button>'
+        )
+    elif secondary_writeback:
+        actions = (
+            '<button type="button" class="submit" disabled>'
+            'Enable Alex review to retry Sheet write-back</button>'
+        )
+    else:
+        actions = (
+            f'<button type="button" class="submit"{submit_dis} '
+            f'onclick="submitCard(this)">{button_text}</button>'
+        )
 
     return f'''
-<article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_error else ''}{state_class}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-review-state="{review_state}" data-addr="{addr_attr}" data-ai="{_html.escape(ai)}">
+<article class="card{' done' if reviewed else ''}{' writeback-error' if writeback_problem else ''}{state_class}" data-rid="{rid}" data-reviewed="{'1' if reviewed else '0'}" data-review-state="{review_state}" data-review-stage="{_html.escape(review_stage)}" data-review-version="{review_version}" data-addr="{addr_attr}" data-ai="{_html.escape(ai)}">
   <div class="head">
     <div><div class="addr">{addr_e}</div>{source}{context}</div>
     <div class="ai">model: <span class="badge" style="background:{ai_color}">{_html.escape(ai) or '—'}</span></div>
@@ -366,8 +423,8 @@ def _card(
     <div class="label">HVAC systems you see (check all):</div>
     <div class="chips">{chips}</div>
     {fitrows}
-    <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}"{controls_dis}>
-    <button type="button" class="submit"{submit_dis} onclick="submitCard(this)">{button_text}</button>
+    <input class="note" type="text" placeholder="optional note…" value="{_html.escape(str(human.get("note", "")))}"{note_dis}>
+    {actions}
     {status}
   </div>
 </article>'''
@@ -377,6 +434,7 @@ def build_review_page(
     entries, job_id, webhook_url="", title="Cooling Tower Review",
     csrf_token="", review_schema=CURRENT_REVIEW_SCHEMA,
     page=None, page_size=None, page_url="", source_context_refresh_url="",
+    alex_review_enabled=False,
 ):
     """Render a review page, optionally limited to one server-selected page.
 
@@ -386,13 +444,30 @@ def build_review_page(
     """
     entries = list(entries)
     total = len(entries)
-    entry_records = [
-        (entry, *_review_state(entry, review_schema))
-        for entry in entries
-    ]
+    alex_queue_active = bool(
+        alex_review_enabled
+        and batch_primary_review_complete(entries, review_schema)
+    )
+    entry_records = []
+    for entry in entries:
+        state, reason = _review_state(
+            entry, review_schema, alex_review_enabled
+        )
+        if (
+            alex_queue_active
+            and state == "reviewed"
+            and entry_needs_alex_review(entry, review_schema)
+        ):
+            state = "alex_review"
+        entry_records.append((entry, state, reason))
+    state_order = (
+        ("alex_review", "reviewed", "pending", "attention")
+        if alex_queue_active
+        else _REVIEW_STATE_ORDER
+    )
     ordered_records = [
         record
-        for state in _REVIEW_STATE_ORDER
+        for state in state_order
         for record in entry_records
         if record[1] == state
     ]
@@ -421,7 +496,7 @@ def build_review_page(
     for entry in entries:
         all_grouped.setdefault(str(entry.get("source_tab") or ""), []).append(entry)
     sections = []
-    for state in _REVIEW_STATE_ORDER:
+    for state in state_order:
         state_records = [record for record in visible_records if record[1] == state]
         if not state_records:
             continue
@@ -461,14 +536,20 @@ def build_review_page(
             state_sections.append(
                 f'<section class="tab-group">{tab_heading}'
                 + "\n".join(
-                    _card(entry, review_schema, state, reason)
+                    _card(
+                        entry,
+                        review_schema,
+                        state,
+                        reason,
+                        alex_review_enabled=alex_review_enabled,
+                    )
                     for entry, reason in tab_records
                 )
                 + "</section>"
             )
         sections.append(
             f'<section class="review-state-group {state}">'
-            f'<div class="state-head"><h2>{_REVIEW_STATE_LABELS[state]}</h2>'
+            f'<div class="state-head"><h2>{"Other completed reviews" if alex_queue_active and state == "reviewed" else _REVIEW_STATE_LABELS[state]}</h2>'
             f'<span>{state_total}{state_context}</span></div>'
             + "\n".join(state_sections)
             + "</section>"
@@ -477,6 +558,7 @@ def build_review_page(
     done0 = sum(1 for e in entries if entry_is_reviewed(e, review_schema))
     pending0 = sum(1 for record in entry_records if record[1] == "pending")
     attention0 = sum(1 for record in entry_records if record[1] == "attention")
+    alex0 = sum(1 for record in entry_records if record[1] == "alex_review")
     if pagination_enabled:
         base_url = str(page_url or "")
 
@@ -523,11 +605,22 @@ def build_review_page(
         )
     else:
         pagination = ""
+    first_page_url = (
+        page_href(1)
+        if pagination_enabled
+        else str(page_url or "")
+    )
     wh = json.dumps(webhook_url)
     jid = json.dumps(str(job_id))
     csrf = json.dumps(str(csrf_token))
     context_refresh = json.dumps(str(source_context_refresh_url or ""))
     schema_json = json.dumps(str(review_schema))
+    first_page_json = json.dumps(first_page_url)
+    alex_header = (
+        f' · Needs Alex Review: <span id="alex-count">{alex0}</span>'
+        if alex_review_enabled and is_dual_fit_schema(review_schema)
+        else ""
+    )
     source_context_toolbar = ""
     if source_context_refresh_url:
         source_context_toolbar = '''
@@ -538,7 +631,7 @@ def build_review_page(
 </div>'''
     fit_help = (
         "both Optimizer Fit and Periscope Fit choices"
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else "a Fit choice"
     )
     return f'''<!doctype html><html><head><meta charset="utf-8">
@@ -556,6 +649,7 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .state-head h2{{margin:0;font-size:18px}}.state-head span{{color:#9aa3ad;font-size:12px}}
 .review-state-group.pending .state-head{{border-color:#375a7f}}
 .review-state-group.attention .state-head{{border-color:#c92a2a;background:#271416}}
+.review-state-group.alex_review .state-head{{border-color:#d4a017;background:#2a2412}}
 .tab-group{{margin:0 0 28px}}.tab-head{{display:flex;justify-content:space-between;align-items:center;
  gap:12px;margin:6px 2px 12px;padding-bottom:8px;border-bottom:1px solid #333b45}}
 .tab-head h2{{margin:0;font-size:18px}}.tab-head span,.source{{color:#9aa3ad;font-size:12px}}
@@ -566,14 +660,15 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .card.writeback-error{{border-color:#f59f00;opacity:1}}
 .card.pending{{border-color:#375a7f}}
 .card.attention{{border-color:#e03131;opacity:1}}
+.card.alex_review{{border-color:#d4a017;opacity:1}}
 .head{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
 .addr{{font-weight:600}}.badge{{color:#0d0f12;font-weight:700;font-size:12px;padding:2px 8px;border-radius:20px}}
 .issue{{margin:12px 0;padding:10px 12px;border-radius:8px;font-size:13px}}
 .issue.pending{{background:#10243a;border:1px solid #375a7f;color:#d7e9fb}}
 .issue.attention{{background:#321719;border:1px solid #e03131;color:#ffd8d8}}
 .carousel{{position:relative;margin:12px 0;background:#0b0d10;border:1px solid #222833;border-radius:10px}}
-.frame{{text-align:center;min-height:320px;display:flex;align-items:center;justify-content:center}}
-.frame img{{display:none;max-width:100%;max-height:60vh;border-radius:8px;cursor:zoom-in}}
+.frame{{text-align:center;min-height:440px;display:flex;align-items:center;justify-content:center}}
+.frame img{{display:none;width:100%;max-width:100%;max-height:72vh;object-fit:contain;border-radius:8px;cursor:zoom-in}}
 .frame img.cur{{display:block}}
 .nav{{position:absolute;top:50%;transform:translateY(-50%);background:rgba(20,24,30,.8);color:#fff;border:1px solid #333b45;
  width:40px;height:52px;border-radius:8px;font-size:26px;cursor:pointer;z-index:2}}
@@ -608,6 +703,13 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 .review .note{{background:#0f1216;color:#e6e8eb;border:1px solid #333b45;border-radius:8px;padding:8px;width:100%;margin-bottom:10px}}
 .submit{{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 18px;cursor:pointer}}
 .submit:disabled{{background:#2a3340;color:#6b7280;cursor:not-allowed}}
+.alex-unlock,.alex-confirm,.alex-cancel{{border-radius:8px;padding:9px 14px;cursor:pointer}}
+.alex-unlock{{background:#9c6f00;color:#fff;border:1px solid #d4a017}}
+.alex-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.alex-actions[hidden]{{display:none}}
+.alex-confirm{{background:#173a66;color:#fff;border:1px solid #4d9fff}}
+.alex-cancel{{background:#1e232b;color:#cfd4da;border:1px solid #333b45}}
+.card.alex-editing{{box-shadow:0 0 0 2px rgba(212,160,23,.22)}}
 .status{{margin-left:12px;color:#9aa3ad;font-size:13px}}.status.ok{{color:#37b24d}}.status.err{{color:#ff6b6b}}
 .bulk-review{{background:#161a20;border:1px solid #2f9e44;border-radius:12px;padding:16px;margin:24px 0 8px}}
 .bulk-review .help{{color:#9aa3ad;font-size:13px;margin-bottom:10px}}
@@ -630,7 +732,7 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 @media(max-width:560px){{.pagination{{gap:8px}}.page-link{{font-size:12px}}.page-summary{{font-size:11px}}}}
 </style></head><body>
 <header><h1>{_html.escape(title)}</h1>
-<div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed · <span id="pending-count">{pending0}</span> still need review · <span id="attention-count">{attention0}</span> need attention · every Submit writes to the source tab</div></header>
+<div class="sub">{total}/{total} analyzed · <span id="done">{done0}</span>/{total} reviewed{alex_header} · <span id="pending-count">{pending0}</span> still need review · <span id="attention-count">{attention0}</span> need attention · every Submit writes to the source tab</div></header>
 <div class="wrap">{source_context_toolbar}{pagination}{cards}{pagination}</div>
 <div class="bulk-review">
   <div class="help"><strong>Done reviewing?</strong> Submit every unreviewed card{' on this page' if pagination_enabled else ''} that has an HVAC system selected (or <em>None</em>) and {fit_help}. Incomplete cards are skipped so nothing is guessed.</div>
@@ -639,7 +741,8 @@ header h1{{margin:0;font-size:17px}}header .sub{{color:#9aa3ad;font-size:13px;ma
 </div>
 <div id="lb" onclick="this.style.display='none'"><img id="lbi"></div>
 <script>
-const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json}, SOURCE_CONTEXT_REFRESH={context_refresh};let done={done0};
+const WEBHOOK={wh}, JOB={jid}, CSRF_TOKEN={csrf}, REVIEW_SCHEMA={schema_json}, SOURCE_CONTEXT_REFRESH={context_refresh}, FIRST_PAGE_URL={first_page_json};let done={done0};
+let primaryAlexReady=false;
 async function refreshSourceContext(){{
   if(!SOURCE_CONTEXT_REFRESH)return;
   const button=document.getElementById('refresh-source-context');
@@ -667,6 +770,47 @@ function toggle(chip){{
     if(c!==chip&&(none||c.dataset.sys==='None'))c.classList.remove('sel');}});
 }}
 function pickFit(chip){{chip.parentElement.querySelectorAll('.fitchip').forEach(c=>c.classList.remove('sel'));chip.classList.add('sel');}}
+function selectedFits(card){{const fits={{}};card.querySelectorAll('.fitchips').forEach(g=>{{
+  const selected=g.querySelector('.fitchip.sel');fits[g.dataset.col]=selected?selected.dataset.fit:'';}});return fits;}}
+function goToFirstPage(){{if(FIRST_PAGE_URL)window.location.href=FIRST_PAGE_URL;else window.location.reload();}}
+function beginAlexReview(btn){{
+  const card=btn.closest('.card');
+  card.dataset.alexSnapshot=JSON.stringify({{fits:selectedFits(card),note:card.querySelector('.note').value}});
+  card.querySelectorAll('.fitchip,.note').forEach(control=>control.disabled=false);
+  card.classList.add('alex-editing');btn.hidden=true;card.querySelector('.alex-actions').hidden=false;
+}}
+function cancelAlexReview(btn){{
+  const card=btn.closest('.card');let snapshot={{fits:{{}},note:''}};
+  try{{snapshot=JSON.parse(card.dataset.alexSnapshot||'{{}}');}}catch(e){{}}
+  card.querySelectorAll('.fitchips').forEach(group=>group.querySelectorAll('.fitchip').forEach(chip=>
+    chip.classList.toggle('sel',chip.dataset.fit===(snapshot.fits||{{}})[group.dataset.col])));
+  card.querySelector('.note').value=snapshot.note||'';
+  card.querySelectorAll('.fitchip,.note').forEach(control=>control.disabled=true);
+  card.classList.remove('alex-editing');card.querySelector('.alex-actions').hidden=true;
+  card.querySelector('.alex-unlock').hidden=false;
+}}
+async function submitSecondary(btn,action){{
+  const card=btn.closest('.card'),status=card.querySelector('.status'),fits=selectedFits(card);
+  const payload={{job_id:JOB,row_id:card.dataset.rid,review_stage:'secondary',
+    secondary_action:action,expected_review_version:+card.dataset.reviewVersion}};
+  if(action==='revise'){{
+    if(!fits.optimizer_fit||!fits.periscope_fit){{status.textContent='choose both Optimizer Fit and Periscope Fit';status.className='status err';return;}}
+    payload.optimizer_fit=fits.optimizer_fit;payload.periscope_fit=fits.periscope_fit;
+    payload.note=card.querySelector('.note').value;
+  }}
+  const buttons=[...card.querySelectorAll('.alex-actions button,.secondary-retry')];
+  buttons.forEach(control=>control.disabled=true);status.textContent='saving…';status.className='status';
+  try{{
+    if(!WEBHOOK)throw new Error('secondary review requires the live review service');
+    const headers={{'Content-Type':'application/json'}};if(CSRF_TOKEN)headers['X-CSRF-Token']=CSRF_TOKEN;
+    const response=await fetch(WEBHOOK,{{method:'POST',headers,body:JSON.stringify(payload)}});
+    let reply={{}};try{{reply=await response.json();}}catch(e){{reply={{}};}}
+    if(!response.ok)throw new Error(reply.error||('HTTP '+response.status));
+    if(reply.sheet==='error'||reply.sheet==='row_not_found'){{goToFirstPage();return;}}
+    status.textContent=action==='revise'?'✓ Alex review saved':'✓ current qualification confirmed';
+    status.className='status ok';goToFirstPage();
+  }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';buttons.forEach(control=>control.disabled=false);}}
+}}
 document.querySelectorAll('.carousel').forEach(setCap);
 async function submitCard(btn,reloadAfterSave=true){{
   const card=btn.closest('.card');
@@ -679,7 +823,7 @@ async function submitCard(btn,reloadAfterSave=true){{
     status.textContent='choose one Fit: Optimizer, Periscope, Unclear, or Bad';
     status.className='status err';return 'incomplete';
   }}
-  if(REVIEW_SCHEMA==='dual_product_fit_v1' && (!fits.optimizer_fit || !fits.periscope_fit)){{
+  if(REVIEW_SCHEMA.startsWith('dual_product_fit_') && (!fits.optimizer_fit || !fits.periscope_fit)){{
     status.textContent='choose both Optimizer Fit and Periscope Fit';
     status.className='status err';return 'incomplete';
   }}
@@ -692,7 +836,7 @@ async function submitCard(btn,reloadAfterSave=true){{
     let reply={{}};
     if(WEBHOOK){{const headers={{'Content-Type':'application/json'}};if(CSRF_TOKEN)headers['X-CSRF-Token']=CSRF_TOKEN;const r=await fetch(WEBHOOK,{{method:'POST',headers,body:JSON.stringify(payload)}});
       try{{reply=await r.json();}}catch(e){{reply={{}};}}
-      if(!r.ok)throw new Error('HTTP '+r.status);
+      if(!r.ok)throw new Error(reply.error||('HTTP '+r.status));
       if(reply.sheet==='error' || reply.sheet==='row_not_found'){{
         status.textContent=reply.sheet==='row_not_found'
           ? 'saved locally; Sheet row not found - retry'
@@ -701,6 +845,7 @@ async function submitCard(btn,reloadAfterSave=true){{
       }}
     }}
     else{{console.log('[DEMO] would POST to n8n:',payload);await new Promise(r=>setTimeout(r,250));}}
+    if(reply.primary_review_complete&&reply.alex_review_remaining>0)primaryAlexReady=true;
     status.textContent='✓ saved: '+payload.hvac_systems+(payload.fit?' · Fit: '+payload.fit:'')+(payload.optimizer_fit?' · Optimizer: '+payload.optimizer_fit:'')+(payload.periscope_fit?' · Periscope: '+payload.periscope_fit:'')+(WEBHOOK?'':' (demo)');status.className='status ok';
     const wasReviewed=card.dataset.reviewed==='1';
     const previousState=card.dataset.reviewState||'';
@@ -721,7 +866,8 @@ async function submitCard(btn,reloadAfterSave=true){{
         const onPage=group.querySelectorAll('.card').length;
         const pageContext=onPage!==totalInGroup?' · '+onPage+' on this page':'';
         progress.textContent=totalInGroup+'/'+totalInGroup+' analyzed · '+doneInGroup+'/'+totalInGroup+' reviewed'+pageContext;}}}}
-    if(reloadAfterSave)window.location.reload();
+    if(reloadAfterSave&&primaryAlexReady)goToFirstPage();
+    else if(reloadAfterSave)window.location.reload();
     return 'saved';
   }}catch(e){{status.textContent='✗ '+e.message+' (retry)';status.className='status err';btn.disabled=false;}}
 }}
@@ -752,7 +898,8 @@ async function submitAll(){{
   if(skipped)parts.push(skipped+' skipped - needs HVAC or Fit');
   if(failed)parts.push(failed+' need retry');
   setBulkStatus(parts.join(' Â· '),(skipped||failed)?'err':'ok');
-  if(saved)window.location.reload();
+  if(saved&&primaryAlexReady)goToFirstPage();
+  else if(saved)window.location.reload();
 }}
 </script></body></html>'''
 

@@ -750,15 +750,30 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
     if not mappings:
         raise ValueError("Workbook has no selected address tabs")
     bindings = sheets_writer.read_bound_sheet_mappings(run["sheet_url"], mappings)
-    from review_contract import DUAL_FIT_OPTIONS, DUAL_FIT_SCHEMA
+    from review_contract import (
+        DUAL_FIT_SCHEMA,
+        DUAL_FIT_SCHEMA_V1,
+        OPT_FIT_COL,
+        PERI_FIT_COL,
+        fit_options_for_schema,
+    )
     from review_render import HVAC_SYSTEMS, NONE_OPTION
+    existing_dual_columns = any(
+        {
+            re.sub(r"\s+", " ", str(header or "")).strip().casefold()
+            for header in binding.get("headers", [])
+        }.issuperset({OPT_FIT_COL.casefold(), PERI_FIT_COL.casefold()})
+        for binding in bindings
+    )
+    review_schema = DUAL_FIT_SCHEMA_V1 if existing_dual_columns else DUAL_FIT_SCHEMA
+    fit_options = fit_options_for_schema(review_schema)
     for binding in bindings:
         sheets_writer.ensure_review_columns(
             binding,
             binding.get("headers", []),
             HVAC_SYSTEMS + [NONE_OPTION],
-            DUAL_FIT_OPTIONS,
-            review_schema=DUAL_FIT_SCHEMA,
+            fit_options,
+            review_schema=review_schema,
         )
         # File uploads are converted into a disposable working Sheet. Start
         # each review blank even when its template contains stale selections;
@@ -766,7 +781,7 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
         # Live Google Sheet intake has no source_blob and stays untouched.
         if run.get("source_blob"):
             sheets_writer.clear_review_answers(
-                binding, review_schema=DUAL_FIT_SCHEMA,
+                binding, review_schema=review_schema,
             )
     tab_counts = collections.Counter()
     grouped: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
@@ -812,6 +827,7 @@ def _build_queue(run: dict[str, Any]) -> dict[str, Any]:
     for tab in run.get("tabs", []):
         tab["row_count"] = int(tab_counts.get(tab["tab"], 0))
     run["sheet_bindings"] = slim_bindings
+    run["review_schema"] = review_schema
     run["target_order"] = target_order
     run["row_count"] = len(target_order)
     run["analysis_count"] = len(items)

@@ -35,12 +35,16 @@ from review_render import (
 )
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_COL,
     SINGLE_FIT_SCHEMA,
+    alex_review_remaining,
+    batch_primary_review_complete,
     entry_is_reviewed,
     entry_needs_attention,
+    human_review_version,
+    accepted_fit_values_for_schema,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 import review_store
 import sheets_writer
@@ -71,6 +75,7 @@ app.config.update(
     SITE_ACCESS_ENABLED=_env_flag("SITE_ACCESS_ENABLED"),
     SITE_ACCESS_PASSWORD=os.getenv("SITE_ACCESS_PASSWORD", ""),
     SITE_ACCESS_SESSION_HOURS=max(1, int(os.getenv("SITE_ACCESS_SESSION_HOURS", "12"))),
+    ALEX_REVIEW_QUEUE_ENABLED=_env_flag("ALEX_REVIEW_QUEUE_ENABLED", False),
     SESSION_COOKIE_SECURE=_env_flag("SITE_COOKIE_SECURE"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -1071,6 +1076,7 @@ def review_page(job_id):
         page_size=page_size,
         page_url=request.path,
         source_context_refresh_url=source_context_refresh_url,
+        alex_review_enabled=app.config["ALEX_REVIEW_QUEUE_ENABLED"],
     )
     return Response(html, mimetype="text/html")
 
@@ -1103,6 +1109,257 @@ def refresh_review_source_context(job_id):
     })
 
 
+def _review_entry(batch, row_id):
+    matches = [
+        item for item in batch.get("entries", [])
+        if str(
+            item.get("row_id")
+            if item.get("row_id") is not None
+            else item.get("i", "")
+        ) == str(row_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _review_response_counts(batch, review_schema):
+    entries = batch.get("entries", [])
+    primary_complete = batch_primary_review_complete(entries, review_schema)
+    remaining = (
+        alex_review_remaining(entries, review_schema)
+        if app.config.get("ALEX_REVIEW_QUEUE_ENABLED")
+        else 0
+    )
+    return primary_complete, remaining
+
+
+def _update_review_run_progress(batch, review_schema):
+    run_id = batch.get("run_id")
+    if not run_id:
+        return
+    try:
+        entries = batch.get("entries", [])
+        reviewed = sum(
+            1 for entry in entries
+            if entry_is_reviewed(entry, review_schema)
+        )
+        writeback_failures = sum(
+            1 for entry in entries
+            if (entry.get("writeback") or {}).get("status") == "error"
+        )
+        unresolved_attention = sum(
+            1 for entry in entries
+            if entry_needs_attention(entry, review_schema)
+        )
+        workbook_runs.update_review_progress(
+            run_id,
+            reviewed,
+            len(entries),
+            writeback_failures=writeback_failures,
+            needs_attention=unresolved_attention,
+        )
+    except Exception as exc:
+        log.error("Workbook progress update failed for %s: %s", run_id, exc)
+
+
+def _write_secondary_review(batch, entry, row_id, decision):
+    """Write only the two product fits and Notes; never HVAC."""
+    sheet = "none"
+    sheet_error = ""
+    if batch.get("sheet_bindings"):
+        if not sheets_writer.enabled():
+            return "error", "Google Sheets write-back is not configured"
+        binding = next(
+            (
+                item for item in batch["sheet_bindings"]
+                if (
+                    str(item.get("grid_id"))
+                    == str(entry.get("source_grid_id"))
+                    and item.get("tab") == entry.get("source_tab")
+                )
+            ),
+            None,
+        )
+        if not binding:
+            return "row_not_found", "Source tab binding was not found"
+        try:
+            required = {
+                sheets_writer.OPT_FIT_COL,
+                sheets_writer.PERI_FIT_COL,
+                sheets_writer.NOTES_COL,
+            }
+            if not required.issubset(set((binding.get("colmap") or {}).keys())):
+                return "error", "Secondary review columns are not bound"
+            ok = sheets_writer.write_secondary_decision_source(
+                binding,
+                entry.get("source_row"),
+                optimizer_fit=decision["optimizer_fit"],
+                periscope_fit=decision["periscope_fit"],
+                note=decision["note"],
+            )
+            sheet = "updated" if ok else "row_not_found"
+            if not ok:
+                sheet_error = "Source row could not be updated"
+        except Exception as exc:
+            log.error(
+                "Secondary workbook write failed for %s/%s: %s",
+                batch.get("job_id"), row_id, exc, exc_info=True,
+            )
+            sheet = "error"
+            sheet_error = str(exc)
+    elif batch.get("sheet_binding"):
+        if not sheets_writer.enabled():
+            return "error", "Google Sheets write-back is not configured"
+        binding = batch["sheet_binding"]
+        try:
+            required = {
+                sheets_writer.OPT_FIT_COL,
+                sheets_writer.PERI_FIT_COL,
+                sheets_writer.NOTES_COL,
+            }
+            if not required.issubset(set((binding.get("colmap") or {}).keys())):
+                return "error", "Secondary review columns are not bound"
+            ok = sheets_writer.write_secondary_decision_bound(
+                binding,
+                row_id,
+                optimizer_fit=decision["optimizer_fit"],
+                periscope_fit=decision["periscope_fit"],
+                note=decision["note"],
+            )
+            sheet = "updated" if ok else "row_not_found"
+            if not ok:
+                sheet_error = "Bound source row could not be updated"
+        except Exception as exc:
+            log.error(
+                "Secondary bound Sheet write failed for %s/%s: %s",
+                batch.get("job_id"), row_id, exc, exc_info=True,
+            )
+            sheet = "error"
+            sheet_error = str(exc)
+    elif batch.get("sheet_url"):
+        if not sheets_writer.enabled():
+            return "error", "Google Sheets write-back is not configured"
+        try:
+            ok = sheets_writer.write_secondary_decision(
+                batch["sheet_url"],
+                batch.get("table_headers", []),
+                batch.get("table_rows", []),
+                row_id,
+                optimizer_fit=decision["optimizer_fit"],
+                periscope_fit=decision["periscope_fit"],
+                note=decision["note"],
+            )
+            sheet = "updated" if ok else "row_not_found"
+            if not ok:
+                sheet_error = "Sheet row could not be updated"
+        except Exception as exc:
+            log.error(
+                "Secondary Sheet write failed for %s/%s: %s",
+                batch.get("job_id"), row_id, exc, exc_info=True,
+            )
+            sheet = "error"
+            sheet_error = str(exc)
+    return sheet, sheet_error
+
+
+def _api_secondary_review(payload, existing_batch, review_schema, job_id, row_id):
+    if not app.config.get("ALEX_REVIEW_QUEUE_ENABLED"):
+        return jsonify({"error": "secondary review is not enabled"}), 409
+    if not _csrf_is_valid():
+        return jsonify({"error": "review session needs to be refreshed"}), 403
+    if not is_dual_fit_schema(review_schema):
+        return jsonify({"error": "secondary review requires a dual-fit batch"}), 409
+    if "hvac_systems" in payload or "fit" in payload:
+        return jsonify({"error": "HVAC and legacy Fit are locked in secondary review"}), 400
+    action = str(payload.get("secondary_action") or "")
+    if action not in {"revise", "confirm_uncertain"}:
+        return jsonify({"error": "invalid secondary review action"}), 400
+    expected = payload.get("expected_review_version")
+    if isinstance(expected, int) and not isinstance(expected, bool):
+        pass
+    elif isinstance(expected, str) and expected.strip().isdigit():
+        expected = int(expected.strip())
+    else:
+        return jsonify({"error": "expected_review_version is required"}), 400
+    if expected < 1:
+        return jsonify({"error": "expected_review_version is required"}), 400
+
+    if action == "confirm_uncertain":
+        forbidden = {"optimizer_fit", "periscope_fit", "note"}.intersection(payload)
+        if forbidden:
+            return jsonify({"error": "confirmation cannot include changed values"}), 400
+        decision = None
+    else:
+        allowed_fit_values = accepted_fit_values_for_schema(review_schema)
+        if payload.get("optimizer_fit") not in allowed_fit_values:
+            return jsonify({"error": "Optimizer Fit is required"}), 400
+        if payload.get("periscope_fit") not in allowed_fit_values:
+            return jsonify({"error": "Periscope Fit is required"}), 400
+        note_value = str(payload.get("note") or "")
+        if len(note_value) > 2000:
+            return jsonify({"error": "note is too long"}), 400
+        decision = {
+            "optimizer_fit": payload.get("optimizer_fit", ""),
+            "periscope_fit": payload.get("periscope_fit", ""),
+            "note": note_value,
+        }
+
+    has_sheet_target = bool(
+        existing_batch.get("sheet_bindings")
+        or existing_batch.get("sheet_binding")
+        or existing_batch.get("sheet_url")
+    )
+    try:
+        receipt = review_store.record_secondary_review(
+            job_id,
+            row_id,
+            action=action,
+            expected_review_version=expected,
+            decision=decision,
+            sheet_write_required=bool(action == "revise" and has_sheet_target),
+        )
+    except review_store.ReviewConflict as exc:
+        response = {"error": str(exc)}
+        if exc.current_review_version is not None:
+            response["current_review_version"] = exc.current_review_version
+        return jsonify(response), 409
+    if not receipt:
+        return jsonify({"error": "unknown batch/row"}), 404
+
+    batch = receipt["batch"]
+    sheet = "none"
+    sheet_error = ""
+    if action == "revise" and has_sheet_target:
+        entry = _review_entry(batch, row_id)
+        sheet, sheet_error = _write_secondary_review(
+            batch, entry, row_id, decision
+        )
+        batch = review_store.record_writeback(
+            job_id,
+            row_id,
+            "updated" if sheet == "updated" else "error",
+            sheet_error or sheet,
+        ) or batch
+        if batch.get("run_id"):
+            workbook_runs.record_metric(
+                "workbook_writebacks_updated"
+                if sheet == "updated"
+                else "workbook_writeback_failures"
+            )
+
+    _update_review_run_progress(batch, review_schema)
+    primary_complete, remaining = _review_response_counts(batch, review_schema)
+    entry = _review_entry(batch, row_id)
+    return jsonify({
+        "ok": True,
+        "local_saved": True,
+        "sheet": sheet,
+        "sheet_error": sheet_error,
+        "review_version": human_review_version(entry),
+        "primary_review_complete": primary_complete,
+        "alex_review_remaining": remaining,
+    })
+
+
 @app.route('/api/review', methods=['POST'])
 def api_review():
     """Receive one reviewer decision from the review page: stamp it into the local
@@ -1126,6 +1383,13 @@ def api_review():
     ):
         return jsonify({"error": "unknown batch/row"}), 404
     review_schema = existing_batch.get("review_schema", CURRENT_REVIEW_SCHEMA)
+    review_stage = str(payload.get("review_stage") or "primary")
+    if review_stage == "secondary":
+        return _api_secondary_review(
+            payload, existing_batch, review_schema, job_id, row_id
+        )
+    if review_stage != "primary":
+        return jsonify({"error": "invalid review stage"}), 400
     hvac_value = str(payload.get("hvac_systems") or "").strip()
     if not hvac_value:
         return jsonify({"error": "choose at least one HVAC system or None"}), 400
@@ -1136,10 +1400,11 @@ def api_review():
         or (NONE_OPTION in systems and len(systems) > 1)
     ):
         return jsonify({"error": "invalid HVAC selection"}), 400
-    if review_schema == DUAL_FIT_SCHEMA:
-        if payload.get("optimizer_fit") not in DUAL_FIT_OPTIONS:
+    if is_dual_fit_schema(review_schema):
+        allowed_fit_values = accepted_fit_values_for_schema(review_schema)
+        if payload.get("optimizer_fit") not in allowed_fit_values:
             return jsonify({"error": "Optimizer Fit is required"}), 400
-        if payload.get("periscope_fit") not in DUAL_FIT_OPTIONS:
+        if payload.get("periscope_fit") not in allowed_fit_values:
             return jsonify({"error": "Periscope Fit is required"}), 400
     elif payload.get("fit") not in FIT_OPTIONS:
         return jsonify({"error": "Fit is required"}), 400
@@ -1150,14 +1415,30 @@ def api_review():
         "hvac_systems": payload.get("hvac_systems", ""),
         "note": payload.get("note", ""),
     }
-    if review_schema == DUAL_FIT_SCHEMA:
+    if is_dual_fit_schema(review_schema):
         decision.update({
             "optimizer_fit": payload.get("optimizer_fit", ""),
             "periscope_fit": payload.get("periscope_fit", ""),
         })
     else:
         decision["fit"] = payload.get("fit", "")
-    batch = review_store.record_decision(job_id, row_id, decision)
+    versioned = bool(
+        app.config.get("ALEX_REVIEW_QUEUE_ENABLED")
+        and is_dual_fit_schema(review_schema)
+    )
+    try:
+        batch = review_store.record_decision(
+            job_id,
+            row_id,
+            decision,
+            versioned=versioned,
+            protect_completed=versioned,
+        )
+    except review_store.ReviewConflict as exc:
+        response = {"error": str(exc)}
+        if exc.current_review_version is not None:
+            response["current_review_version"] = exc.current_review_version
+        return jsonify(response), 409
     if not batch:
         return jsonify({"error": "unknown batch/row"}), 404
 
@@ -1210,7 +1491,7 @@ def api_review():
                     sheets_writer.ensure_review_columns(
                         binding, binding.get("headers", []),
                         HVAC_SYSTEMS + [NONE_OPTION],
-                        FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                        fit_options_for_schema(review_schema),
                         review_schema=review_schema,
                     )
                 ok = sheets_writer.write_decision_source(
@@ -1242,7 +1523,7 @@ def api_review():
                     and FIT_COL not in binding.get("colmap", {})
                 )
                 or (
-                    review_schema == DUAL_FIT_SCHEMA
+                    is_dual_fit_schema(review_schema)
                     and any(
                         column not in binding.get("colmap", {})
                         for column in (
@@ -1256,7 +1537,7 @@ def api_review():
                     binding,
                     binding.get("headers", []),
                     HVAC_SYSTEMS + [NONE_OPTION],
-                    FIT_OPTIONS if review_schema == SINGLE_FIT_SCHEMA else DUAL_FIT_OPTIONS,
+                    fit_options_for_schema(review_schema),
                     review_schema=review_schema,
                 )
             ok = sheets_writer.write_decision_bound(
@@ -1297,29 +1578,8 @@ def api_review():
                 if sheet == "updated" else "workbook_writeback_failures"
             )
 
-    run_id = batch.get("run_id")
-    if run_id:
-        try:
-            entries = batch.get("entries", [])
-            reviewed = sum(
-                1 for entry in entries
-                if entry_is_reviewed(entry, review_schema)
-            )
-            writeback_failures = sum(
-                1 for entry in entries
-                if (entry.get("writeback") or {}).get("status") == "error"
-            )
-            unresolved_attention = sum(
-                1 for entry in entries
-                if entry_needs_attention(entry, review_schema)
-            )
-            workbook_runs.update_review_progress(
-                run_id, reviewed, len(entries),
-                writeback_failures=writeback_failures,
-                needs_attention=unresolved_attention,
-            )
-        except Exception as e:
-            log.error("Workbook progress update failed for %s: %s", run_id, e)
+    _update_review_run_progress(batch, review_schema)
+    primary_complete, remaining = _review_response_counts(batch, review_schema)
     # The local decision is saved even when the live Sheet write fails. Keep
     # that distinction explicit so the review page cannot report a false
     # "saved" state to the operator.
@@ -1328,6 +1588,8 @@ def api_review():
         "local_saved": True,
         "sheet": sheet,
         "sheet_error": sheet_error,
+        "primary_review_complete": primary_complete,
+        "alex_review_remaining": remaining,
     })
 
 

@@ -26,13 +26,13 @@ import threading
 
 from review_contract import (
     CURRENT_REVIEW_SCHEMA,
-    DUAL_FIT_OPTIONS,
-    DUAL_FIT_SCHEMA,
     FIT_COL,
     FIT_OPTIONS,
     OPT_FIT_COL,
     PERI_FIT_COL,
     SINGLE_FIT_SCHEMA,
+    fit_options_for_schema,
+    is_dual_fit_schema,
 )
 
 log = logging.getLogger("sheets")
@@ -513,7 +513,7 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
         norm_to_idx.setdefault(_norm(h), i)
     fill_synonyms = (
         _DUAL_FILL_SYNONYMS
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else _SINGLE_FILL_SYNONYMS
     )
     colmap, missing = {}, []
@@ -570,8 +570,11 @@ def ensure_review_columns(binding, headers, hvac_options, fit_options,
     # as invalid in the Sheet. Existing customer HVAC dropdowns remain intact.
     reqs = []
     rules = (
-        [(OPT_FIT_COL, DUAL_FIT_OPTIONS), (PERI_FIT_COL, DUAL_FIT_OPTIONS)]
-        if review_schema == DUAL_FIT_SCHEMA
+        [
+            (OPT_FIT_COL, fit_options_for_schema(review_schema)),
+            (PERI_FIT_COL, fit_options_for_schema(review_schema)),
+        ]
+        if is_dual_fit_schema(review_schema)
         else [(FIT_COL, fit_options or FIT_OPTIONS)]
     )
     for canon, options in rules:
@@ -607,7 +610,7 @@ def clear_review_answers(binding, review_schema=CURRENT_REVIEW_SCHEMA) -> bool:
     colmap = binding.get("colmap") or {}
     review_columns = (
         [HVAC_COL, OPT_FIT_COL, PERI_FIT_COL]
-        if review_schema == DUAL_FIT_SCHEMA
+        if is_dual_fit_schema(review_schema)
         else [HVAC_COL, FIT_COL]
     )
     first_row, last_row = min(rows), max(rows)
@@ -691,6 +694,72 @@ def write_decision_source(binding, source_row, hvac, optimizer_fit="",
         body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
     return True
+
+
+def write_secondary_decision_source(
+    binding,
+    source_row,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write only Alex-editable values to one exact physical source row.
+
+    All three columns must already be bound so the operation cannot silently
+    become a partial revision. Notes are written even when empty, allowing an
+    authorized secondary review to clear the prior note. HVAC is never present
+    in this request.
+    """
+    try:
+        row = int(source_row)
+    except (TypeError, ValueError):
+        return False
+    if row < 2:
+        return False
+    colmap = binding.get("colmap") or {}
+    cells = {
+        OPT_FIT_COL: optimizer_fit,
+        PERI_FIT_COL: periscope_fit,
+        NOTES_COL: note,
+    }
+    if any(column not in colmap for column in cells):
+        return False
+    data = [
+        {
+            "range": _tab_range(
+                binding["tab"], f"{_col_letter(colmap[column])}{row}"
+            ),
+            "values": [[value]],
+        }
+        for column, value in cells.items()
+    ]
+    sheets, _ = _get_services()
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=binding["spreadsheet_id"],
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute()
+    return True
+
+
+def write_secondary_decision_bound(
+    binding,
+    row_id,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write Alex-editable values using a bound data-row identifier."""
+    try:
+        source_row = binding["row_numbers"][int(row_id) - 1]
+    except (IndexError, ValueError, TypeError):
+        return False
+    return write_secondary_decision_source(
+        binding,
+        source_row,
+        optimizer_fit=optimizer_fit,
+        periscope_fit=periscope_fit,
+        note=note,
+    )
 
 
 def write_source_values(binding, source_row, mapping) -> bool:
@@ -790,8 +859,8 @@ def create_batch_sheet(title, headers, rows, hvac_options, fit_options,
         [(FIT_COL, fit_options or FIT_OPTIONS)]
         if FIT_COL in headers
         else [
-            (OPT_FIT_COL, DUAL_FIT_OPTIONS),
-            (PERI_FIT_COL, DUAL_FIT_OPTIONS),
+            (OPT_FIT_COL, fit_options or fit_options_for_schema(CURRENT_REVIEW_SCHEMA)),
+            (PERI_FIT_COL, fit_options or fit_options_for_schema(CURRENT_REVIEW_SCHEMA)),
         ]
     )
     for col_name, options in [(HVAC_COL, hvac_options)] + fit_rules:
@@ -862,3 +931,29 @@ def write_decision(sheet_url, headers, rows, row_id, hvac,
     if note:
         mapping[NOTES_COL] = note
     return write_row_values(sheet_url, headers, rows, row_id, mapping)
+
+
+def write_secondary_decision(
+    sheet_url,
+    headers,
+    rows,
+    row_id,
+    optimizer_fit,
+    periscope_fit,
+    note,
+) -> bool:
+    """Write only Alex-editable values in a generated legacy batch Sheet."""
+    required = {OPT_FIT_COL, PERI_FIT_COL, NOTES_COL}
+    if not required.issubset(set(headers or [])):
+        return False
+    return write_row_values(
+        sheet_url,
+        headers,
+        rows,
+        row_id,
+        {
+            OPT_FIT_COL: optimizer_fit,
+            PERI_FIT_COL: periscope_fit,
+            NOTES_COL: note,
+        },
+    )
