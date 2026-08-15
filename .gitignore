@@ -18,7 +18,7 @@ service.yaml
 # Ignore trained model weights by default (large; experimental weights stay local)
 models/*.pt
 # ...but the two production ensemble weights (MODEL_PATHS) MUST ship in the image:
-# Railway builds from GitHub, so anything not committed is absent from the container.
+# Render builds from GitHub, so anything not committed is absent from the container.
 !models/rooftop_model.pt
 !models/rooftop_model_prev.pt
 
@@ -27,6 +27,8 @@ models/*.pt
 .env.local
 .env.*.local
 *.env
+google_service_account.json
+gen-lang-client-*.json
 
 # Test artifacts
 math_test*.jpg
@@ -38,6 +40,7 @@ geometry (1).py
 # Sensitive / local-only files (do not publish on public fork)
 Existing_Market_TAM.xlsx
 jobs.db
+jobs.db-*
 storage/
 temp_uploads/
 training_images/
@@ -54,6 +57,26 @@ scratch_*.md
 scratch_*.log
 scratch_*.json
 scratch_*.jsonl
+scratch_*.jpg
+scratch_*.jpeg
+scratch_*.png
 scratch_results.json
 scratch_*/
 smoke_*.py
+
+# Local cleanup/archive and generated demo outputs
+.local_archive/
+.tmp_render_push/
+demo_report*.html
+registry_options.html
+results.xlsx
+data/
+
+# Market runway dashboard build and local state
+market_dashboard/frontend/node_modules/
+market_dashboard/frontend/dist/
+market_dashboard/local_storage/
+
+# n8n one-off/simple workflow drafts
+n8n/*simple*.workflow.json
+n8n/SIMPLE_SETUP.md

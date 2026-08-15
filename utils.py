@@ -5,7 +5,7 @@ import re
 import logging
 import threading
 import math
-from typing import Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from PIL import Image, ImageDraw
@@ -515,6 +515,115 @@ def get_satellite_image_google(lat: float, lon: float, out_path: str, zoom: int 
         return False
 
 
+def _streetview_location_string(location: Any) -> str:
+    if isinstance(location, (tuple, list)) and len(location) >= 2:
+        try:
+            return f"{float(location[0]):.7f},{float(location[1]):.7f}"
+        except (TypeError, ValueError):
+            return ""
+    return str(location or "").strip()[:500]
+
+
+def get_streetview_metadata_google(location: Any) -> Optional[Dict[str, Any]]:
+    """Return a bounded, non-secret panorama receipt for one target location."""
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot use Street View")
+        return None
+    query = _streetview_location_string(location)
+    if not query:
+        return None
+    try:
+        meta = requests.get(
+            "https://maps.googleapis.com/maps/api/streetview/metadata",
+            params={"location": query, "source": "outdoor",
+                    "key": GOOGLE_MAPS_API_KEY},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+        if meta.get("status") != "OK":
+            log.info(
+                "No outdoor Street View coverage for requested review context: status=%s",
+                meta.get("status"),
+            )
+            return None
+        location_meta = meta.get("location") or {}
+        receipt = {
+            "status": "OK",
+            "pano_id": str(meta.get("pano_id") or ""),
+            "location": {},
+        }
+        try:
+            receipt["location"] = {
+                "lat": float(location_meta.get("lat")),
+                "lng": float(location_meta.get("lng")),
+            }
+        except (TypeError, ValueError):
+            receipt["location"] = {}
+        if meta.get("date"):
+            receipt["date"] = str(meta["date"])[:16]
+        return receipt
+    except Exception as e:
+        log.error("Street View metadata fetch failed: %s", e)
+        return None
+
+
+def get_streetview_image_google(
+    lat: float,
+    lon: float,
+    out_path: str,
+    fov: int = 90,
+    pitch: int = 5,
+    *,
+    location: Any = None,
+    heading: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Download one reviewer-only Street View image and return its metadata.
+
+    ``location`` may be the full source address. Google can choose a camera that
+    better displays an address than a request aimed only at a roof centroid.
+    Supplying metadata pins the image to the panorama already selected by the
+    free metadata request. Existing truthiness-only callers remain compatible.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        log.error("GOOGLE_MAPS_API_KEY not set; cannot use Street View")
+        return None
+    query = _streetview_location_string(
+        location if location is not None else (lat, lon)
+    )
+    meta = metadata or get_streetview_metadata_google(query)
+    if not meta:
+        return None
+    try:
+        url = "https://maps.googleapis.com/maps/api/streetview"
+        params = {
+            "size": "640x640",
+            "fov": min(max(int(fov), 10), 120),
+            "pitch": min(max(int(pitch), -90), 90),
+            "source": "outdoor",
+            "return_error_code": "true",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        if meta.get("pano_id"):
+            params["pano"] = meta["pano_id"]
+        else:
+            params["location"] = query
+        if heading is not None:
+            params["heading"] = round(float(heading) % 360.0, 2)
+        with requests.get(url, params=params, timeout=HTTP_TIMEOUT, stream=True) as r:
+            if r.status_code != 200:
+                log.warning("Street View Static error %s: %s", r.status_code, r.text[:200])
+                return None
+            parent = os.path.dirname(out_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            img.save(out_path, format="JPEG", quality=92)
+        return meta
+    except Exception as e:
+        log.error("Street View fetch failed: %s", e)
+        return None
+
+
 def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None,
                         provider: str = None) -> bool:
     """Dispatch to the imagery provider. An explicit `provider` (per-address override,
@@ -533,7 +642,7 @@ def get_satellite_image(lat: float, lon: float, out_path: str, zoom: int = None,
 def _get_model():
     """
     Load the YOLO model once, on first call.
-    Using lru_cache avoids import-time model load (which caused Cloud Run OOM).
+    Using lru_cache avoids an import-time model load (a past OOM cause on memory-constrained hosts).
     """
     from ultralytics import YOLO  # import here to avoid heavy import at module load
     if not os.path.exists(MODEL_PATH):

@@ -1,5 +1,11 @@
-# Optimized Dockerfile for Railway deployment
-# Reduces build time from 16 minutes to ~6-8 minutes
+# Build the market dashboard into static, same-origin assets.
+FROM node:24-alpine AS market-dashboard-builder
+
+WORKDIR /app/market_dashboard/frontend
+COPY market_dashboard/frontend/package.json market_dashboard/frontend/package-lock.json ./
+RUN npm ci
+COPY market_dashboard/frontend/ ./
+RUN npm run build
 
 FROM python:3.11-slim
 
@@ -25,24 +31,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app_railway.py app.py
-COPY job_queue.py .
-COPY storage_helpers.py .
-COPY worker.py .
-COPY tasks_local.py .
-COPY utils.py .
-COPY geometry.py .
-COPY vlm.py .
-COPY pipeline_render.py .
-COPY nyc_opendata.py .
-COPY ms_footprints.py .
-COPY html_report.py .
-COPY report_audit.py .
-COPY api_analyze.py .
-COPY zip_bundler.py .
+# Copy ALL Python modules — avoids the recurring "forgot a COPY line" boot crash.
+# (app_railway.py is also copied to app.py above for the gunicorn entrypoint.)
+COPY *.py .
 COPY models/ models/
 COPY reference_images/ reference_images/
 COPY static/ static/
 COPY templates/ templates/
+COPY market_dashboard/ market_dashboard/
+COPY --from=market-dashboard-builder /app/market_dashboard/dist/ market_dashboard/dist/
 
 # Create storage directory
 RUN mkdir -p storage

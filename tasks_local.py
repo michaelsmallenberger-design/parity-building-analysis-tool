@@ -17,7 +17,8 @@ from shapely.ops import transform
 
 from utils import (
     geocode_address_mapbox, geocode_with_confidence,
-    get_satellite_image, validate_address_google,
+    get_satellite_image, get_streetview_image_google,
+    get_streetview_metadata_google, validate_address_google,
     is_fully_qualified_address,
     YOLO_CONF, _get_models, ct_class_indices, MAPBOX_ZOOM, MAPBOX_ZOOM_WIDE,
 )
@@ -29,7 +30,6 @@ from geometry import (
 from nyc_opendata import lookup_nyc_registry, _in_nyc
 from vlm import verify_detection, verify_rooftop, verify_address
 from pipeline_render import render_annotated_image, render_marked_tile
-from html_report import generate_html_report
 
 log = logging.getLogger("tasks")
 
@@ -72,6 +72,20 @@ CLOSEUP_ZOOM = int(os.getenv("CLOSEUP_ZOOM", "20"))
 # adopt it if it lands inside a building.
 GEOCODER_FALLBACK_ENABLED = os.environ.get("GEOCODER_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# Reviewer-only exterior context. This never affects the machine verdict.
+# The hard bound is two Street View images per eligible address: one selected
+# using the full source address and one alternate/context angle.
+STREETVIEW_SECONDARY_ENABLED = os.environ.get(
+    "STREETVIEW_SECONDARY_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+STREETVIEW_PRIMARY_FOV = int(os.getenv("STREETVIEW_PRIMARY_FOV", "90"))
+STREETVIEW_PRIMARY_PITCH = int(os.getenv("STREETVIEW_PRIMARY_PITCH", "5"))
+STREETVIEW_CONTEXT_FOV = int(os.getenv("STREETVIEW_CONTEXT_FOV", "105"))
+STREETVIEW_CONTEXT_PITCH = int(os.getenv("STREETVIEW_CONTEXT_PITCH", "5"))
+STREETVIEW_ALTERNATE_HEADING_OFFSET = float(
+    os.getenv("STREETVIEW_ALTERNATE_HEADING_OFFSET", "55")
+)
+
 # YOLO ensemble models are @lru_cache-shared singletons; ultralytics .predict()
 # is not thread-safe. Serialize inference so concurrent addresses can't corrupt
 # each other's detections. YOLO is CPU-bound (effectively serial anyway); the
@@ -82,8 +96,9 @@ _yolo_lock = threading.Lock()
 # is overlapping the dual-VLM wait (YOLO and Overpass are lock-serialized). The
 # web worker uses this default; the audit harness overrides per-run to diff 1 vs 5.
 DEFAULT_VLM_ADDRESS_CONCURRENCY = 5
-# Transient failures (throttled Overpass, transient VLM verdict) are re-queued and
-# retried this many extra rounds before being emitted as unverified.
+# Address-level infrastructure failures (for example throttled footprint lookup)
+# are re-queued this many extra rounds. VLM provider retries are bounded inside
+# vlm.py; a provider-exhausted result is never sent through another full pass.
 MAX_RETRY_ROUNDS = int(os.environ.get("VLM_RETRY_ROUNDS", "2"))
 RETRY_BACKOFF_SECONDS = float(os.environ.get("VLM_RETRY_BACKOFF", "5"))
 # Markers vlm.py stamps into reasoning on transient failures (timeout / server
@@ -91,7 +106,7 @@ RETRY_BACKOFF_SECONDS = float(os.environ.get("VLM_RETRY_BACKOFF", "5"))
 # low-confidence/disagreement/construction needs_review has none of these.
 _VLM_TRANSIENT_MARKERS = (
     "network timeout", "network connection error",
-    "server error (http", "throttled", "after 4 attempts",
+    "server error (http", "throttled", "after 3 attempts",
 )
 
 
@@ -320,6 +335,121 @@ def _footprint_area_m2(footprint: Dict[str, Any]) -> float:
     return projected.area
 
 
+def _bearing_degrees(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial compass bearing from one WGS84 point to another."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_lon = math.radians(lon2 - lon1)
+    y = math.sin(delta_lon) * math.cos(phi2)
+    x = (
+        math.cos(phi1) * math.sin(phi2)
+        - math.sin(phi1) * math.cos(phi2) * math.cos(delta_lon)
+    )
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _panorama_heading(
+    metadata: Optional[Dict[str, Any]],
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+) -> Optional[float]:
+    """Aim a selected panorama at the target building when coordinates exist."""
+    location = (metadata or {}).get("location") or {}
+    if target_lat is None or target_lon is None:
+        return None
+    try:
+        return _bearing_degrees(
+            float(location["lat"]),
+            float(location["lng"]),
+            float(target_lat),
+            float(target_lon),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _capture_review_streetviews(
+    full_address: str,
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+    job_id: str,
+    row_index: int,
+    clean_addr: str,
+    upload_file: Callable[[str, str], None],
+    make_signed_url: Callable[[str], str],
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Capture at most two reviewer-only exterior images.
+
+    The first panorama search uses the full source address, which lets Google
+    prefer a camera that displays the address. The second search uses the
+    selected building point. When both searches choose the same panorama, the
+    second image rotates by a bounded offset instead of duplicating the first.
+    """
+    primary_path = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{row_index}_{clean_addr}_streetview_address.jpg",
+    )
+    paths = [primary_path]
+    primary_url = None
+    context_url = None
+    primary_meta = get_streetview_metadata_google(full_address)
+    primary_heading = _panorama_heading(
+        primary_meta, target_lat, target_lon
+    )
+    if primary_meta and get_streetview_image_google(
+        target_lat or 0.0,
+        target_lon or 0.0,
+        primary_path,
+        location=full_address,
+        fov=STREETVIEW_PRIMARY_FOV,
+        pitch=STREETVIEW_PRIMARY_PITCH,
+        heading=primary_heading,
+        metadata=primary_meta,
+    ):
+        primary_blob = f"results/{job_id}/{os.path.basename(primary_path)}"
+        upload_file(primary_path, primary_blob)
+        primary_url = make_signed_url(primary_blob)
+
+    if (
+        not STREETVIEW_SECONDARY_ENABLED
+        or target_lat is None
+        or target_lon is None
+    ):
+        return primary_url, context_url, paths
+
+    context_path = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{row_index}_{clean_addr}_streetview_context.jpg",
+    )
+    paths.append(context_path)
+    coordinate_query = f"{float(target_lat):.7f},{float(target_lon):.7f}"
+    context_meta = get_streetview_metadata_google(coordinate_query)
+    heading = _panorama_heading(context_meta, target_lat, target_lon)
+    if (
+        primary_meta
+        and context_meta
+        and primary_meta.get("pano_id")
+        and primary_meta.get("pano_id") == context_meta.get("pano_id")
+    ):
+        if heading is not None:
+            heading = (
+                heading + STREETVIEW_ALTERNATE_HEADING_OFFSET
+            ) % 360.0
+    if context_meta and get_streetview_image_google(
+        target_lat,
+        target_lon,
+        context_path,
+        location=coordinate_query,
+        fov=STREETVIEW_CONTEXT_FOV,
+        pitch=STREETVIEW_CONTEXT_PITCH,
+        heading=heading,
+        metadata=context_meta,
+    ):
+        context_blob = f"results/{job_id}/{os.path.basename(context_path)}"
+        upload_file(context_path, context_blob)
+        context_url = make_signed_url(context_blob)
+    return primary_url, context_url, paths
+
+
 def _build_web_entry(
     full_address: str,
     verdict: str,
@@ -331,11 +461,14 @@ def _build_web_entry(
     result_url: Optional[str],
     error: Optional[str] = None,
     result_url_wide: Optional[str] = None,
+    result_url_streetview: Optional[str] = None,
+    result_url_streetview_context: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a web_results entry. Keeps backward-compatible keys for html_report.py
+    """Build a web_results entry. Keeps the shared keys the report/CSV renderers expect
     (address, confidence_score, result_image_url, original_image_url, error) plus
     the new pipeline fields surfaced for downstream consumers. result_url_wide is
-    the annotated wide-context tile (None for non-VLM rows).
+    the annotated wide-context tile (None for non-VLM rows). result_url_streetview
+    is a ground-level Google Street View photo (None when there's no coverage).
     """
     if consensus_dict is not None:
         confidence_score = consensus_dict.get('confidence')
@@ -350,6 +483,10 @@ def _build_web_entry(
         is_house = bool(consensus_dict.get('is_house'))
         gemini_is_house = gemini.get('is_house')
         grok_is_house = grok.get('is_house')
+        gemini_reasoning = gemini.get('reasoning', '')
+        grok_reasoning = grok.get('reasoning', '')
+        model_path = consensus_dict.get('model_path', '')
+        grok_fallback_used = bool(consensus_dict.get('grok_fallback_used', False))
     else:
         confidence_score = None
         reasoning = ''
@@ -361,12 +498,18 @@ def _build_web_entry(
         is_house = None
         gemini_is_house = None
         grok_is_house = None
+        gemini_reasoning = ''
+        grok_reasoning = ''
+        model_path = ''
+        grok_fallback_used = False
 
     entry = {
         "address": full_address,
         "confidence_score": confidence_score,
         "result_image_url": result_url,
         "result_image_url_wide": result_url_wide,
+        "result_image_url_streetview": result_url_streetview,
+        "result_image_url_streetview_context": result_url_streetview_context,
         "original_image_url": original_url,
         "verdict": verdict,
         "detection_count": detection_count,
@@ -375,8 +518,12 @@ def _build_web_entry(
         "agreement": agreement,
         "gemini_verdict": gemini_verdict,
         "gemini_confidence": gemini_confidence,
+        "gemini_reasoning": gemini_reasoning,
         "grok_verdict": grok_verdict,
         "grok_confidence": grok_confidence,
+        "grok_reasoning": grok_reasoning,
+        "model_path": model_path,
+        "grok_fallback_used": grok_fallback_used,
         "is_house": is_house,
         "gemini_is_house": gemini_is_house,
         "grok_is_house": grok_is_house,
@@ -528,10 +675,10 @@ def _process_one_address_core(
     full_address = _compose_address(row, columns)
 
     # Geocode (+ free geocoder-agreement confidence flag, stashed into `geo`)
-    log.info(f"Row {i+1}/{total}: Geocoding '{full_address}'")
+    log.info(f"Row {i+1}/{total}: Geocoding source address")
     geo_lat, geo_lon, geo["confidence"], geo["divergence_m"] = geocode_with_confidence(full_address)
     if geo_lat is None:
-        log.warning(f"Row {i+1}/{total}: Geocoding failed for '{full_address}'")
+        log.warning(f"Row {i+1}/{total}: Geocoding failed")
         notes = _build_notes({'geocode_failed': True})
         return (
             _build_web_entry(
@@ -663,6 +810,21 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            geo_lat,
+            geo_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
+        )
+
         notes = _build_notes({'verdict': 'footprint_missing', 'geocoder_retried': geocoder_retried})
         if addr_val_note:
             notes = f"{addr_val_note} {notes}".strip()
@@ -675,6 +837,8 @@ def _process_one_address_core(
             notes=notes,
             original_url=original_url,
             result_url=result_url,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
         )
         csv_row = _build_csv_row(
             full_address=full_address,
@@ -687,7 +851,7 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local):
+        for p in (original_local, annotated_local, *streetview_paths):
             try:
                 if os.path.exists(p):
                     os.remove(p)
@@ -716,36 +880,112 @@ def _process_one_address_core(
         })
         if addr_val_note:
             notes = f"{addr_val_note} {notes}".strip()
-        return (
-            _build_web_entry(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
-            _build_csv_row(
-                full_address=full_address, verdict='ambiguous_footprint',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            geo_lat,
+            geo_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
         )
+        web_entry = _build_web_entry(
+            full_address=full_address, verdict='ambiguous_footprint',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=None, result_url=None,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address, verdict='ambiguous_footprint',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=None, result_url=None,
+        )
+        for path in streetview_paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {path}: {e}")
+        return web_entry, csv_row
 
     footprint_area = _footprint_area_m2(footprint) if AREA_GATE_ENABLED else 0.0
     if AREA_GATE_ENABLED and footprint_area < MIN_COMMERCIAL_FOOTPRINT_SQM:
         log.info(f"Row {i+1}/{total}: Footprint {footprint_area:.0f} sq m < "
                  f"{MIN_COMMERCIAL_FOOTPRINT_SQM} sq m floor; gating as likely_residential")
         notes = _build_notes({'verdict': 'likely_residential'})
-        return (
-            _build_web_entry(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
-            _build_csv_row(
-                full_address=full_address, verdict='likely_residential',
-                consensus_dict=None, detection_count=0, construction=False,
-                notes=notes, original_url=None, result_url=None,
-            ),
+        # Still fetch + render detail + wide tiles so a human can eyeball the gate
+        # decision — a small/wrong footprint on a real commercial building (e.g. a
+        # supertall geocoded to a tiny polygon) is caught by looking at the imagery
+        # (requirement: every report carries imagery incl. the wide view).
+        gate_provider = "mapbox" if (_in_nyc(centroid_lat, centroid_lon)
+                                     or _in_dense_core(centroid_lat, centroid_lon)) else None
+        original_url = result_url = result_url_wide = None
+        if get_satellite_image(centroid_lat, centroid_lon, original_local, provider=gate_provider):
+            original_blob = f"uploads/{job_id}/{os.path.basename(original_local)}"
+            upload_file(original_local, original_blob)
+            original_url = make_signed_url(original_blob)
+            render_annotated_image(
+                raw_image_path=original_local, output_path=annotated_local,
+                footprint=footprint, centroid_lat=centroid_lat, centroid_lon=centroid_lon,
+                enriched_detections=[], winner=None)
+            result_blob = f"results/{job_id}/{os.path.basename(annotated_local)}"
+            upload_file(annotated_local, result_blob)
+            result_url = make_signed_url(result_blob)
+        gate_wide = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_wide.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, gate_wide, zoom=MAPBOX_ZOOM_WIDE, provider=gate_provider):
+            render_annotated_image(
+                raw_image_path=gate_wide, output_path=annotated_wide_local,
+                footprint=footprint, centroid_lat=centroid_lat, centroid_lon=centroid_lon,
+                enriched_detections=[], winner=None, zoom=MAPBOX_ZOOM_WIDE)
+            wide_blob = f"results/{job_id}/{os.path.basename(annotated_wide_local)}"
+            upload_file(annotated_wide_local, wide_blob)
+            result_url_wide = make_signed_url(wide_blob)
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            centroid_lat,
+            centroid_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
         )
+        web_entry = _build_web_entry(
+            full_address=full_address, verdict='likely_residential',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=original_url, result_url=result_url,
+            result_url_wide=result_url_wide,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
+        )
+        csv_row = _build_csv_row(
+            full_address=full_address, verdict='likely_residential',
+            consensus_dict=None, detection_count=0, construction=False,
+            notes=notes, original_url=original_url, result_url=result_url,
+        )
+        for path in (
+            original_local,
+            annotated_local,
+            gate_wide,
+            annotated_wide_local,
+            *streetview_paths,
+        ):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                log.warning(f"Could not clean up temp file {path}: {e}")
+        return web_entry, csv_row
 
     # Per-address routing off the dense-urban gate (NYC cores + curated downtowns):
     #  - imagery: dense → Mapbox (true nadir; Google's 3D photogrammetry distorts dense
@@ -812,6 +1052,41 @@ def _process_one_address_core(
         upload_file(annotated_local, result_blob)
         result_url = make_signed_url(result_blob)
 
+        (
+            result_url_streetview,
+            result_url_streetview_context,
+            streetview_paths,
+        ) = _capture_review_streetviews(
+            full_address,
+            centroid_lat,
+            centroid_lon,
+            job_id,
+            i,
+            clean_addr,
+            upload_file,
+            make_signed_url,
+        )
+
+        # Wide/aerial context tile so registry-confirmed rows also carry the wide view
+        # for human review (requirement: every report has one, no matter the path).
+        result_url_wide = None
+        wide_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_wide.jpg")
+        annotated_wide_local = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_annotated_wide.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+            render_annotated_image(
+                raw_image_path=wide_local,
+                output_path=annotated_wide_local,
+                footprint=footprint,
+                centroid_lat=centroid_lat,
+                centroid_lon=centroid_lon,
+                enriched_detections=[],
+                winner=None,
+                zoom=MAPBOX_ZOOM_WIDE,
+            )
+            wide_blob = f"results/{job_id}/{os.path.basename(annotated_wide_local)}"
+            upload_file(annotated_wide_local, wide_blob)
+            result_url_wide = make_signed_url(wide_blob)
+
         notes = _build_notes({
             'verdict': 'registry_confirmed',
             'registry_citation': registry['citation'],
@@ -825,6 +1100,9 @@ def _process_one_address_core(
             notes=notes,
             original_url=original_url,
             result_url=result_url,
+            result_url_streetview=result_url_streetview,
+            result_url_streetview_context=result_url_streetview_context,
+            result_url_wide=result_url_wide,
         )
         csv_row = _build_csv_row(
             full_address=full_address,
@@ -837,39 +1115,45 @@ def _process_one_address_core(
             result_url=result_url,
         )
 
-        for p in (original_local, annotated_local):
+        for p in (
+            original_local,
+            annotated_local,
+            wide_local,
+            annotated_wide_local,
+            *streetview_paths,
+        ):
             try:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     os.remove(p)
             except Exception as e:
                 log.warning(f"Could not clean up temp file {p}: {e}")
 
         return web_entry, csv_row
 
-    # Dense-urban roof-only scan (gate computed above with the imagery provider): in dense
-    # cores cooling towers are roof-only and off-building detections are neighbor false
-    # positives — suppress the wide (ground) tile and the outside-footprint passthrough.
-    if dense:
-        log.info(f"Row {i+1}/{total}: dense urban core — roof-only scan (no wide tile, drop off-building detections)")
+    # Always fetch the wide/context tile so EVERY report carries an aerial view for human
+    # review (requirement: wide view in every report, no matter what). The dense-core gate
+    # governs DETECTION/VLM, not display: in dense cores cooling towers are roof-only and
+    # off-building detections are neighbor false positives, so below we skip YOLO on the
+    # wide tile and don't feed it to the VLM — it is display-only there. Outside dense cores
+    # the wide tile also drives ground-mounted-CT detection and VLM context.
+    wide_local = os.path.join(
+        tempfile.gettempdir(),
+        f"{job_id}_{i}_{clean_addr}_wide.jpg",
+    )
+    log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image"
+             + (" (dense: display-only)" if dense else ""))
+    if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+        log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
         wide_local = None
-    else:
-        # Fetch the wider tile (ground-mounted CTs / parcel context).
-        wide_local = os.path.join(
-            tempfile.gettempdir(),
-            f"{job_id}_{i}_{clean_addr}_wide.jpg",
-        )
-        log.info(f"Row {i+1}/{total}: Downloading wide (z{MAPBOX_ZOOM_WIDE}) satellite image")
-        if not get_satellite_image(centroid_lat, centroid_lon, wide_local, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
-            log.warning(f"Row {i+1}/{total}: Wide tile fetch failed; proceeding with detail tile only")
-            wide_local = None
 
     log.info(f"Row {i+1}/{total}: Running YOLO ensemble at conf={YOLO_CONF}"
              + (" (dense: roof-only)" if dense else " on both zooms"))
     detail_kept = _detect_on_tile(
         original_local, MAPBOX_ZOOM, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
+    # Detect on the wide tile only outside dense cores (in dense it is display-only).
     wide_kept = (
         _detect_on_tile(wide_local, MAPBOX_ZOOM_WIDE, footprint, centroid_lat, centroid_lon, keep_outside=keep_outside)
-        if wide_local else []
+        if (wide_local and not dense) else []
     )
     merged = geo_dedupe_detections(detail_kept + wide_kept, dist_threshold_m=10.0)
     log.info(
@@ -900,8 +1184,10 @@ def _process_one_address_core(
         tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked.jpg")
     render_marked_tile(original_local, marked_detail, footprint,
                        centroid_lat, centroid_lon, detail_dets, zoom=MAPBOX_ZOOM)
+    # The VLM gets the wide tile as context only outside dense cores (preserve dense
+    # roof-only verify behavior); the wide tile still renders into the report below.
     marked_wide = None
-    if wide_local:
+    if wide_local and not dense:
         marked_wide = os.path.join(
             tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_marked_wide.jpg")
         render_marked_tile(wide_local, marked_wide, footprint,
@@ -964,8 +1250,40 @@ def _process_one_address_core(
                 detection_count = len(retry_dets)
                 rooftop_path = (detection_count == 0)
                 enriched = [{**d, 'vlm_result': consensus_dict} for d in retry_dets]
-                render_src, render_wide = retry_detail, None
+                render_src, render_wide = retry_detail, wide_local  # keep wide tile for the report
                 imagery_retried = True
+
+    # Frame-inadequate zoom-out retry (Gemini-only signal): if Gemini judged the detail
+    # frame too tight to rule out a GROUND-MOUNTED cooling tower sitting just outside it,
+    # and we didn't already do the provider-swap retry, re-pull a WIDER tile so the adjacent
+    # ground / pads / yards are in frame and re-run once. Skipped on a positive verdict — we
+    # already have what we need. Adopt the wider-view verdict (resolves, or lands needs_review).
+    wide_retry = wr_marked = None
+    frame_retried = False
+    if (IMAGERY_RETRY_ENABLED and not imagery_retried
+            and consensus_dict.get('frame_inadequate')
+            and consensus_dict.get('verdict') not in _POSITIVE_VERDICTS):
+        log.info(f"Row {i+1}/{total}: Gemini flagged frame too tight for a ground-CT call; "
+                 f"retrying at wider zoom {MAPBOX_ZOOM_WIDE}")
+        wide_retry = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_widefit.jpg")
+        if get_satellite_image(centroid_lat, centroid_lon, wide_retry, zoom=MAPBOX_ZOOM_WIDE, provider=img_provider):
+            wr_dets = _detect_on_tile(wide_retry, MAPBOX_ZOOM_WIDE, footprint,
+                                      centroid_lat, centroid_lon, keep_outside=keep_outside)
+            wr_marked = os.path.join(tempfile.gettempdir(), f"{job_id}_{i}_{clean_addr}_widefit_marked.jpg")
+            render_marked_tile(wide_retry, wr_marked, footprint,
+                               centroid_lat, centroid_lon, wr_dets, zoom=MAPBOX_ZOOM_WIDE)
+            # Hand the original tight z19 tile back in as cross-zoom context for fine detail.
+            wr_ctx = {**base_ctx, "tile_zoom": MAPBOX_ZOOM_WIDE, "context_zoom": MAPBOX_ZOOM}
+            wr_result = verify_address(
+                wr_marked, wr_ctx, n_boxes=len(wr_dets),
+                context_image_path=original_local, closeup_image_path=None)
+            log.info(f"Row {i+1}/{total}: wider-view retry verdict={wr_result.get('verdict')}")
+            consensus_dict = wr_result
+            detection_count = len(wr_dets)
+            rooftop_path = (detection_count == 0)
+            enriched = [{**d, 'vlm_result': consensus_dict} for d in wr_dets]
+            render_src, render_wide = wide_retry, wide_local  # keep wide tile for the report
+            frame_retried = True
 
     # Render BOTH tiles so manual review always has a clear close-up plus context.
     def _render_tile(tile_path, tile_zoom, out_path):
@@ -989,6 +1307,23 @@ def _process_one_address_core(
 
     result_url = _render_tile(render_src, MAPBOX_ZOOM, annotated_local)
     result_url_wide = _render_tile(render_wide, MAPBOX_ZOOM_WIDE, annotated_wide_local)
+
+    # Reviewer-only exterior context is separate from detection/verification;
+    # absence or failure never changes the machine verdict.
+    (
+        result_url_streetview,
+        result_url_streetview_context,
+        streetview_paths,
+    ) = _capture_review_streetviews(
+        full_address,
+        centroid_lat,
+        centroid_lon,
+        job_id,
+        i,
+        clean_addr,
+        upload_file,
+        make_signed_url,
+    )
 
     # Construction → needs_review: active construction means the Mapbox tile may
     # predate the current building state, so the cooling-tower call isn't reliable.
@@ -1021,6 +1356,11 @@ def _process_one_address_core(
         _prim = "Mapbox" if dense else "Google"
         notes = (f"[IMAGERY RETRY: VLM flagged the {_prim} tile unusable (e.g. tall building "
                  f"shown at an oblique angle); re-analyzed on {alt_provider.capitalize()} imagery] {notes}").strip()
+    if frame_retried:
+        # Tell the reviewer why the analysis looks at a wider tile than usual.
+        notes = (f"[WIDER-VIEW RETRY: the close-up was too zoomed in to rule out a ground-mounted "
+                 f"cooling tower next to the building, so it was re-checked on a wider view that "
+                 f"includes the surrounding ground] {notes}").strip()
     if addr_val_note:
         notes = f"{addr_val_note} {notes}".strip()
 
@@ -1034,6 +1374,8 @@ def _process_one_address_core(
         original_url=original_url,
         result_url=result_url,
         result_url_wide=result_url_wide,
+        result_url_streetview=result_url_streetview,
+        result_url_streetview_context=result_url_streetview_context,
     )
     csv_row = _build_csv_row(
         full_address=full_address,
@@ -1048,7 +1390,8 @@ def _process_one_address_core(
 
     for p in (original_local, wide_local, annotated_local, annotated_wide_local,
               marked_detail, marked_wide, retry_detail, retry_marked,
-              closeup_local, retry_closeup):
+              closeup_local, retry_closeup, wide_retry, wr_marked,
+              *streetview_paths):
         try:
             if p and os.path.exists(p):
                 os.remove(p)
@@ -1056,6 +1399,38 @@ def _process_one_address_core(
             log.warning(f"Could not clean up temp file {p}: {e}")
 
     return web_entry, csv_row
+
+
+ADDRESS_VARIANTS = [
+    'Address', 'address', 'ADDRESS',
+    'Property Address', 'property address', 'PROPERTY ADDRESS',
+    'PropertyAddress', 'propertyaddress', 'PROPERTYADDRESS',
+    'Street Address', 'street address', 'STREET ADDRESS',
+    'StreetAddress', 'streetaddress', 'STREETADDRESS',
+    'Building Address', 'building address', 'BUILDING ADDRESS',
+    'BuildingAddress', 'buildingaddress', 'BUILDINGADDRESS',
+    'Property_Address', 'property_address', 'PROPERTY_ADDRESS',
+    'Street_Address', 'street_address', 'STREET_ADDRESS',
+    'Building_Address', 'building_address', 'BUILDING_ADDRESS'
+]
+
+
+def _pick_excel_tab(all_sheets):
+    """Choose the worksheet to analyze from a multi-tab workbook. Real sales
+    workbooks lead with Read Me / notes tabs (e.g. the Washington Gas campaign
+    file: Read Me, then four different tabs holding addresses), so take the
+    LEFTMOST non-empty tab with a recognizable address column; fall back to the
+    first non-empty tab. Returns (tab_name, df) or (None, None)."""
+    variants = {v.lower() for v in ADDRESS_VARIANTS}
+    fallback = (None, None)
+    for name, d in all_sheets.items():
+        if d is None or not len(d.columns) or not len(d):
+            continue
+        if fallback == (None, None):
+            fallback = (name, d)
+        if {str(c).strip().lower() for c in d.columns} & variants:
+            return name, d
+    return fallback
 
 
 def process_address_list(
@@ -1067,6 +1442,9 @@ def process_address_list(
     make_signed_url: Callable[[str], str],        # (blob_path) -> url
     write_partial_result: Callable[[Dict[str, Any]], None] = None,  # Optional callback for streaming results
     concurrency: int = None,  # addresses processed at once; None → VLM_ADDRESS_CONCURRENCY env (default 5)
+    resume_results: Dict[int, Any] = None,
+    include_web_results_in_partials: bool = True,
+    generate_html_report: bool = True,
 ) -> Dict[str, Any]:
     """
     Process a CSV of addresses through the geometry + dual-VLM pipeline.
@@ -1088,18 +1466,23 @@ def process_address_list(
     df = None
 
     # Handle Excel files (.xlsx, .xls)
+    chosen_tab = None
     if file_ext in ['.xlsx', '.xls']:
         try:
-            df = pd.read_excel(uploaded_filepath, engine='openpyxl' if file_ext == '.xlsx' else None)
-
-            # Validate: must have at least 1 column and 1 row
-            if len(df.columns) >= 1 and len(df) > 0:
-                log.info(f"Excel file loaded successfully: {len(df)} rows, {len(df.columns)} columns")
-            else:
-                df = None
+            all_sheets = pd.read_excel(uploaded_filepath, sheet_name=None,
+                                       engine='openpyxl' if file_ext == '.xlsx' else None)
+            tab, df = _pick_excel_tab(all_sheets)
+            if df is None:
                 error_msg = "Excel file is empty or has no valid data"
                 log.error(error_msg)
                 return {"error": error_msg}
+            if len(all_sheets) > 1:
+                chosen_tab = tab
+                others = [n for n in all_sheets if n != tab]
+                log.info(f"Workbook has {len(all_sheets)} tabs; analyzing '{tab}' "
+                         f"({len(df)} rows). Skipped: {others}")
+            else:
+                log.info(f"Excel file loaded successfully: {len(df)} rows, {len(df.columns)} columns")
         except Exception as e:
             error_msg = f"Failed to read Excel file: {str(e)}"
             log.error(error_msg)
@@ -1179,18 +1562,7 @@ def process_address_list(
 
     # Auto-detect address column (support common variations)
     address_col = None
-    address_variants = [
-        'Address', 'address', 'ADDRESS',
-        'Property Address', 'property address', 'PROPERTY ADDRESS',
-        'PropertyAddress', 'propertyaddress', 'PROPERTYADDRESS',
-        'Street Address', 'street address', 'STREET ADDRESS',
-        'StreetAddress', 'streetaddress', 'STREETADDRESS',
-        'Building Address', 'building address', 'BUILDING ADDRESS',
-        'BuildingAddress', 'buildingaddress', 'BUILDINGADDRESS',
-        'Property_Address', 'property_address', 'PROPERTY_ADDRESS',
-        'Street_Address', 'street_address', 'STREET_ADDRESS',
-        'Building_Address', 'building_address', 'BUILDING_ADDRESS'
-    ]
+    address_variants = ADDRESS_VARIANTS
 
     for variant in address_variants:
         if variant in df.columns:
@@ -1218,9 +1590,9 @@ def process_address_list(
     # Concurrent orchestrator: run up to `concurrency` addresses at once to
     # overlap the dual-VLM wait. Per-address work is isolated in
     # _process_one_address; shared state (progress, partial-result streaming,
-    # ordering) is handled here under one lock. Transient failures (throttled
-    # Overpass → TransientFootprintError, transient VLM verdict) are re-queued
-    # and retried in later rounds; nothing is silently dropped.
+    # ordering) is handled here under one lock. Address-level infrastructure
+    # failures such as a throttled footprint lookup are re-queued. A VLM result
+    # that exhausted its provider retry budget is terminal needs-attention.
     # ------------------------------------------------------------------
     if concurrency is None:
         concurrency = int(os.environ.get("VLM_ADDRESS_CONCURRENCY", str(DEFAULT_VLM_ADDRESS_CONCURRENCY)))
@@ -1229,19 +1601,110 @@ def process_address_list(
 
     columns = df.columns
     results_by_index = {}   # i -> (web_entry, csv_row)
-    last_seen = {}          # i -> last (web_entry, csv_row) for transient-VLM rows
-    commit_lock = threading.Lock()
-    done = 0
+    rows_by_index = {int(i): row for i, row in df.iterrows()}
+    state_by_index = {
+        index: {
+            "index": index,
+            "address": _compose_address(row, columns),
+            "state": "queued",
+            "message": "Waiting to be analyzed",
+            "error": "",
+        }
+        for index, row in rows_by_index.items()
+    }
+    for raw_index, stored in (resume_results or {}).items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(stored, dict):
+            web_entry = stored.get("web_entry")
+            csv_row = stored.get("csv_row")
+        elif isinstance(stored, (list, tuple)) and len(stored) == 2:
+            web_entry, csv_row = stored
+        else:
+            continue
+        if isinstance(web_entry, dict) and isinstance(csv_row, dict):
+            results_by_index[index] = (web_entry, csv_row)
+            error = str(web_entry.get("error") or "")
+            state_by_index[index] = {
+                "index": index,
+                "address": (
+                    web_entry.get("address")
+                    or state_by_index.get(index, {}).get("address")
+                    or ""
+                ),
+                "state": "attention" if error else "complete",
+                "message": error or "Machine analysis finished",
+                "error": error,
+            }
+    commit_lock = threading.RLock()
+    done = len(results_by_index)
+
+    def _partial_payload_locked():
+        payload = {
+            "schema_version": 2,
+            "row_results": [
+                {
+                    "index": int(k),
+                    "web_entry": results_by_index[k][0],
+                    "csv_row": results_by_index[k][1],
+                }
+                for k in sorted(results_by_index)
+            ],
+            "address_states": [
+                state_by_index[k] for k in sorted(state_by_index)
+            ],
+        }
+        if include_web_results_in_partials:
+            payload["web_results"] = [
+                results_by_index[k][0] for k in sorted(results_by_index)
+            ]
+        return payload
+
+    def _publish_locked():
+        if write_partial_result:
+            write_partial_result(_partial_payload_locked())
+
+    def _set_state(i, row, state, message="", error=""):
+        index = int(i)
+        with commit_lock:
+            state_by_index[index] = {
+                "index": index,
+                "address": _compose_address(row, columns),
+                "state": state,
+                "message": str(message or ""),
+                "error": str(error or ""),
+            }
+            _publish_locked()
+
+    if done:
+        progress_cb(done, total, f"Resumed {done} checkpointed address(es)")
+    with commit_lock:
+        _publish_locked()
 
     def _commit(i, web_entry, csv_row):
         nonlocal done
         with commit_lock:
-            results_by_index[i] = (web_entry, csv_row)
+            index = int(i)
+            if index in results_by_index:
+                return
+            results_by_index[index] = (web_entry, csv_row)
+            error = str(web_entry.get("error") or "")
+            state_by_index[index] = {
+                "index": index,
+                "address": (
+                    web_entry.get("address")
+                    or state_by_index.get(index, {}).get("address")
+                    or ""
+                ),
+                "state": "attention" if error else "complete",
+                "message": error or "Machine analysis finished",
+                "error": error,
+            }
             done += 1
             progress_cb(done, total, None)
-            if write_partial_result:
-                snapshot = [results_by_index[k][0] for k in sorted(results_by_index)]
-                write_partial_result({"web_results": snapshot})
+            _publish_locked()
             if done % 50 == 0 and total > 100:
                 import gc
                 gc.collect()
@@ -1250,10 +1713,16 @@ def process_address_list(
     def _run_round(batch):
         """Process a batch concurrently; return the rows that need retry."""
         retry = []
+
+        def _run_one(i, row):
+            _set_state(i, row, "analyzing", "Analyzing this address now")
+            return _process_one_address(
+                row, i, columns, total, job_id, upload_file, make_signed_url,
+            )
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
             futs = {
-                ex.submit(_process_one_address, row, i, columns, total,
-                          job_id, upload_file, make_signed_url): (i, row)
+                ex.submit(_run_one, i, row): (i, row)
                 for (i, row) in batch
             }
             for fut in concurrent.futures.as_completed(futs):
@@ -1265,21 +1734,36 @@ def process_address_list(
                     web_entry, csv_row = fut.result()
                 except TransientFootprintError:
                     log.warning(f"Row {i+1}/{total}: Overpass throttled (transient); queued for retry")
+                    _set_state(
+                        i, row, "retrying",
+                        "Building-footprint service was busy; retrying",
+                    )
                     retry.append((i, row))
                     continue
                 except Exception as e:
                     log.warning(f"Row {i+1}/{total}: unexpected error ({type(e).__name__}: {e}); queued for retry")
+                    detail = f"{type(e).__name__}: {e}"
+                    _set_state(i, row, "retrying", detail, detail)
                     retry.append((i, row))
                     continue
                 if _is_transient_vlm(web_entry):
-                    last_seen[i] = (web_entry, csv_row)  # keep as fallback if retries don't clear it
-                    log.info(f"Row {i+1}/{total}: transient VLM verdict; queued for retry")
-                    retry.append((i, row))
+                    log.warning(
+                        f"Row {i+1}/{total}: VLM provider retry budget exhausted; "
+                        "keeping explicit needs_review result"
+                    )
+                    _set_state(
+                        i, row, "retrying",
+                        "Visual analysis provider failed after its retry limit",
+                    )
+                    _commit(i, web_entry, csv_row)
                     continue
                 _commit(i, web_entry, csv_row)
         return retry
 
-    pending = list(df.iterrows())
+    pending = [
+        (i, row) for i, row in df.iterrows()
+        if int(i) not in results_by_index
+    ]
     for round_num in range(MAX_RETRY_ROUNDS + 1):
         if not pending:
             break
@@ -1288,14 +1772,11 @@ def process_address_list(
             time.sleep(RETRY_BACKOFF_SECONDS * round_num)
         pending = _run_round(pending)
 
-    # No silent drops. If a transient VLM result was seen, keep it (a legitimate
-    # needs_review row); if the footprint never resolved, emit footprint_missing
-    # tagged unverified so a throttle-induced miss is never logged as a clean
-    # genuine negative.
+    # No silent drops. Provider-exhausted VLM results were committed above as
+    # explicit needs_review rows. If an address-level infrastructure dependency
+    # never resolved, emit footprint_missing tagged unverified so a throttle-
+    # induced miss is never logged as a clean genuine negative.
     for i, row in pending:
-        if i in last_seen:
-            _commit(i, *last_seen[i])
-            continue
         full_address = _compose_address(row, columns)
         log.warning(f"Row {i+1}/{total}: still failing after {MAX_RETRY_ROUNDS} retries; emitting unverified")
         notes = "Transient failure (Overpass/VLM) unresolved after retries; manual verification needed"
@@ -1329,13 +1810,17 @@ def process_address_list(
     log.info(f"  ✗ Failed: {failed}")
     log.info(f"  📡 Cooling towers detected: {detections}")
 
-    # Generate HTML report with embedded images (skip for large batches to save memory)
-    skip_html = total > 200
+    # Workbook runs use the interactive review surface and discard this legacy
+    # report. Avoid copying and base64-encoding every chunk image in that path.
+    skip_html = not generate_html_report or total > 200
     html_local = os.path.join(tempfile.gettempdir(), f"Report_{job_id}.html")
     html_url = None
 
     if skip_html:
-        log.info(f"Skipping HTML generation for large batch ({total} addresses) to conserve memory")
+        log.info(
+            "Skipping legacy HTML report generation for %d address(es)",
+            total,
+        )
     else:
         # We need a function to get local paths from blob paths for image encoding
         # This lambda will be passed to the HTML generator
@@ -1347,12 +1832,32 @@ def process_address_list(
             return get_file_path(blob_path)
 
         try:
-            generate_html_report(
-                web_results=web_results,
-                job_id=job_id,
-                output_path=html_local,
-                get_local_path_func=blob_to_local
+            # Default report format: report_audit audit cards (clickable lightbox +
+            # Google Maps/Earth/Bing location links), dark theme. Annotated tiles are
+            # embedded as base64 data URIs so the downloaded HTML works offline.
+            import base64
+            import copy as _copy
+            from report_audit import build_audit_report
+            report_results = _copy.deepcopy(web_results)
+            for _e in report_results:
+                for _k in ("result_image_url", "result_image_url_wide", "original_image_url"):
+                    _u = _e.get(_k)
+                    if not isinstance(_u, str) or not _u:
+                        continue
+                    _bp = _u[len("/files/"):] if _u.startswith("/files/") else _u
+                    try:
+                        _b = blob_to_local(_bp).read_bytes()
+                        _e[_k] = "data:image/jpeg;base64," + base64.b64encode(_b).decode("ascii")
+                    except (OSError, AttributeError):
+                        pass
+            _report_html = build_audit_report(
+                report_results,
+                title=f"Cooling Tower Analysis — {job_id}",
+                email_mode=False,
+                dark=True,
             )
+            with open(html_local, "w", encoding="utf-8") as _f:
+                _f.write(_report_html)
 
             # Upload HTML report
             html_blob = f"results/{job_id}/Report_{job_id}.html"
@@ -1364,5 +1869,11 @@ def process_address_list(
 
     return {
         "web_results": web_results,
-        "html_url": html_url
+        "html_url": html_url,
+        # The parsed upload (post dropna, address column normalized), 1:1 and
+        # in order with web_results — the caller finalizes it into the review
+        # batch + Google Sheet. Not JSON-serializable; pop before write_result.
+        "table_df": df,
+        # Set when a multi-tab workbook was uploaded: which tab was analyzed.
+        "sheet_tab": chosen_tab,
     }

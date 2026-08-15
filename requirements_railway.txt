@@ -12,7 +12,8 @@ pillow==11.3.0
 # Data processing
 pandas==2.3.2
 numpy==2.2.6
-openpyxl==3.1.2  # Excel file support
+openpyxl==3.1.2  # .xlsx file support
+xlrd==2.0.1      # legacy .xls file support
 
 # HTTP requests
 requests==2.32.5
@@ -23,6 +24,8 @@ geopy==2.4.1
 # Phase 3: building footprints + VLM verification
 shapely
 google-genai
+google-api-python-client   # Sheets/Drive write-back (sheets_writer.py)
+google-auth
 openai
 httpx  # used directly in vlm.py (timeouts/errors); also a transitive dep of google-genai/openai
 python-dotenv

@@ -1,97 +1,70 @@
-# n8n orchestration — "upload a sheet, get an emailed report"
+# n8n Orchestration
 
-This folder contains the n8n Cloud workflow that drives the cooling-tower pipeline
-end to end:
+> Inactive reference only. Parity does not currently deploy or require n8n.
+> Browser upload, Drive inbox, and the versioned API call the durable workbook
+> engine directly.
 
+The exports below are retained only in case an external orchestrator is added
+later. The primary operator path is the Claude skill
+(`.claude/skills/parity-cooling-tower`), which runs a batch, hands the team a
+review page, and writes reviewed picks into a Google Sheet.
+
+## Multi-Tab Workbook Flow
+
+Import:
+
+```text
+n8n/parity_workbook_async.workflow.json
 ```
-Webhook → Google Sheet → Grok LLM chain (normalize) → Collect → POST /api/run (Railway)
-        → Gmail (email the HTML report) → Slack (confirmation)
+
+This is the replacement file-upload path for `.xlsx` workbooks with several
+regional tabs. It creates one asynchronous workbook run, then polls the status
+URL until the grouped review page is ready. It never normalizes customer
+addresses with Grok in n8n; Render uses deterministic headers and invokes Grok
+only for redacted, ambiguous schema profiles.
+
+Create one n8n **Header Auth** credential named `Parity Render API Key` with
+header name `X-API-Key` and the Render `ANALYZE_API_KEY` as its value. Select
+that credential on both HTTP Request nodes. Keep the API key in n8n's encrypted
+credential store, not in the workflow JSON.
+
+An `approval_required` or `confirmation_required` result is a deliberate stop,
+not a failed analysis. Use the returned `approval_url` or `setup_url`, then keep
+polling the same `status_url`.
+
+## Retired Legacy Single-Table Workflow
+
+The older file remains in the repository only for existing single-table
+consumers:
+
+```text
+n8n/parity_cooling_tower.workflow.json
 ```
 
-n8n only orchestrates. The ML (YOLO + dual-VLM) runs on the Railway Flask app via the
-`/api/*` endpoints in `api_analyze.py` — n8n cannot run PyTorch/YOLO itself (its Python
-node is a sandboxed Pyodide runtime). The single `POST /api/run` call sends the whole
-list of addresses and gets the finished, self-contained HTML report back, so n8n never
-has to loop per row.
+Do not use it for new workbook automation. It sends rows through a legacy
+single-table path and does not provide multi-tab accounting, resumable chunks,
+or dropdown-preservation checks. New automation must use
+`parity_workbook_async.workflow.json`. Grok schema assistance happens inside
+Render with redacted column profiles; n8n must not send raw customer addresses
+to an LLM.
 
-### Node walk-through
-1. **Webhook** — `POST` to its URL starts a run; it replies `{"status":"started"}`
-   immediately (so it never times out on a long batch) and the rest runs async.
-2. **Read addresses** (Google Sheets) — reads every row.
-3. **Normalize (Grok)** — a Basic LLM Chain with an **xAI Grok** chat model rewrites
-   each row's address into a clean `number street, city, STATE ZIP` line.
-4. **Collect addresses** (Aggregate) — gathers the normalized lines into one list
-   (the only "glue" node; turns N rows into one batch payload).
-5. **Analyze on Railway** (HTTP) — one `POST /api/run` with `{addresses, title}` →
-   returns the HTML report as text (`$json.data`).
-6. **Email report** (Gmail) — inlines the HTML report.
-7. **Slack confirmation** — posts "analysis complete — N addresses, report emailed".
+## What n8n Does
 
-## One-time setup
+n8n only orchestrates intake, optional cleanup, and notifications. YOLO, imagery, geocoding,
+Gemini, and Grok verification all run on the Render Flask service through `api_analyze.py`.
 
-### 1. Railway (the analyzer)
-1. Deploy the repo to Railway as usual (it already builds from `Dockerfile.railway`).
-2. Set a new environment variable on the Railway service:
-   - `ANALYZE_API_KEY` = a long random secret (e.g. `openssl rand -hex 24`).
-   The `/api/analyze` and `/api/report` routes refuse to run without it (they spend VLM money).
-   All the existing keys (`GOOGLE_MAPS_API_KEY`, `MAPBOX_API_KEY`, `GEMINI_API_KEY`,
-   `XAI_API_KEY`) stay as they are.
-3. Confirm it's live: `curl https://YOUR-APP.up.railway.app/api/health` → `{"status":"ok"}`.
+## Endpoints
 
-### 2. n8n Cloud
-1. **Workflows → Import from File** → choose `parity_cooling_tower.workflow.json`.
-2. Add credentials (n8n → Credentials):
-   - **Google Sheets** (OAuth2) → *Read addresses* node.
-   - **xAI** (`xAiApi`) → *Grok Chat Model* node.
-   - **Gmail** (OAuth2) → *Email report* node.
-   - **Slack** (OAuth2 or API token) → *Slack confirmation* node.
-3. Replace the placeholders:
-   - *Read addresses*: set the Google Sheet (`documentId`) and tab (`sheetName`).
-   - *Analyze on Railway*: set the URL to `https://YOUR-APP.up.railway.app/api/run`
-     and the `X-API-Key` header to the `ANALYZE_API_KEY` you created above.
-   - *Email report*: set `sendTo`.
-   - *Slack confirmation*: set the channel.
-   > Tip: instead of pasting the key, create an n8n **Header Auth** credential
-   > (`X-API-Key: <key>`) and switch the HTTP node to "Generic Credential → Header Auth".
-
-### 3. The sheet
-One row per address. Column headers (case-sensitive):
-- `Address` — **required**, the full street address.
-- `Boro_Area` — optional (borough / city / area).
-- `Zip` — optional.
-
-## Running
-`POST` to the Webhook URL (n8n shows it on the *Webhook* node — there's a test URL
-and a production URL; activate the workflow to use the production one). It replies
-`{"status":"started"}` immediately, then analyzes the whole sheet, emails the report,
-and posts a Slack confirmation. A single bad address does not abort the run (the
-analyzer encodes the failure in that address's card instead).
-
-## The Grok normalization step
-*Normalize (Grok)* is a Basic LLM Chain wired to an **xAI Grok** chat model; it
-rewrites each row into a clean `number street, city, STATE ZIP` line before geocoding,
-which helps with messy sales-CSV formats. If your n8n version doesn't have the xAI
-Grok chat-model node, swap *Grok Chat Model* for any other chat-model sub-node
-(OpenAI, Gemini, etc.) — the chain itself is model-agnostic. To skip normalization
-entirely, disable *Normalize (Grok)* and point *Collect addresses* at the raw
-`Address` field instead of `text`.
-
-## Notes / limits
-- **Cost:** each address is ~$0.10–$0.30 of VLM spend (Gemini + Grok), plus one small
-  Grok call per row for normalization. Spend is proportional to sheet size.
-- **Large runs (>~200 addresses):** the report embeds every annotated image as base64,
-  so very large reports get heavy for email clients, and `/api/run` is one long
-  request. For big batches, split the sheet, or have the *Email report* step write to
-  Google Drive instead of inlining. (A chunked/streamed report can be added if this
-  becomes routine.)
-- **Secrets:** all model/API keys live on the Railway service, not in the workflow
-  JSON. n8n holds only the Railway URL + the shared `X-API-Key` (+ its own Sheets/
-  xAI/Gmail/Slack credentials).
-
-## Endpoint reference (`api_analyze.py`)
 | Method | Path | Auth | Body | Returns |
-|--------|------|------|------|---------|
-| GET | `/api/health` | none | — | `{"status":"ok"}` |
-| POST | `/api/run` | `X-API-Key` | `{addresses:[str\|{address,boro_area,zip}], title?}` | `text/html` audit report (**the n8n path**) |
-| POST | `/api/analyze` | `X-API-Key` | `{address, boro_area?, zip?}` | one web_entry JSON (images as `data:` URIs) |
-| POST | `/api/report` | `X-API-Key` | `{results:[web_entry,...], title?}` | `text/html` audit report |
+| --- | --- | --- | --- | --- |
+| `GET` | `/api/health` | none | none | health JSON |
+| `POST` | `/api/run` | `X-API-Key` | `{addresses:[...]}` | `text/html` report (+ `X-Review-URL` header) |
+| `POST` | `/api/run-file` | `X-API-Key` | multipart file upload | JSON `{review_url, count}` (drives the review flow; used by the Claude skill) |
+| `POST` | `/api/v2/workbook-runs` | `X-API-Key` | `.xlsx`/`.csv` file or `sheet_url` | asynchronous run metadata |
+| `GET` | `/api/v2/workbook-runs/<run_id>` | `X-API-Key` | none | durable run status and denominators |
+| `POST` | `/api/v2/workbook-runs/<run_id>/approval` | `X-API-Key` | none | records one large-workbook approval |
+| `POST` | `/api/v2/workbook-runs/<run_id>/retry` | `X-API-Key` | none | resumes a failed run from checkpoints |
+| `POST` | `/api/analyze` | `X-API-Key` | one address | one result JSON |
+| `POST` | `/api/report` | `X-API-Key` | result entries | `text/html` report |
+| `GET` | `/review/<batch_id>` | site password | none | interactive review page |
+| `GET` | `/api/batch/<batch_id>` | `X-API-Key` | none | original table + human review decisions |

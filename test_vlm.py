@@ -1,4 +1,4 @@
-"""Dual-VLM test harness for vlm.verify_detection (Gemini + Grok consensus).
+"""Gemini-first test harness for vlm.verify_detection.
 
 Runs vlm.verify_detection end-to-end against two known-good raw satellite
 tiles from pipeline_test_outputs/. Exits 0 only when both fixtures pass
@@ -59,11 +59,12 @@ _VALID_VERDICTS = {
 _SUB_MODEL_KEYS = {"verdict", "confidence", "reasoning", "construction", "is_house"}
 _TOP_LEVEL_KEYS = {
     "verdict", "confidence", "reasoning", "construction", "is_house",
-    "gemini", "grok", "agreement",
+    "image_unusable", "frame_inadequate", "gemini", "grok", "agreement",
+    "model_path", "grok_fallback_used",
 }
 _CONSENSUS_NEEDS_REVIEW_MARKERS = ("disagreed", "threshold", "timeout")
 _API_ERROR_MARKERS = (
-    "after 4 attempts",
+    "after 3 attempts",
     "Network timeout",
     "Network connection error",
     "API server error",
@@ -98,7 +99,7 @@ def _print_fail(label: str) -> None:
 
 def _preflight() -> bool:
     print("=== PRE-FLIGHT ===")
-    for var in ("GEMINI_API_KEY", "XAI_API_KEY"):
+    for var in ("GEMINI_API_KEY",):
         if os.environ.get(var):
             _print_pass(f"{var} is set")
         else:
@@ -160,10 +161,15 @@ def _validate_sub_dict(name: str, sub) -> list[tuple[bool, str]]:
     checks.append((sub_is_dict, f"{name} sub-dict is a dict (got: {type(sub).__name__})"))
     if not sub_is_dict:
         return checks
+    # Gemini returns its full reviewer shape. Grok is empty unless an actual
+    # technical Gemini failure required the bounded emergency fallback.
+    if name == "grok" and sub == {}:
+        checks.append((True, "grok is empty because no emergency fallback ran"))
+        return checks
     sub_keys = set(sub.keys())
     checks.append((
-        sub_keys == _SUB_MODEL_KEYS,
-        f"{name} sub-dict has exactly five keys (got: {sorted(sub_keys)})",
+        _SUB_MODEL_KEYS.issubset(sub_keys),
+        f"{name} sub-dict retains required reviewer keys (got: {sorted(sub_keys)})",
     ))
     v = sub.get("verdict")
     checks.append((v in _VALID_VERDICTS, f"{name}.verdict is a valid literal (got: {v!r})"))
@@ -192,8 +198,8 @@ def _validate_structure(resp) -> tuple[bool, list[tuple[bool, str]]]:
 
     keys = set(resp.keys())
     checks.append((
-        keys == _TOP_LEVEL_KEYS,
-        f"response has exactly eight keys (got: {sorted(keys)})",
+        _TOP_LEVEL_KEYS.issubset(keys),
+        f"response retains the compatible result keys (got: {sorted(keys)})",
     ))
 
     verdict = resp.get("verdict")

@@ -1,24 +1,20 @@
-"""Phase 3 dual-VLM verification of YOLO cooling-tower detections.
+"""Gemini-first verification of YOLO cooling-tower detections.
 
-Public surface: a single function ``verify_detection`` that takes a satellite
-tile path, a YOLO bounding box, and a building-context dict, and returns a
-result dict describing whether the candidate is a real cooling tower on the
-target rooftop. Every call runs Gemini 3.1 Pro and Grok 4.3 in parallel and
-combines their verdicts via consensus: bucket-agreement on a confident answer
-= final verdict; disagreement OR below-threshold confidence = ``needs_review``.
-All recoverable failures map to ``needs_review``; configuration errors
-(missing ``GEMINI_API_KEY`` or ``XAI_API_KEY``) propagate as ``KeyError``.
+Gemini is the normal rooftop reviewer.  Grok is intentionally an emergency
+fallback only after Gemini has exhausted its retries because of a provider,
+transport, timeout, or structured-output failure.  Valid Gemini uncertainty is
+still a valid Gemini result and never spends on Grok.
 """
 
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import functools
 import io
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,10 +35,22 @@ _REFERENCE_DIR_POSITIVE = "reference_images/positive"
 _REFERENCE_DIR_NEGATIVE = "reference_images/negative"
 _REFERENCE_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 _REFERENCE_IMAGE_CAP_PER_CATEGORY = 5
+_REFERENCE_MEDIA_RESOLUTION = (
+    types.PartMediaResolutionLevel.MEDIA_RESOLUTION_MEDIUM
+)
+_POSITIVE_REFERENCE_LABEL = (
+    "--- Reference: confirmed cooling tower (positive example) ---"
+)
+_NEGATIVE_REFERENCE_LABEL = (
+    "--- Reference: human-reviewed RTU / rooftop-unit false positive; "
+    "negative because a human rejected the equipment, not because its "
+    "neutral YOLO candidate box is green; NOT a cooling tower ---"
+)
 _CROP_PAD_PX = 50
 _RETRY_BACKOFFS_S = (1, 2, 4)
+_MAX_PROVIDER_ATTEMPTS = 3  # initial request plus at most two retries
 
-_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 _DEFAULT_GROK_MODEL = "grok-4.3"
 _GROK_BASE_URL = "https://api.x.ai/v1"
 # Reasoning depth. Grok 4.3 defaults to "low" if unset; Gemini 3.x to "medium".
@@ -52,8 +60,155 @@ _GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "high")
 _DEFAULT_TIMEOUT_S = 120
 _DEFAULT_CONSENSUS_THRESHOLD = 0.7
 
+_METRICS_LOCK = threading.Lock()
+_METRICS = {"gemini_only_reviews": 0, "grok_emergency_fallbacks": 0}
+_TECHNICAL_FAILURE_MARKERS = (
+    "timeout", "network", "connection error", "api ", "schema mismatch",
+    "empty response", "response shape", "authentication", "authorization",
+    "throttled", "invalid structured",
+)
+
+
+def _metric(name: str) -> None:
+    with _METRICS_LOCK:
+        _METRICS[name] = _METRICS.get(name, 0) + 1
+
+
+def metrics_snapshot() -> dict:
+    """Non-sensitive operational counters for health/audit reporting."""
+    with _METRICS_LOCK:
+        return dict(_METRICS)
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _grok_fallback_enabled() -> bool:
+    return _flag("GEMINI_GROK_EMERGENCY_FALLBACK_ENABLED", True)
+
+
+def _is_technical_gemini_failure(result: dict) -> bool:
+    """Only provider/transport/schema failures are allowed to invoke Grok."""
+    if not isinstance(result, dict) or result.get("verdict") != "needs_review":
+        return False
+    reasoning = str(result.get("reasoning") or "").lower()
+    return any(marker in reasoning for marker in _TECHNICAL_FAILURE_MARKERS)
+
+
+def _gemini_first_result(
+    gemini_result: dict, grok_result: dict | None = None, *, fallback_attempted: bool = False,
+) -> dict:
+    """Keep the historical result shape while exposing the model path used."""
+    if grok_result is None:
+        _metric("gemini_only_reviews")
+        return {
+            **gemini_result,
+            "gemini": gemini_result,
+            "grok": {},
+            # Retained for old CSV/review consumers. A Gemini-only result is
+            # not a two-model agreement, even when it is a valid final verdict.
+            "agreement": False,
+            "model_path": "gemini_only",
+            "grok_fallback_used": False,
+        }
+
+    if fallback_attempted:
+        _metric("grok_emergency_fallbacks")
+    if grok_result.get("verdict") != "needs_review":
+        return {
+            **grok_result,
+            "reasoning": (
+                "Gemini had a technical verification failure; Grok emergency fallback: "
+                f"{grok_result.get('reasoning', '')}"
+            ),
+            "gemini": gemini_result,
+            "grok": grok_result,
+            "agreement": False,
+            "model_path": "grok_emergency_fallback",
+            "grok_fallback_used": True,
+        }
+
+    return {
+        "verdict": "needs_review",
+        "confidence": 0.0,
+        "reasoning": (
+            "Gemini had a technical verification failure and the one allowed Grok "
+            f"fallback also failed. Gemini: {gemini_result.get('reasoning', '')} "
+            f"Grok: {grok_result.get('reasoning', '')}"
+        ),
+        "construction": False,
+        "is_house": False,
+        "image_unusable": bool(gemini_result.get("image_unusable") or grok_result.get("image_unusable")),
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
+        "gemini": gemini_result,
+        "grok": grok_result,
+        "agreement": False,
+        "model_path": "grok_fallback_failed",
+        "grok_fallback_used": True,
+    }
+
+
+def _grok_fallback_unavailable_result(gemini_result: dict) -> dict:
+    """Fail closed without pretending Grok ran when its exception path is off."""
+    return {
+        "verdict": "needs_review",
+        "confidence": 0.0,
+        "reasoning": (
+            "Gemini had a technical verification failure and Grok emergency fallback "
+            f"was unavailable. Gemini: {gemini_result.get('reasoning', '')}"
+        ),
+        "construction": False,
+        "is_house": False,
+        "image_unusable": bool(gemini_result.get("image_unusable")),
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
+        "gemini": gemini_result,
+        "grok": {},
+        "agreement": False,
+        "model_path": "grok_fallback_unavailable",
+        "grok_fallback_used": False,
+    }
+
 _POSITIVE_VERDICTS = frozenset({"confirmed", "likely", "cooling_tower_present", "cooling_tower_possible"})
 _NEGATIVE_VERDICTS = frozenset({"not_detected", "neighbor_only", "no_cooling_tower"})
+
+_RTU_VS_COOLING_TOWER_GUIDANCE = """
+RTU / PACKAGED ROOFTOP UNIT vs COOLING TOWER — a recurring YOLO false positive:
+
+- An RTU, VRF condenser, or air-cooled rooftop unit is usually a low rectangular
+  sheet-metal cabinet with one or more small circular condenser-fan grilles on
+  a mostly solid top. It may connect to ducts or sit on a roof curb. A row or
+  grid of small fans on compact cabinets is still often RTU/VRF equipment.
+- A real cooling tower needs cooling-tower-specific heat-rejection structure,
+  not merely a visible fan: an elevated fan stack or shroud, large open/louvered
+  intake faces, tower-cell and basin geometry, visible wet-fill or coil banks,
+  and/or large connected tower piping.
+- One circular fan, several small fan grilles, or a box selected by YOLO is NOT
+  enough evidence. YOLO frequently boxes RTUs, VRF condensers, exhaust fans,
+  and air handlers as cooling towers.
+- Every numbered YOLO candidate box is green regardless of what equipment it
+  contains; green is a neutral locator, never evidence of an RTU, a negative
+  result, or a cooling tower.
+- Cooling towers and RTU/VRF equipment are NOT mutually exclusive; the same
+  target roof may contain both. Judge each distinct unit independently (and
+  every numbered box when present). A negative-reference match rejects only
+  that matched unit; it must not cancel a separate unit with at least TWO
+  cooling-tower-specific features.
+- For whole-roof/address verdicts, return the appropriate positive verdict if
+  any real cooling tower serves the target, even when RTUs are also present;
+  return a negative verdict only when none does. For a single-candidate verdict,
+  judge only the current candidate. In the reasoning, identify both types when
+  both are visible.
+""".strip()
+
+
+def _system_instruction(base_prompt: str) -> str:
+    """Apply the same RTU false-positive guard to every VLM verification path."""
+    return f"{base_prompt}\n\n{_RTU_VS_COOLING_TOWER_GUIDANCE}"
+
 
 _SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
 
@@ -114,12 +269,12 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 
 Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest")."""
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see (e.g. "louvered intake panels visible on top of the unit", "candidate is on the southeast corner of the target rooftop, separated from the neighbor by a clear gap"). Avoid technical jargon they would not recognize. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building (e.g., "on the building immediately north of the target" or "on the adjacent building to the southwest"). For "confirmed" or "likely", cite at least two cooling-tower-specific features and explain why the object is not an RTU. For "not_detected", name the false-positive equipment type when visible, especially RTU, rooftop condenser, exhaust fan, or air handler."""
 
 _REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the candidate tile may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
+Along with Image A and Image B you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the candidate tile may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -127,7 +282,9 @@ When evaluating the candidate in Image A, compare its features against the posit
 
 _REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if the candidate in Image A more closely resembles a negative reference than any positive reference, lean toward "not_detected"."""
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors. If the candidate in Image A more closely resembles one of these compact, solid-topped rooftop units or small fan grids than a positive cooling-tower reference, use "not_detected" and explicitly say that it is likely an RTU, rooftop condenser, exhaust fan, or air handler."""
 
 
 _ROOFTOP_SYSTEM_PROMPT = """You are a senior rooftop HVAC equipment detection specialist.
@@ -187,12 +344,12 @@ Set "construction": true ONLY if you can see active construction — cranes, exp
 
 Set "is_house": true ONLY if the TARGET building is clearly a single-family house or small residential dwelling — a small footprint with a pitched/gabled roof, a driveway or yard, the look of a detached or attached row home — i.e. a building that would not carry commercial cooling-tower equipment. Set false for apartment blocks, commercial, institutional, mixed-use, or any building large or ambiguous enough to plausibly have a cooling tower. This is a separate signal from the cooling-tower verdict.
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see on the target rooftop. Avoid technical jargon. For "cooling_tower_present" or "cooling_tower_possible", cite at least two cooling-tower-specific features and explain why the equipment is not an RTU. For "no_cooling_tower", name the lookalike when visible, especially RTU, rooftop condenser, exhaust fan, or air handler. IMPORTANT: if your verdict is "no_cooling_tower" AND construction is true, the reasoning MUST describe the construction activity in concrete terms (where on the building, what you see) — this is the lead signal the sales team uses for follow-up."""
 
 _ROOFTOP_REFERENCE_BLOCK_POSITIVE = """
 
 === REFERENCE IMAGES ===
-After the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the tile you are scanning may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
+Along with the satellite tile you will receive {n_pos} confirmed-positive reference image(s) from prior verified cases. These come from 768x768 zoom-19 Mapbox satellite imagery (the same source you are analyzing); the tile you are scanning may be at a different zoom, so match on equipment features (fan pattern, louvers, enclosure) rather than absolute scale.
 
 Each positive has a yellow bounding box drawn around the cooling tower (the original training-data label from Roboflow). The yellow box marks the object — it is NOT a visual feature of cooling towers themselves. Use the equipment inside the yellow box as your visual anchor: fan pattern, enclosure shape, scale relative to the rooftop, and overhead appearance.
 
@@ -200,7 +357,21 @@ When scanning the target rooftop in the satellite tile, compare what you see aga
 
 _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
 
-You will also receive {n_neg} confirmed-negative reference image(s) showing rooftop objects commonly mistaken for cooling towers but which are NOT cooling towers (for example: rooftop air handlers, exhaust fans, skylights, satellite dishes, water tanks). Treat these as exclusion anchors — if equipment on the target rooftop more closely resembles a negative reference than any positive reference, lean toward "no_cooling_tower"."""
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors for each matching unit, not for the roof as a whole. Reject equipment that resembles these compact, solid-topped rooftop units or small fan grids, explicitly identifying it as a likely RTU, rooftop condenser, exhaust fan, or air handler, then continue scanning the rest of the target. Use "no_cooling_tower" only when no separate real cooling tower serves the target."""
+
+_ADDRESS_REFERENCE_BLOCK_POSITIVE = """
+
+You will also receive {n_pos} confirmed-positive reference image(s) showing real cooling towers from overhead. These examples are visual anchors for cooling-tower-specific structure, such as substantial fan stacks or shrouds, large louvered/open intake faces, tower-cell and basin geometry, and connected tower piping.
+
+Compare every numbered box and any unboxed equipment on the target rooftop against these positive examples. Use "confirmed" or "likely" only when the target equipment shares at least two cooling-tower-specific features."""
+
+_ADDRESS_REFERENCE_BLOCK_NEGATIVE_ADDITION = """
+
+You will also receive {n_neg} confirmed-negative, equipment-only reference image(s) from this team's own human-reviewed production results. Surrounding building and location context was removed before publication. In these examples, YOLO incorrectly identified RTUs, rooftop condensers, exhaust fans, or air handlers as cooling towers. YOLO draws every candidate box green regardless of the eventual verdict; these specific crops are negative because a human reviewer rejected the enclosed equipment, not because the boxes are green. A crop may retain a fragment of the RED target-building outline; neither color is an equipment feature.
+
+Treat these as strong exclusion anchors for each matching unit, not for the address as a whole. Reject a numbered box or other equipment that resembles these compact, solid-topped rooftop units or small fan grids, explicitly identifying it as a likely RTU, rooftop condenser, exhaust fan, or air handler, then continue checking every other box and unboxed roof area. Use "not_detected" only when no separate real cooling tower serves the target."""
 
 
 class _VerificationResponse(BaseModel):
@@ -210,6 +381,7 @@ class _VerificationResponse(BaseModel):
     construction: bool
     is_house: bool
     image_unusable: bool = False
+    frame_inadequate: bool = False
 
 
 class _RooftopResponse(BaseModel):
@@ -234,6 +406,7 @@ def _needs_review(reasoning: str) -> dict:
         "construction": False,
         "is_house": False,
         "image_unusable": False,
+        "frame_inadequate": False,
     }
 
 
@@ -258,11 +431,19 @@ def _strip_md_fences(text: str) -> str:
     return s.strip()
 
 
-def _to_image_url_part(jpeg_bytes: bytes) -> dict:
-    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+def _image_mime_type(image_bytes: bytes) -> str:
+    """Identify the two repository-supported image formats without decoding."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    return "image/jpeg"
+
+
+def _to_image_url_part(image_bytes: bytes) -> dict:
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    mime_type = _image_mime_type(image_bytes)
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
     }
 
 
@@ -293,6 +474,42 @@ def _load_reference_dir(dir_path: str) -> list[bytes]:
 
 def _load_reference_images() -> tuple[list[bytes], list[bytes]]:
     return _load_reference_dir(_REFERENCE_DIR_POSITIVE), _load_reference_dir(_REFERENCE_DIR_NEGATIVE)
+
+
+def _append_gemini_reference_parts(
+    contents: list, positive_images: list[bytes], negative_images: list[bytes],
+) -> None:
+    """Append few-shot images with labels that explain human-reviewed negatives."""
+    for image_bytes in positive_images:
+        contents.append(_POSITIVE_REFERENCE_LABEL)
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=_image_mime_type(image_bytes),
+                media_resolution=_REFERENCE_MEDIA_RESOLUTION,
+            )
+        )
+    for image_bytes in negative_images:
+        contents.append(_NEGATIVE_REFERENCE_LABEL)
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=_image_mime_type(image_bytes),
+                media_resolution=_REFERENCE_MEDIA_RESOLUTION,
+            )
+        )
+
+
+def _append_openai_reference_parts(
+    content_parts: list, positive_images: list[bytes], negative_images: list[bytes],
+) -> None:
+    """Mirror Gemini's labeled references for the emergency Grok fallback."""
+    for image_bytes in positive_images:
+        content_parts.append({"type": "text", "text": _POSITIVE_REFERENCE_LABEL})
+        content_parts.append(_to_image_url_part(image_bytes))
+    for image_bytes in negative_images:
+        content_parts.append({"type": "text", "text": _NEGATIVE_REFERENCE_LABEL})
+        content_parts.append(_to_image_url_part(image_bytes))
 
 
 def _encode_jpeg(img: Image.Image) -> bytes:
@@ -387,8 +604,8 @@ def _build_prompt(
     reference_block = ""
     if n_pos > 0:
         reference_block = _REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+    if n_neg > 0:
+        reference_block += _REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -438,8 +655,8 @@ def _build_rooftop_prompt(
     reference_block = ""
     if n_pos > 0:
         reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+    if n_neg > 0:
+        reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _ROOFTOP_USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -489,7 +706,7 @@ Two jobs, equally important:
 1. VERIFY the numbered boxes — decide which, if any, contain a real cooling tower serving the target building.
 2. FIND what YOLO MISSED — scan the rest of the target's roof and its immediate surroundings for any cooling tower with NO box around it. A real cooling tower that YOLO failed to box still counts — report it.
 
-Return a structured JSON response with six fields: verdict, confidence, reasoning, construction, is_house, image_unusable. Be calibrated and honest about uncertainty."""
+Return a structured JSON response with seven fields: verdict, confidence, reasoning, construction, is_house, image_unusable, frame_inadequate. Be calibrated and honest about uncertainty."""
 
 _ADDRESS_USER_PROMPT_TEMPLATE = """=== BUILDING CONTEXT ===
 Address: {address}
@@ -518,7 +735,9 @@ Set "is_house": true ONLY if the TARGET building is clearly a single-family hous
 
 Set "image_unusable": true ONLY if you cannot properly judge the target building because its roof is not clearly visible from directly above in THIS image — for example a tall tower shown leaning at a steep oblique angle so you see its glass facade instead of its roof, or the target's roof is cut off at the edge of the frame. This tells the system to retry with a different satellite source. If you can see the target's roof clearly (even if it simply has no cooling tower on it), set it false.
 
-Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
+Set "frame_inadequate": true ONLY when you are about to call "not_detected" or "neighbor_only" AND the image is zoomed in tightly enough that a GROUND-MOUNTED cooling tower serving the target could be sitting just outside the frame — i.e. the target building fills most of the view and you cannot see the immediately-adjacent ground, pads, yards, alleys, or mechanical enclosures where such a unit would sit. This tells the system to re-pull a WIDER view and look again. Think this through deliberately before setting it: if the surroundings you can ALREADY see are enough to rule out a ground-mounted unit, set false. And if you have ALREADY found a real cooling tower serving the target (a "confirmed" or "likely" verdict), set it false — you already have the information you need, so there is no reason to look elsewhere. This is separate from "image_unusable" (which is about the target's roof not being visible at all).
+
+Write 2-5 sentences in the "reasoning" field that a non-technical sales rep can read and understand. Reference what you actually see, and when you rely on a box, name it (e.g. "box 2 is a real cooling tower on the target's southeast corner; boxes 1 and 3 are rooftop air handlers"). For "confirmed" or "likely", cite at least two cooling-tower-specific features and explain why the equipment is not an RTU. For "not_detected", name the false-positive equipment type when visible, especially RTU, rooftop condenser, exhaust fan, or air handler. If your verdict is "neighbor_only", specify which direction the cooling tower actually is relative to the target building."""
 
 
 _ADDRESS_CLOSEUP_BLOCK = """
@@ -568,9 +787,9 @@ def _build_address_prompt(
 
     reference_block = ""
     if n_pos > 0:
-        reference_block = _ROOFTOP_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
-        if n_neg > 0:
-            reference_block += _ROOFTOP_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
+        reference_block = _ADDRESS_REFERENCE_BLOCK_POSITIVE.format(n_pos=n_pos)
+    if n_neg > 0:
+        reference_block += _ADDRESS_REFERENCE_BLOCK_NEGATIVE_ADDITION.format(n_neg=n_neg)
 
     return _ADDRESS_USER_PROMPT_TEMPLATE.format(
         address=address,
@@ -596,6 +815,8 @@ def _result_from_validated(parsed: _VerificationResponse) -> dict:
         "is_house": parsed.is_house,
         # Only the address schema carries image_unusable; rooftop schema lacks it.
         "image_unusable": bool(getattr(parsed, "image_unusable", False)),
+        # Gemini-only ground-CT "look wider" signal; rooftop schema lacks it.
+        "frame_inadequate": bool(getattr(parsed, "frame_inadequate", False)),
     }
 
 
@@ -645,12 +866,7 @@ def _verify_gemini(
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Image A (candidate crop) ---")
     contents.append(types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"))
     contents.append("--- Image B (full satellite tile) ---")
@@ -661,7 +877,7 @@ def _verify_gemini(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -670,7 +886,7 @@ def _verify_gemini(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -681,19 +897,23 @@ def _verify_gemini(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -702,7 +922,8 @@ def _verify_gemini(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -721,7 +942,9 @@ def _verify_gemini(
 
         return _parse_response(response, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_gemini_rooftop(
@@ -748,12 +971,7 @@ def _verify_gemini_rooftop(
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Satellite tile (target building centered) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
     if context_bytes is not None:
@@ -762,7 +980,7 @@ def _verify_gemini_rooftop(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_ROOFTOP_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_ROOFTOP_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_RooftopResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -771,7 +989,7 @@ def _verify_gemini_rooftop(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -782,19 +1000,23 @@ def _verify_gemini_rooftop(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Rooftop attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -803,7 +1025,8 @@ def _verify_gemini_rooftop(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Rooftop attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -822,7 +1045,9 @@ def _verify_gemini_rooftop(
 
         return _parse_response(response, _RooftopResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_grok(
@@ -831,6 +1056,7 @@ def _verify_grok(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -851,12 +1077,7 @@ def _verify_grok(
     prompt = _build_prompt(building_context, detection_bbox, len(pos_imgs), len(neg_imgs))
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Image A (candidate crop) ---"})
     content_parts.append(_to_image_url_part(crop_bytes))
     content_parts.append({"type": "text", "text": "--- Image B (full satellite tile) ---"})
@@ -866,14 +1087,15 @@ def _verify_grok(
         content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -887,13 +1109,15 @@ def _verify_grok(
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok attempt %d timeout: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok network timeout after 4 attempts."
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
             )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -903,7 +1127,9 @@ def _verify_grok(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -914,7 +1140,8 @@ def _verify_grok(
                     attempt + 1, code, _truncate(e),
                 )
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -946,7 +1173,8 @@ def _verify_grok(
         return _parse_response(shim, _VerificationResponse)
 
     return last_transient_result or _needs_review(
-        "Grok network timeout after 4 attempts."
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
     )
 
 
@@ -955,6 +1183,7 @@ def _verify_grok_rooftop(
     building_context: dict,
     timeout_s: int,
     context_image_path: str = None,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -974,12 +1203,7 @@ def _verify_grok_rooftop(
     prompt = _build_rooftop_prompt(building_context, len(pos_imgs), len(neg_imgs))
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Satellite tile (target building centered) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
     if context_bytes is not None:
@@ -987,14 +1211,15 @@ def _verify_grok_rooftop(
         content_parts.append(_to_image_url_part(context_bytes))
 
     messages = [
-        {"role": "system", "content": _ROOFTOP_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_ROOFTOP_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1008,13 +1233,15 @@ def _verify_grok_rooftop(
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok rooftop attempt %d timeout: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok network timeout after 4 attempts."
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
             )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok rooftop attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -1024,7 +1251,9 @@ def _verify_grok_rooftop(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok rooftop attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -1035,7 +1264,8 @@ def _verify_grok_rooftop(
                     attempt + 1, code, _truncate(e),
                 )
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -1067,7 +1297,8 @@ def _verify_grok_rooftop(
         return _parse_response(shim, _RooftopResponse)
 
     return last_transient_result or _needs_review(
-        "Grok network timeout after 4 attempts."
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
     )
 
 
@@ -1099,12 +1330,7 @@ def _verify_gemini_address(
                                    has_closeup=closeup_bytes is not None)
 
     contents: list = [prompt]
-    for img_bytes in pos_imgs:
-        contents.append("--- Reference: positive example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-    for img_bytes in neg_imgs:
-        contents.append("--- Reference: negative example ---")
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    _append_gemini_reference_parts(contents, pos_imgs, neg_imgs)
     contents.append("--- Satellite tile (target footprint in red, YOLO candidates numbered) ---")
     contents.append(types.Part.from_bytes(data=tile_bytes, mime_type="image/jpeg"))
     if context_bytes is not None:
@@ -1116,7 +1342,7 @@ def _verify_gemini_address(
 
     client = _get_gemini_client(api_key)
     config = types.GenerateContentConfig(
-        system_instruction=_ADDRESS_SYSTEM_PROMPT,
+        system_instruction=_system_instruction(_ADDRESS_SYSTEM_PROMPT),
         response_mime_type="application/json",
         response_schema=_VerificationResponse,
         thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
@@ -1125,7 +1351,7 @@ def _verify_gemini_address(
 
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    for attempt in range(_MAX_PROVIDER_ATTEMPTS):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1136,19 +1362,23 @@ def _verify_gemini_address(
             )
         except httpx.TimeoutException as e:
             _LOGGER.debug("Address attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+            )
             continue
         except httpx.ConnectError as e:
             _LOGGER.debug("Address attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Network connection error after {_MAX_PROVIDER_ATTEMPTS} attempts: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except genai_errors.ServerError as e:
             code = getattr(e, "code", None) or getattr(e, "status_code", None) or 500
             _LOGGER.debug("Address attempt %d server error (HTTP %s): %s", attempt + 1, code, _truncate(e))
             last_transient_result = _needs_review(
-                f"API server error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                f"API server error (HTTP {code}) after "
+                f"{_MAX_PROVIDER_ATTEMPTS} attempts: {_truncate(e)}"
             )
             continue
         except genai_errors.ClientError as e:
@@ -1157,7 +1387,8 @@ def _verify_gemini_address(
                 name = "Request Timeout" if code == 408 else "Too Many Requests"
                 _LOGGER.debug("Address attempt %d throttled (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"API throttled (HTTP {code} {name}) after 4 attempts; retry later."
+                    f"API throttled (HTTP {code} {name}) after "
+                    f"{_MAX_PROVIDER_ATTEMPTS} attempts; retry later."
                 )
                 continue
             if code == 401:
@@ -1176,7 +1407,9 @@ def _verify_gemini_address(
 
         return _parse_response(response, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Network timeout after {_MAX_PROVIDER_ATTEMPTS} attempts."
+    )
 
 
 def _verify_grok_address(
@@ -1186,6 +1419,7 @@ def _verify_grok_address(
     timeout_s: int,
     context_image_path: str = None,
     closeup_image_path: str = None,
+    max_attempts: int = _MAX_PROVIDER_ATTEMPTS,
 ) -> dict:
     api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
@@ -1207,12 +1441,7 @@ def _verify_grok_address(
                                    has_closeup=closeup_bytes is not None)
 
     content_parts: list = [{"type": "text", "text": prompt}]
-    for img_bytes in pos_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: positive example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
-    for img_bytes in neg_imgs:
-        content_parts.append({"type": "text", "text": "--- Reference: negative example ---"})
-        content_parts.append(_to_image_url_part(img_bytes))
+    _append_openai_reference_parts(content_parts, pos_imgs, neg_imgs)
     content_parts.append({"type": "text", "text": "--- Satellite tile (target footprint in red, YOLO candidates numbered) ---"})
     content_parts.append(_to_image_url_part(tile_bytes))
     if context_bytes is not None:
@@ -1223,14 +1452,15 @@ def _verify_grok_address(
         content_parts.append(_to_image_url_part(closeup_bytes))
 
     messages = [
-        {"role": "system", "content": _ADDRESS_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_instruction(_ADDRESS_SYSTEM_PROMPT)},
         {"role": "user", "content": content_parts},
     ]
 
     client = _get_grok_client(api_key)
     last_transient_result: dict | None = None
 
-    for attempt in range(4):
+    attempt_limit = max(1, min(int(max_attempts), _MAX_PROVIDER_ATTEMPTS))
+    for attempt in range(attempt_limit):
         if attempt > 0:
             time.sleep(_RETRY_BACKOFFS_S[attempt - 1])
         try:
@@ -1243,12 +1473,16 @@ def _verify_grok_address(
             )
         except openai.APITimeoutError as e:
             _LOGGER.debug("Grok address attempt %d timeout: %s", attempt + 1, _truncate(e))
-            last_transient_result = _needs_review("Grok network timeout after 4 attempts.")
+            last_transient_result = _needs_review(
+                f"Grok network timeout after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}."
+            )
             continue
         except openai.RateLimitError as e:
             _LOGGER.debug("Grok address attempt %d rate-limited: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                "Grok API throttled (HTTP 429 Too Many Requests) after 4 attempts; retry later."
+                f"Grok API throttled (HTTP 429 Too Many Requests) after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}; retry later."
             )
             continue
         except openai.AuthenticationError:
@@ -1258,7 +1492,9 @@ def _verify_grok_address(
         except openai.APIConnectionError as e:
             _LOGGER.debug("Grok address attempt %d connect error: %s", attempt + 1, _truncate(e))
             last_transient_result = _needs_review(
-                f"Grok network connection error after 4 attempts: {type(e).__name__}: {_truncate(e)}"
+                f"Grok network connection error after {attempt_limit} "
+                f"{'attempt' if attempt_limit == 1 else 'attempts'}: "
+                f"{type(e).__name__}: {_truncate(e)}"
             )
             continue
         except openai.APIStatusError as e:
@@ -1266,7 +1502,8 @@ def _verify_grok_address(
             if code in (408, 429) or 500 <= code < 600:
                 _LOGGER.debug("Grok address attempt %d transient (HTTP %s): %s", attempt + 1, code, _truncate(e))
                 last_transient_result = _needs_review(
-                    f"Grok API transient error (HTTP {code}) after 4 attempts: {_truncate(e)}"
+                    f"Grok API transient error (HTTP {code}) after {attempt_limit} "
+                    f"{'attempt' if attempt_limit == 1 else 'attempts'}: {_truncate(e)}"
                 )
                 continue
             if code == 403:
@@ -1291,7 +1528,10 @@ def _verify_grok_address(
         shim = SimpleNamespace(parsed=None, text=_strip_md_fences(content))
         return _parse_response(shim, _VerificationResponse)
 
-    return last_transient_result or _needs_review("Grok network timeout after 4 attempts.")
+    return last_transient_result or _needs_review(
+        f"Grok network timeout after {attempt_limit} "
+        f"{'attempt' if attempt_limit == 1 else 'attempts'}."
+    )
 
 
 def verify_address(
@@ -1301,11 +1541,11 @@ def verify_address(
     context_image_path: str = None,
     closeup_image_path: str = None,
 ) -> dict:
-    """One dual-VLM pass per address. The VLM sees a single marked-up tile (target
+    """One Gemini-first pass per address. The reviewer sees a marked-up tile (target
     footprint in red, YOLO candidate boxes numbered) plus reference images, and
     returns one consensus verdict — verifying the boxes AND scanning for anything
     YOLO missed. Replaces the per-box verify_detection loop + the verify_rooftop
-    scan. Same output shape as verify_detection (the 7-key consensus dict)."""
+    scan. The result retains legacy per-model fields and adds ``model_path``."""
     if not isinstance(building_context, dict):
         return _needs_review(
             f"building_context must be a dict, got {type(building_context).__name__}."
@@ -1334,35 +1574,22 @@ def verify_address(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini_address(
+        image_path, building_context, n_boxes, timeout_s,
+        context_image_path, closeup_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini_address, image_path, building_context, n_boxes, timeout_s,
-            context_image_path, closeup_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok_address, image_path, building_context, n_boxes, timeout_s,
-            context_image_path, closeup_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(f"Gemini exceeded {timeout_s}s wall-clock timeout.")
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(f"Grok exceeded {timeout_s}s wall-clock timeout.")
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok_address(
+        image_path, building_context, n_boxes, timeout_s,
+        context_image_path, closeup_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)
 
 
 def _combine_verdicts(
@@ -1435,6 +1662,9 @@ def _combine_verdicts(
         "is_house": final_is_house,
         # If EITHER model couldn't see the target roof, flag for an imagery retry.
         "image_unusable": bool(gemini_result.get("image_unusable") or grok_result.get("image_unusable")),
+        # Gemini-only: re-pull a wider view to rule out a ground-mounted CT outside a tight
+        # frame. Deliberately NOT ORed with Grok — this judgment is Gemini's job alone.
+        "frame_inadequate": bool(gemini_result.get("frame_inadequate")),
         "gemini": gemini_result,
         "grok": grok_result,
         "agreement": agree and confident,
@@ -1447,7 +1677,7 @@ def verify_detection(
     building_context: dict,
     context_image_path: str = None,
 ) -> dict:
-    """Verify a YOLO cooling-tower detection using parallel Gemini + Grok consensus.
+    """Verify a YOLO cooling-tower detection with Gemini first.
 
     Args:
         image_path: Path to the full 768x768 satellite tile (JPEG/PNG).
@@ -1461,38 +1691,15 @@ def verify_detection(
             the OSM footprint).
 
     Returns:
-        A dict with exactly seven keys. The first four are the consensus
-        result (backward-compatible with the prior single-model shape);
-        the remaining three expose per-model detail.
-
-        - ``verdict`` (str): consensus verdict, or ``"needs_review"`` when
-          the two models disagree, either falls below the confidence
-          threshold, or either failed via timeout/transport error.
-        - ``confidence`` (float): ``min(gemini_conf, grok_conf)`` when
-          consensus reached; ``0.0`` otherwise.
-        - ``reasoning`` (str): synthesized explanation that embeds both
-          models' raw reasoning. For ``needs_review`` it leads with the
-          reason ("Models disagreed.", "Below confidence threshold.", or
-          a per-model timeout/transport failure embedded in sub-detail).
-        - ``construction`` (bool): ``True`` only when both models flagged
-          active construction.
-        - ``gemini`` (dict): Gemini's own 4-key result dict.
-        - ``grok`` (dict): Grok's own 4-key result dict.
-        - ``agreement`` (bool): ``True`` iff the two models confidently
-          agreed on a bucket.
-
-        All recoverable failures (bad inputs, network errors, schema
-        mismatches, per-model timeouts, etc.) are mapped to ``needs_review``
-        in the relevant sub-dict; that naturally routes the top-level result
-        to ``needs_review`` via the disagreement rule. Pre-flight validation
-        failures (bad inputs, unreadable image, degenerate bbox) short-circuit
-        and return ``needs_review`` directly without calling either model
-        (and without the per-model sub-dicts).
+        A backward-compatible result with ``gemini``, an empty ``grok`` field
+        unless fallback actually ran, and a ``model_path`` marker. Valid
+        Gemini positives, negatives, low-confidence outcomes, and human-review
+        outcomes never invoke Grok. Technical provider/timeout/schema failures
+        can make one Grok emergency request; if that fails, the result is
+        ``needs_review``.
 
     Raises:
-        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
-            or empty. Both are required configuration; missing keys are
-            surfaced loudly rather than routed to ``needs_review``.
+        KeyError: If ``GEMINI_API_KEY`` is unset or empty.
     """
     if not isinstance(building_context, dict):
         return _needs_review(
@@ -1538,39 +1745,21 @@ def verify_detection(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini(
+        image_path, detection_bbox, building_context, timeout_s, context_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini, image_path, detection_bbox, building_context, timeout_s,
-            context_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok, image_path, detection_bbox, building_context, timeout_s,
-            context_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(
-                f"Gemini exceeded {timeout_s}s wall-clock timeout."
-            )
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(
-                f"Grok exceeded {timeout_s}s wall-clock timeout."
-            )
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok(
+        image_path, detection_bbox, building_context, timeout_s,
+        context_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)
 
 
 def verify_rooftop(
@@ -1595,16 +1784,13 @@ def verify_rooftop(
             sub-dict with ``osm_id``, ``tags``, and ``contains_point``.
 
     Returns:
-        A dict with exactly seven keys, matching the shape of
-        ``verify_detection``. The verdict literals come from the rooftop
+        A backward-compatible result matching ``verify_detection``. The verdict literals come from the rooftop
         schema: ``cooling_tower_present``, ``cooling_tower_possible``,
         ``no_cooling_tower``, or ``needs_review``. Construction is True only
-        when both models flagged active construction (same consensus rule
-        as ``verify_detection``).
+        when the active reviewer flags active construction.
 
     Raises:
-        KeyError: If either ``GEMINI_API_KEY`` or ``XAI_API_KEY`` is unset
-            or empty.
+        KeyError: If ``GEMINI_API_KEY`` is unset or empty.
     """
     if not isinstance(building_context, dict):
         return _needs_review(
@@ -1634,37 +1820,17 @@ def verify_rooftop(
 
     if not os.environ.get("GEMINI_API_KEY"):
         raise KeyError("GEMINI_API_KEY")
-    if not os.environ.get("XAI_API_KEY"):
-        raise KeyError("XAI_API_KEY")
 
     timeout_s = int(os.environ.get("VLM_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT_S)))
-    threshold = float(
-        os.environ.get("VLM_CONSENSUS_THRESHOLD", str(_DEFAULT_CONSENSUS_THRESHOLD))
+    gemini_result = _verify_gemini_rooftop(
+        image_path, building_context, timeout_s, context_image_path,
     )
+    if not _is_technical_gemini_failure(gemini_result):
+        return _gemini_first_result(gemini_result)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        gemini_future = ex.submit(
-            _verify_gemini_rooftop, image_path, building_context, timeout_s,
-            context_image_path,
-        )
-        grok_future = ex.submit(
-            _verify_grok_rooftop, image_path, building_context, timeout_s,
-            context_image_path,
-        )
-
-        try:
-            gemini_result = gemini_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            gemini_result = _needs_review(
-                f"Gemini exceeded {timeout_s}s wall-clock timeout."
-            )
-
-        try:
-            grok_result = grok_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            grok_result = _needs_review(
-                f"Grok exceeded {timeout_s}s wall-clock timeout."
-            )
-
-    return _combine_verdicts(gemini_result, grok_result, threshold)
-
+    if not _grok_fallback_enabled() or not os.environ.get("XAI_API_KEY"):
+        return _grok_fallback_unavailable_result(gemini_result)
+    grok_result = _verify_grok_rooftop(
+        image_path, building_context, timeout_s, context_image_path, max_attempts=1,
+    )
+    return _gemini_first_result(gemini_result, grok_result, fallback_attempted=True)

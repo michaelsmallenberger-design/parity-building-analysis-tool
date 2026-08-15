@@ -1,5 +1,5 @@
 {
-  "name": "Parity Cooling Tower — Webhook → Sheet → Grok → Railway → Email → Slack",
+  "name": "Parity Cooling Tower - Webhook to Sheet to Grok to Render to Email to Slack",
   "nodes": [
     {
       "parameters": {
@@ -83,12 +83,12 @@
       "type": "n8n-nodes-base.aggregate",
       "typeVersion": 1,
       "position": [560, 300],
-      "notes": "Turns the per-row normalized addresses into one list (`addresses`) for the single batch call to Railway."
+      "notes": "Turns the per-row normalized addresses into one list (`addresses`) for the single batch call to Render."
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "https://REPLACE-WITH-RAILWAY-APP.up.railway.app/api/run",
+        "url": "https://REPLACE-WITH-RENDER-SERVICE.onrender.com/api/run",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -103,12 +103,12 @@
           "response": { "response": { "responseFormat": "text" } }
         }
       },
-      "id": "node-railway",
-      "name": "Analyze on Railway",
+      "id": "node-render",
+      "name": "Analyze on Render",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [780, 300],
-      "notes": "One batch call: Railway analyzes every address and returns the finished self-contained HTML report (in $json.data). Long timeout — a big sheet can take many minutes."
+      "notes": "One batch call: Render analyzes every address and returns the finished self-contained HTML report (in $json.data). Long timeout because a big sheet can take many minutes."
     },
     {
       "parameters": {
@@ -155,8 +155,8 @@
     "Read addresses": { "main": [[{ "node": "Normalize (Grok)", "type": "main", "index": 0 }]] },
     "Grok Chat Model": { "ai_languageModel": [[{ "node": "Normalize (Grok)", "type": "ai_languageModel", "index": 0 }]] },
     "Normalize (Grok)": { "main": [[{ "node": "Collect addresses", "type": "main", "index": 0 }]] },
-    "Collect addresses": { "main": [[{ "node": "Analyze on Railway", "type": "main", "index": 0 }]] },
-    "Analyze on Railway": { "main": [[{ "node": "Email report", "type": "main", "index": 0 }]] },
+    "Collect addresses": { "main": [[{ "node": "Analyze on Render", "type": "main", "index": 0 }]] },
+    "Analyze on Render": { "main": [[{ "node": "Email report", "type": "main", "index": 0 }]] },
     "Email report": { "main": [[{ "node": "Slack confirmation", "type": "main", "index": 0 }]] }
   },
   "settings": { "executionOrder": "v1" }

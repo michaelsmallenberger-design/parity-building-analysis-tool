@@ -8,3 +8,27 @@ node_modules/
 .DS_Store
 static/uploads/*
 static/results/*
+.env
+.env.local
+.env.*.local
+*.env
+.agents/
+.vscode/
+storage/
+temp_uploads/
+jobs.db
+.ms_footprint_cache/
+.local_archive/
+pipeline_test_outputs/
+scratch_*
+demo_report*.html
+registry_options.html
+results.xlsx
+Existing_Market_TAM.xlsx
+training_images/
+training_setup/
+training_addresses.csv
+download_training_images.py
+data/
+# tests don't belong in the runtime image (but real modules now auto-copy via COPY *.py)
+test_*.py
