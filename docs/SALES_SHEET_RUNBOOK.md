@@ -78,6 +78,11 @@ batch is running. Every result is tied to its original tab and physical row.
 On the dark Review Page, each card shows the address, rooftop imagery, useful map
 links, and the model's guidance. A person—not the model—makes the final choice.
 
+For a batch from one Sheet tab, the page does not repeat that internal tab name
+above the cards. The tab binding is still preserved for safe write-back. When a
+batch contains several source tabs, their names remain visible to keep the card
+groups clear.
+
 Cards show **Sheet Stories/Floors** only when the source Sheet contains a
 recognized Stories or Floors column. Parity displays that source value; it does
 not calculate or independently verify the number.
