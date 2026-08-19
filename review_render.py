@@ -526,7 +526,7 @@ def build_review_page(
                 else ""
             )
             tab_heading = ""
-            if len(all_grouped) > 1 or tab:
+            if len(all_grouped) > 1:
                 tab_heading = (
                     f'<div class="tab-head"><h2>{_html.escape(tab or "Other")}</h2>'
                     f'<span class="tab-progress" data-total="{len(all_tab_entries)}" '

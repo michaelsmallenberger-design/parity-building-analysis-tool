@@ -188,12 +188,52 @@ def test_server_pagination_limits_dom_and_keeps_global_tab_progress():
         'data-total="8" data-reviewed="0">8/8 analyzed '
         '· 0/8 reviewed · 3 on this page'
     ) in page
+    assert page.count('<div class="tab-head">') == 2
+    assert '<h2>DC</h2>' in page
+    assert '<h2>NYC</h2>' in page
     assert "Buildings 6–10 of 15 · page 2 of 3" in page
     assert 'href="/review/paged?mode=compact&amp;page=1"' in page
     assert 'href="/review/paged?mode=compact&amp;page=3"' in page
     assert page.count('class="pagination"') == 2
     assert "Submit all completed on this page" in page
     assert "const totalInGroup=+progress.dataset.total" in page
+
+
+def test_single_source_tab_hides_redundant_tab_heading():
+    entries = []
+    for number in range(1, 11):
+        entry = {
+            **_entry(),
+            "i": number,
+            "row_id": f"row-{number}",
+            "address": f"{number} Single Tab Ave",
+            "source_tab": "DC",
+            "source_row": number + 1,
+        }
+        if number == 1:
+            entry["human"] = {
+                "hvac_systems": "Cooling Tower",
+                "optimizer_fit": "Good",
+                "periscope_fit": "Good",
+            }
+        entries.append(entry)
+
+    page = build_review_page(
+        entries,
+        job_id="single-tab",
+        page=1,
+        page_size=10,
+    )
+
+    assert page.count("<article ") == 10
+    assert '<span id="done">1</span>/10 reviewed' in page
+    assert "Still needs review</h2><span>9" in page
+    assert "Completed reviews</h2><span>1" in page
+    assert "Tab: DC · row 2" in page
+    assert '<div class="tab-head">' not in page
+    assert '<h2>DC</h2>' not in page
+    assert 'class="tab-progress"' not in page
+    assert "10/10 analyzed · 1/10 reviewed · 1 on this page" not in page
 
 
 def test_pagination_is_opt_in_for_legacy_callers():
